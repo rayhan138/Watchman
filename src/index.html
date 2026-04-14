@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Traffic Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/plugins/monthSelect/style.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- Background Gradients -->
+  <div class="bg-blob-1"></div>
+  <div class="bg-blob-2"></div>
+  <div class="bg-blob-3"></div>
+
+  <!-- Title Bar -->
+  <div class="titlebar" id="titlebar">
+    <div class="titlebar-drag">
+      <div class="app-title-wrapper">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="12" cy="12" r="10"/>
+          <circle cx="12" cy="12" r="6"/>
+          <circle cx="12" cy="12" r="2"/>
+        </svg>
+        <span class="titlebar-title">Traffic Monitor</span>
+      </div>
+    </div>
+    <div class="titlebar-controls">
+
+      <button class="titlebar-btn settings-btn" id="settingsBtn" title="Settings">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+      </button>
+      <button class="titlebar-btn theme-btn" id="themeToggleBtn" title="Toggle Theme">
+        <svg id="themeIcon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+        </svg>
+      </button>
+      <button class="titlebar-btn pin-btn" id="pinBtn" title="Lock Taskbar Widget">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M12 17v5M9 2h6l-1 7h3l-5 8h-1l1-8H9l1-7z"/>
+        </svg>
+      </button>
+      <button class="titlebar-btn minimize-btn" id="minimizeBtn" title="Minimize">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+      </button>
+      <button class="titlebar-btn close-btn" id="closeBtn" title="Close to Tray">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <line x1="18" y1="6" x2="6" y2="18"/>
+          <line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Tab Navigation -->
+  <nav class="tab-bar" id="tabBar">
+    <button class="tab-item active" data-tab="dashboard" id="tabDashboard">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+      <span>Dashboard</span>
+    </button>
+    <button class="tab-item" data-tab="data-usage" id="tabDataUsage">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 20V10M6 20V4M18 20v-4"/></svg>
+      <span>Data</span>
+    </button>
+    <button class="tab-item" data-tab="applications" id="tabApps">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+      <span>Apps</span>
+    </button>
+    <button class="tab-item" data-tab="network" id="tabNetwork">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/></svg>
+      <span>Network</span>
+    </button>
+    <button class="tab-item" data-tab="tools" id="tabTools">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+      <span>Tools</span>
+    </button>
+  </nav>
+
+  <!-- Main Content -->
+  <div class="content" id="content">
+
+    <!-- ============================================ -->
+    <!--  TAB: Dashboard                              -->
+    <!-- ============================================ -->
+    <div class="tab-panel active" id="panelDashboard">
+
+      <!-- Network Speed Section -->
+      <section class="speed-section">
+        <div class="speed-card download-card" id="downloadCard">
+          <div class="speed-card-left">
+            <span class="speed-arrow down-arrow">↓</span>
+            <div class="speed-label-group">
+              <span class="speed-label">Download</span>
+            </div>
+          </div>
+          <div class="speed-value-container">
+            <span class="speed-value" id="downloadSpeed">0.0</span>
+            <span class="speed-unit" id="downloadUnit">B/s</span>
+          </div>
+        </div>
+
+        <div class="speed-card upload-card" id="uploadCard">
+          <div class="speed-card-left">
+            <span class="speed-arrow up-arrow">↑</span>
+            <div class="speed-label-group">
+              <span class="speed-label">Upload</span>
+            </div>
+          </div>
+          <div class="speed-value-container">
+            <span class="speed-value" id="uploadSpeed">0.0</span>
+            <span class="speed-unit" id="uploadUnit">B/s</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Dashboard Data Usage Summary -->
+      <section class="dash-usage-section">
+        <div class="dash-snapshot-card">
+          <div class="dash-snapshot-header">
+            <span class="dash-snapshot-title">Usage Snapshot</span>
+            <button class="dash-snapshot-chip" id="dashUsagePeriodChip" type="button">Today</button>
+          </div>
+          <div class="dash-snapshot-stats">
+            <div class="dash-snapshot-stat">
+            <div class="du-card-label">Total</div>
+            <div class="du-card-value" id="dashTotalUsage">0 B</div>
+          </div>
+            <div class="dash-snapshot-stat">
+            <div class="du-card-label">↓ Download</div>
+            <div class="du-card-value" id="dashDownload">0 B</div>
+          </div>
+            <div class="dash-snapshot-stat">
+            <div class="du-card-label">↑ Upload</div>
+            <div class="du-card-value" id="dashUpload">0 B</div>
+          </div>
+          </div>
+        <div class="dash-snapshot-meta" id="dashUsageMeta">Updated just now</div>
+      </div>
+      </section>
+
+
+      <!-- Traffic Light Indicator (Task 16) -->
+      <section class="traffic-light-section">
+        <div class="traffic-light-card">
+          <div class="traffic-light" id="trafficLight">
+            <div class="tl-dot" id="tlDot"></div>
+          </div>
+          <div class="traffic-light-info">
+            <span class="tl-label" id="tlLabel">Normal</span>
+            <span class="tl-detail" id="tlDetail">Network usage is within normal range</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- System Gauges -->
+      <section class="gauges-section">
+        <div class="gauge-card" id="cpuGauge">
+          <div class="minimal-gauge">
+            <div class="gauge-fill" id="cpuRing"></div>
+            <div class="gauge-center">
+              <span class="gauge-value" id="cpuValue">0</span><span class="gauge-percent">%</span>
+            </div>
+          </div>
+          <div class="gauge-label">CPU</div>
+          <div class="gauge-sub" id="cpuCores">-- cores</div>
+        </div>
+
+        <div class="gauge-card" id="ramGauge">
+          <div class="minimal-gauge">
+            <div class="gauge-fill" id="ramRing" style="background: rgba(0,0,0,0.15)"></div>
+            <div class="gauge-center">
+              <span class="gauge-value" id="ramValue">0</span><span class="gauge-percent">%</span>
+            </div>
+          </div>
+          <div class="gauge-label">RAM</div>
+          <div class="gauge-sub" id="ramInfo">-- / -- GB</div>
+        </div>
+
+        <div class="gauge-card" id="diskGaugeCard">
+          <div class="minimal-gauge">
+            <div class="gauge-fill" id="diskRing" style="background: rgba(0,0,0,0.2)"></div>
+            <div class="gauge-center">
+              <span class="gauge-value" id="diskValue">0</span><span class="gauge-percent">%</span>
+            </div>
+          </div>
+          <div class="gauge-label">Disk</div>
+          <div class="gauge-sub" id="diskInfo">-- / -- GB</div>
+        </div>
+      </section>
+
+
+
+      <!-- Expandable Details Sections -->
+      <section class="details-section">
+        <div class="details-panel" id="networkDetailsPanel">
+          <button class="details-toggle" id="networkDetailsToggle">
+            <span class="toggle-arrow">→</span>
+            <span>Network Details</span>
+          </button>
+          <div class="details-content" id="networkDetailsContent">
+            <div class="details-table" id="networkDetailsTable">
+              <div class="detail-row">
+                <span class="detail-label">Loading...</span>
+                <span class="detail-value">—</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="details-panel" id="systemInfoPanel">
+          <button class="details-toggle" id="systemInfoToggle">
+            <span class="toggle-arrow">→</span>
+            <span>System Information</span>
+          </button>
+          <div class="details-content" id="systemInfoContent">
+            <div class="details-table" id="systemInfoTable">
+              <div class="detail-row">
+                <span class="detail-label">Loading...</span>
+                <span class="detail-value">—</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </div><!-- /panelDashboard -->
+
+
+    <!-- ============================================ -->
+    <!--  TAB: Data Usage (Task 12)                   -->
+    <!-- ============================================ -->
+    <div class="tab-panel" id="panelDataUsage">
+
+      <!-- Period Selector -->
+      <div class="du-period-bar">
+        <button class="du-period-btn active" data-period="daily" id="duPeriodDaily">Daily</button>
+        <button class="du-period-btn" data-period="weekly" id="duPeriodWeekly">Weekly</button>
+        <button class="du-period-btn" data-period="monthly" id="duPeriodMonthly">Monthly</button>
+      </div>
+
+      <!-- Usage Summary Cards -->
+      <div class="du-summary-row">
+        <div class="du-card">
+          <div class="du-card-label">Total Usage</div>
+          <div class="du-card-value" id="duTotalUsage">0 B</div>
+        </div>
+        <div class="du-card">
+          <div class="du-card-label">↓ Download</div>
+          <div class="du-card-value" id="duDownload">0 B</div>
+        </div>
+        <div class="du-card">
+          <div class="du-card-label">↑ Upload</div>
+          <div class="du-card-value" id="duUpload">0 B</div>
+        </div>
+      </div>
+
+      <!-- Usage Chart -->
+      <section class="chart-section">
+        <div class="traffic-history-panel">
+          <!-- Filter Buttons -->
+          <div class="th-filter-bar">
+            <button class="th-filter-btn" data-filter="today" id="duThFilterToday">Today</button>
+            <button class="th-filter-btn active" data-filter="last7days" id="duThFilterLast7Days">Last 7 Days</button>
+            <button class="th-filter-btn" data-filter="monthly" id="duThFilterMonthly">Monthly</button>
+            <button class="th-filter-btn" data-filter="yearly" id="duThFilterYearly">Yearly</button>
+          </div>
+
+          <!-- Statistics Cards -->
+          <div class="th-stats-row">
+            <div class="th-stat-card">
+              <div class="th-stat-label">Total Traffic</div>
+              <div class="th-stat-value" id="duThStatTotal">0 B</div>
+            </div>
+            <div class="th-stat-card">
+              <div class="th-stat-label">↓ Download</div>
+              <div class="th-stat-value" id="duThStatDownload">0 B</div>
+            </div>
+            <div class="th-stat-card">
+              <div class="th-stat-label">↑ Upload</div>
+              <div class="th-stat-value" id="duThStatUpload">0 B</div>
+            </div>
+          </div>
+
+          <!-- Date Range Label / Month Selector -->
+          <div class="th-date-range" id="duThDateRange">
+            <button class="th-month-trigger" id="duThMonthTrigger" type="button" hidden>
+              <svg class="th-month-trigger-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="3.5" y="5.5" width="17" height="15" rx="2"></rect>
+                <path d="M7.5 3.5v4"></path>
+                <path d="M16.5 3.5v4"></path>
+                <path d="M3.5 9.5h17"></path>
+              </svg>
+              <span id="duThMonthTriggerLabel">April 2026</span>
+            </button>
+            <span class="th-date-range-label" id="duThDateRangeLabel">Select a time period</span>
+            <input class="th-month-picker-input" id="duThMonthPicker" type="text" tabindex="-1" aria-hidden="true" readonly>
+          </div>
+
+          <!-- Chart Canvas -->
+          <div class="th-chart-wrapper">
+            <canvas id="dataUsageHistoryChart" width="400" height="200"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- Comparison Card -->
+      <div class="du-comparison-card" id="duComparisonCard">
+        <div class="du-comparison-label">vs Previous Period</div>
+        <div class="du-comparison-value" id="duComparisonValue">—</div>
+        <div class="du-comparison-trend" id="duComparisonTrend"></div>
+      </div>
+
+      <!-- Data Limit Card -->
+      <div class="du-limit-card">
+        <div class="du-limit-header">
+          <span class="chart-title">Data Limit</span>
+          <div class="du-limit-remaining" id="duLimitRemaining">No limit set</div>
+        </div>
+        <div class="du-limit-progress-wrap">
+          <div class="du-limit-progress" id="duLimitProgress">
+            <div class="du-limit-fill" id="duLimitFill" style="width: 0%"></div>
+          </div>
+          <span class="du-limit-pct" id="duLimitPct">0%</span>
+        </div>
+        <div class="du-limit-input-row">
+          <input type="number" id="duLimitInput" class="du-limit-input" placeholder="Limit in GB" min="0" step="1">
+          <button class="btn-small btn-accent" id="duLimitSaveBtn">Set Limit</button>
+        </div>
+      </div>
+
+    </div><!-- /panelDataUsage -->
+
+
+    <!-- ============================================ -->
+    <!--  TAB: Applications (Task 14)                 -->
+    <!-- ============================================ -->
+    <div class="tab-panel" id="panelApps">
+
+      <div class="app-header-row">
+        <div class="app-header-copy">
+          <span class="chart-title">App Network Activity</span>
+          <span class="app-header-subtitle" id="appHeaderSubtitle">Live now and recent background traffic stay listed here for this session.</span>
+        </div>
+        <span class="app-count-badge" id="appCountBadge">0</span>
+      </div>
+
+      <div class="app-table-wrapper" id="appTableWrapper">
+        <table class="app-table" id="appTable">
+          <thead>
+            <tr>
+              <th style="width:52%">Application</th>
+              <th style="width:18%">↓ Down</th>
+              <th style="width:18%">↑ Up</th>
+              <th style="width:12%">Conns</th>
+            </tr>
+          </thead>
+          <tbody id="appTableBody">
+            <tr><td colspan="4" class="app-empty">Loading applications...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+    </div><!-- /panelApps -->
+
+
+    <!-- ============================================ -->
+    <!--  TAB: Network Health (Task 13)               -->
+    <!-- ============================================ -->
+    <div class="tab-panel" id="panelNetwork">
+
+      <!-- Quality Indicator -->
+      <div class="nh-quality-card" id="nhQualityCard">
+        <div class="nh-quality-dot" id="nhQualityDot"></div>
+        <div class="nh-quality-info">
+          <div class="nh-quality-kicker">Connection Health</div>
+          <div class="nh-quality-level" id="nhQualityLevel">Checking...</div>
+          <div class="nh-quality-sub" id="nhQualitySub">Sampling real network latency...</div>
+        </div>
+      </div>
+
+      <!-- Latency / Jitter / Packet Loss -->
+      <div class="nh-metrics-row">
+        <div class="nh-metric-card">
+          <div class="nh-metric-label">Latency</div>
+          <div class="nh-metric-value" id="nhLatencyValue">--</div>
+          <div class="nh-metric-sub" id="nhLatencyLabel">5-ping average</div>
+        </div>
+        <div class="nh-metric-card">
+          <div class="nh-metric-label">Jitter</div>
+          <div class="nh-metric-value" id="nhJitterValue">--</div>
+          <div class="nh-metric-sub" id="nhJitterLabel">variation between replies</div>
+        </div>
+        <div class="nh-metric-card">
+          <div class="nh-metric-label">Packet Loss</div>
+          <div class="nh-metric-value" id="nhLossValue">--</div>
+          <div class="nh-metric-sub" id="nhLossLabel">waiting for replies</div>
+        </div>
+      </div>
+
+      <div class="nh-connection-card">
+        <div class="chart-header">
+          <span class="chart-title">Connection</span>
+        </div>
+        <div class="nh-connection-body">
+          <div class="nh-connection-grid">
+            <div class="nh-conn-row">
+              <span class="nh-conn-label">Type</span>
+              <span class="nh-conn-value" id="nhConnType">Checking...</span>
+            </div>
+            <div class="nh-conn-row">
+              <span class="nh-conn-label">SSID / Adapter</span>
+              <span class="nh-conn-value" id="nhConnName">Checking...</span>
+            </div>
+            <div class="nh-conn-row">
+              <span class="nh-conn-label">Link Speed</span>
+              <span class="nh-conn-value" id="nhConnLink">--</span>
+            </div>
+            <div class="nh-conn-row">
+              <span class="nh-conn-label">Local IP</span>
+              <span class="nh-conn-value" id="nhConnIp">--</span>
+            </div>
+          </div>
+          <div class="nh-connection-visual">
+            <div class="nh-signal-bars" id="nhSignalBars">
+              <div class="signal-bar" data-bar="1"></div>
+              <div class="signal-bar" data-bar="2"></div>
+              <div class="signal-bar" data-bar="3"></div>
+              <div class="signal-bar" data-bar="4"></div>
+            </div>
+            <div class="nh-connection-badge" id="nhSignalLabel">checking...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Speed Test -->
+      <div class="nh-speedtest-card">
+        <div class="chart-header">
+          <span class="chart-title">Speed Test</span>
+          <button class="btn-small btn-accent" id="nhSpeedTestBtn">Run Test</button>
+        </div>
+        <div class="nh-speedtest-progress" id="nhSpeedTestProgress" style="display:none">
+          <div class="spinner"></div>
+          <span>Running speed test...</span>
+        </div>
+        <div class="nh-speedtest-results" id="nhSpeedTestResults">
+          <div class="nh-st-row">
+            <span class="nh-st-label">Download</span>
+            <span class="nh-st-value" id="nhStDownload">—</span>
+          </div>
+          <div class="nh-st-row">
+            <span class="nh-st-label">Upload</span>
+            <span class="nh-st-value" id="nhStUpload">—</span>
+          </div>
+          <div class="nh-st-row">
+            <span class="nh-st-label">Server Ping</span>
+            <span class="nh-st-value" id="nhStPing">—</span>
+          </div>
+          <div class="nh-st-row">
+            <span class="nh-st-label">Server</span>
+            <span class="nh-st-value" id="nhStServer">--</span>
+          </div>
+          <div class="nh-st-row">
+            <span class="nh-st-label">Last Tested</span>
+            <span class="nh-st-value" id="nhStTime">Never</span>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /panelNetwork -->
+
+
+    <!-- ============================================ -->
+    <!--  TAB: Tools (Task 18 + 19)                   -->
+    <!-- ============================================ -->
+    <div class="tab-panel" id="panelTools">
+
+      <!-- Troubleshooter Section -->
+      <section class="tools-section">
+        <div class="chart-container">
+          <div class="chart-header">
+            <span class="chart-title">Network Troubleshooter</span>
+            <button class="btn-small btn-accent" id="toolsTroubleshootBtn">Run Diagnostics</button>
+          </div>
+          <div class="tools-progress" id="toolsTroubleshootProgress" style="display:none">
+            <div class="spinner"></div>
+            <span>Running diagnostic tests...</span>
+          </div>
+          <div class="tools-results" id="toolsTroubleshootResults">
+            <div class="tools-empty">Click "Run Diagnostics" to check your network</div>
+          </div>
+          <div class="tools-fixes" id="toolsFixes" style="display:none">
+            <div class="tools-fixes-title">Suggested Fixes</div>
+            <div class="tools-fixes-list" id="toolsFixesList"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Export Section -->
+      <section class="tools-section">
+        <div class="chart-container">
+          <div class="chart-header">
+            <span class="chart-title">Export CSV</span>
+          </div>
+          <div class="export-options">
+            <div class="export-row">
+              <label class="export-label">Format</label>
+              <span class="export-static-pill">CSV Only</span>
+            </div>
+            <div class="export-row">
+              <label class="export-label">Period</label>
+              <select class="history-select" id="exportPeriodSelect">
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly" selected>Monthly</option>
+                <option value="yearly">Yearly</option>
+              </select>
+            </div>
+            <div class="export-row" id="exportMonthRow" hidden>
+              <label class="export-label" for="exportMonthSelect">Month</label>
+              <select class="history-select" id="exportMonthSelect"></select>
+            </div>
+            <div class="export-row" id="exportYearRow">
+              <label class="export-label" for="exportYearSelect">Year</label>
+              <select class="history-select" id="exportYearSelect"></select>
+            </div>
+            <div class="export-helper" id="exportHelper">Choose a saved month or year from your history before exporting.</div>
+            <button class="btn-primary" id="exportBtn">Download CSV</button>
+          </div>
+          <div class="export-status" id="exportStatus" style="display:none"></div>
+        </div>
+      </section>
+
+    </div><!-- /panelTools -->
+
+  </div><!-- /content -->
+
+  <!-- Status Bar -->
+  <div class="status-bar" id="statusBar">
+    <div class="status-left">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="connectionStatus">Initializing...</span>
+    </div>
+    <div class="status-right">
+      <span id="uptimeDisplay">Uptime: --</span>
+    </div>
+  </div>
+
+  <!-- In-App Notification Toast -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- Settings Modal (Enhanced — Task 20) -->
+  <div class="settings-modal" id="settingsModal">
+    <div class="settings-content">
+      <div class="settings-header">
+        <h2 class="settings-title">Preferences</h2>
+        <button class="settings-close" id="settingsCloseBtn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+      <div class="settings-body">
+        <!-- Existing settings -->
+        <label class="setting-row" data-tooltip="Start Electron automatically when Windows starts">
+          <span class="setting-label">Run on Windows Startup</span>
+          <input type="checkbox" id="cfgStartOnBoot" class="toggle-checkbox">
+        </label>
+        <label class="setting-row" data-tooltip="Display network speeds in bits per second instead of bytes per second">
+          <span class="setting-label">Use Bits/s instead of Bytes/s</span>
+          <input type="checkbox" id="cfgUnitMode" class="toggle-checkbox">
+        </label>
+        <label class="setting-row" data-tooltip="Hide CPU, RAM, and Disk usage gauges from the dashboard">
+          <span class="setting-label">Hide Hardware Gauges</span>
+          <input type="checkbox" id="cfgHideGauges" class="toggle-checkbox">
+        </label>
+
+        <div class="settings-divider"></div>
+
+        <!-- Data Limit (Task 20) -->
+        <label class="setting-row" data-tooltip="Set a monthly data cap. Alerts trigger at 80%, 95%, and 100% usage">
+          <span class="setting-label">Monthly Data Limit (GB)</span>
+          <input type="number" id="cfgDataLimit" class="setting-input" placeholder="0 = none" min="0" step="1">
+        </label>
+
+        <div class="settings-divider"></div>
+
+        <!-- High Usage Warnings -->
+        <div class="settings-section-title">High Usage Warnings</div>
+        <div class="settings-section-help">Send me a warning when:</div>
+        <div class="settings-warning-list">
+          <div class="warning-setting-row">
+            <div class="warning-setting-main">
+              <span class="warning-setting-name">Today's Traffic</span>
+              <span class="warning-setting-hit">hits</span>
+            </div>
+            <div class="warning-setting-controls">
+              <input type="number" id="cfgWarnTrafficThreshold" class="warning-threshold-input" min="0" step="1">
+              <select id="cfgWarnTrafficUnit" class="warning-unit-select">
+                <option value="MB">MB</option>
+                <option value="GB">GB</option>
+              </select>
+            </div>
+            <input type="checkbox" id="cfgWarnTrafficEnabled" class="toggle-checkbox warning-toggle">
+          </div>
+          <div class="warning-setting-row">
+            <div class="warning-setting-main">
+              <span class="warning-setting-name">Memory Usage</span>
+              <span class="warning-setting-hit">hits</span>
+            </div>
+            <div class="warning-setting-controls">
+              <input type="number" id="cfgWarnMemoryThreshold" class="warning-threshold-input" min="0" max="100" step="1">
+              <span class="warning-unit-label">%</span>
+            </div>
+            <input type="checkbox" id="cfgWarnMemoryEnabled" class="toggle-checkbox warning-toggle">
+          </div>
+          <div class="warning-setting-row">
+            <div class="warning-setting-main">
+              <span class="warning-setting-name">CPU Temperature</span>
+              <span class="warning-setting-hit">hits</span>
+            </div>
+            <div class="warning-setting-controls">
+              <input type="number" id="cfgWarnCpuTempThreshold" class="warning-threshold-input" min="0" step="1">
+              <span class="warning-unit-label">&deg;C</span>
+            </div>
+            <input type="checkbox" id="cfgWarnCpuTempEnabled" class="toggle-checkbox warning-toggle">
+          </div>
+          <div class="warning-setting-row">
+            <div class="warning-setting-main">
+              <span class="warning-setting-name">GPU Temperature</span>
+              <span class="warning-setting-hit">hits</span>
+            </div>
+            <div class="warning-setting-controls">
+              <input type="number" id="cfgWarnGpuTempThreshold" class="warning-threshold-input" min="0" step="1">
+              <span class="warning-unit-label">&deg;C</span>
+            </div>
+            <input type="checkbox" id="cfgWarnGpuTempEnabled" class="toggle-checkbox warning-toggle">
+          </div>
+          <div class="warning-setting-row">
+            <div class="warning-setting-main">
+              <span class="warning-setting-name">Disk Temperature</span>
+              <span class="warning-setting-hit">hits</span>
+            </div>
+            <div class="warning-setting-controls">
+              <input type="number" id="cfgWarnDiskTempThreshold" class="warning-threshold-input" min="0" step="1">
+              <span class="warning-unit-label">&deg;C</span>
+            </div>
+            <input type="checkbox" id="cfgWarnDiskTempEnabled" class="toggle-checkbox warning-toggle">
+          </div>
+          <div class="warning-setting-row">
+            <div class="warning-setting-main">
+              <span class="warning-setting-name">Mainboard Temperature</span>
+              <span class="warning-setting-hit">hits</span>
+            </div>
+            <div class="warning-setting-controls">
+              <input type="number" id="cfgWarnMainboardTempThreshold" class="warning-threshold-input" min="0" step="1">
+              <span class="warning-unit-label">&deg;C</span>
+            </div>
+            <input type="checkbox" id="cfgWarnMainboardTempEnabled" class="toggle-checkbox warning-toggle">
+          </div>
+        </div>
+
+        <div class="settings-divider"></div>
+
+        <!-- Recommended + Undo (Task 20) -->
+        <div class="settings-actions-row">
+          <div class="settings-actions-left">
+            <button class="btn-small btn-accent" id="cfgRecommendedBtn" data-tooltip="Apply optimal settings based on your system">Use Recommended</button>
+            <button class="btn-small btn-outline" id="cfgUndoBtn" disabled data-tooltip="Revert to the previous settings state">Undo</button>
+          </div>
+          <button class="btn-small btn-primary settings-save-btn" id="cfgSaveBtn" disabled data-tooltip="Save your preferences">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Confirm Dialog -->
+  <div class="confirm-modal" id="confirmModal" style="display:none">
+    <div class="confirm-content">
+      <div class="confirm-title" id="confirmTitle">Confirm</div>
+      <div class="confirm-message" id="confirmMessage">Are you sure?</div>
+      <div class="confirm-actions">
+        <button class="btn-small btn-outline" id="confirmCancelBtn">Cancel</button>
+        <button class="btn-small btn-danger" id="confirmOkBtn">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tooltip -->
+  <div class="tooltip" id="globalTooltip" style="display:none"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/plugins/monthSelect/index.js"></script>
+  <script src="tauri-bridge.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

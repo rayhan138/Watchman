@@ -1,0 +1,1012 @@
+// Prevents additional console window on Windows in release
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod commands;
+mod taskbar_embed;
+
+use chrono::{Datelike, Local};
+use commands::config::ConfigState;
+use commands::history::HistoryState;
+use commands::monitor::MonitorState;
+use serde::Serialize;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::{
+    image::Image,
+    menu::{MenuBuilder, MenuItemBuilder},
+    tray::TrayIconBuilder,
+    Emitter, LogicalSize, Manager, Size, WindowEvent,
+};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_notification::NotificationExt;
+
+#[cfg(target_os = "windows")]
+use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+
+#[cfg(target_os = "windows")]
+use windows::core::PCWSTR;
+
+#[cfg(target_os = "windows")]
+use windows::Win32::{
+    Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, POINT, WPARAM},
+    System::Threading::CreateMutexW,
+    UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW, SetForegroundWindow,
+        TrackPopupMenu, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_NULL,
+    },
+};
+
+pub struct HistoryWriterState {
+    pub can_write: bool,
+    #[cfg(target_os = "windows")]
+    _lock: Option<HistoryWriterLock>,
+}
+
+struct WidgetDisplayState {
+    network_only: bool,
+}
+
+impl Default for WidgetDisplayState {
+    fn default() -> Self {
+        Self {
+            network_only: false,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WidgetDisplayModePayload {
+    network_only: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WidgetMenuActionPayload {
+    tab: Option<String>,
+    history_filter: Option<String>,
+    year: Option<i32>,
+    month: Option<u32>,
+}
+
+#[derive(Default)]
+struct AlertRuntimeState {
+    memory_warning_active: bool,
+    traffic_warning_active: bool,
+    traffic_day: String,
+}
+
+const WIDGET_FULL_WIDTH: f64 = 160.0;
+const WIDGET_NETWORK_ONLY_WIDTH: f64 = 104.0;
+const WIDGET_HEIGHT: f64 = 30.0;
+
+fn current_day_string() -> String {
+    Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn current_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn traffic_threshold_to_bytes(threshold: u32, unit: &str) -> u64 {
+    let multiplier = match unit.trim().to_ascii_uppercase().as_str() {
+        "GB" => 1024_u64 * 1024 * 1024,
+        _ => 1024_u64 * 1024,
+    };
+
+    (threshold as u64).saturating_mul(multiplier)
+}
+
+fn format_bytes_for_alert(bytes: u64) -> String {
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit_index = 0usize;
+
+    while value >= 1024.0 && unit_index < units.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+
+    let precision = if unit_index == 0 { 0 } else { 2 };
+    format!("{value:.precision$} {}", units[unit_index], precision = precision)
+}
+
+fn emit_high_usage_notification(
+    app_handle: &tauri::AppHandle,
+    category: &str,
+    title: &str,
+    message: &str,
+) {
+    let timestamp = current_timestamp_millis();
+    let notification = commands::notifications::InAppNotification {
+        id: format!("{category}-{timestamp}"),
+        notif_type: "warning".to_string(),
+        category: category.to_string(),
+        title: title.to_string(),
+        message: message.to_string(),
+        actions: Vec::new(),
+        timestamp,
+    };
+
+    let _ = app_handle.emit("notification", &notification);
+    let _ = app_handle
+        .notification()
+        .builder()
+        .title(title)
+        .body(message)
+        .show();
+}
+
+fn evaluate_high_usage_warnings(
+    app_handle: &tauri::AppHandle,
+    payload: &commands::monitor::MetricsPayload,
+    todays_total_bytes: u64,
+) {
+    let config = {
+        let config_state = app_handle.state::<Mutex<ConfigState>>();
+        let config_result = match config_state.lock() {
+            Ok(state) => state.config.clone(),
+            Err(_) => return,
+        };
+        config_result
+    };
+
+    let notifications = &config.notifications;
+    let warning_settings = &notifications.warning_settings;
+    let today = current_day_string();
+
+    let mut emit_memory = false;
+    let mut emit_traffic = false;
+
+    {
+        let alert_state = app_handle.state::<Mutex<AlertRuntimeState>>();
+        let Ok(mut state) = alert_state.lock() else {
+            return;
+        };
+
+        if state.traffic_day != today {
+            state.traffic_day = today.clone();
+            state.traffic_warning_active = false;
+        }
+
+        let warnings_enabled = notifications.enabled && notifications.high_usage_warnings;
+        if !warnings_enabled {
+            state.memory_warning_active = false;
+            state.traffic_warning_active = false;
+            return;
+        }
+
+        let memory_threshold = warning_settings.memory_threshold as f64;
+        let memory_exceeded = warning_settings.memory_enabled
+            && warning_settings.memory_threshold > 0
+            && payload.memory.percent_used >= memory_threshold;
+
+        if memory_exceeded && !state.memory_warning_active {
+            state.memory_warning_active = true;
+            emit_memory = true;
+        } else if !memory_exceeded {
+            state.memory_warning_active = false;
+        }
+
+        let traffic_threshold_bytes = traffic_threshold_to_bytes(
+            warning_settings.traffic_threshold,
+            &warning_settings.traffic_unit,
+        );
+        let traffic_exceeded = warning_settings.traffic_enabled
+            && warning_settings.traffic_threshold > 0
+            && todays_total_bytes >= traffic_threshold_bytes;
+
+        if traffic_exceeded && !state.traffic_warning_active {
+            state.traffic_warning_active = true;
+            emit_traffic = true;
+        } else if !traffic_exceeded {
+            state.traffic_warning_active = false;
+        }
+    }
+
+    if emit_memory {
+        emit_high_usage_notification(
+            app_handle,
+            "memory-usage",
+            "Memory usage warning",
+            &format!(
+                "Memory usage reached {:.1}% and crossed your {}% limit.",
+                payload.memory.percent_used, warning_settings.memory_threshold
+            ),
+        );
+    }
+
+    if emit_traffic {
+        emit_high_usage_notification(
+            app_handle,
+            "today-traffic",
+            "Today's traffic warning",
+            &format!(
+                "Today's traffic reached {} and crossed your {} {} limit.",
+                format_bytes_for_alert(todays_total_bytes),
+                warning_settings.traffic_threshold,
+                warning_settings.traffic_unit
+            ),
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct HistoryWriterLock {
+    _handle: HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+fn create_history_writer_state() -> HistoryWriterState {
+    let mut name: Vec<u16> = std::ffi::OsStr::new("Local\\TrafficMonitorHistoryWriter")
+        .encode_wide()
+        .collect();
+    name.push(0);
+
+    let handle = match unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => handle,
+        Err(_) => {
+            return HistoryWriterState {
+                can_write: true,
+                _lock: None,
+            }
+        }
+    };
+
+    let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    if already_exists {
+        HistoryWriterState {
+            can_write: false,
+            _lock: None,
+        }
+    } else {
+        HistoryWriterState {
+            can_write: true,
+            _lock: Some(HistoryWriterLock { _handle: handle }),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn create_history_writer_state() -> HistoryWriterState {
+    HistoryWriterState { can_write: true }
+}
+
+fn main() {
+    let start_minimized = std::env::args().any(|arg| arg == "--minimized");
+
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
+        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
+        .manage(Mutex::new(MonitorState::new()))
+        .manage(Mutex::new(ConfigState::new()))
+        .manage(Mutex::new(HistoryState::new()))
+        .manage(Mutex::new(AlertRuntimeState::default()))
+        .manage(Mutex::new(WidgetDisplayState::default()))
+        .manage(create_history_writer_state());
+
+    if !cfg!(debug_assertions) {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }));
+    }
+
+    builder
+        .invoke_handler(tauri::generate_handler![
+            // Monitor
+            commands::monitor::cmd_get_cpu_usage,
+            commands::monitor::cmd_get_memory_usage,
+            commands::monitor::cmd_get_network_stats,
+            commands::monitor::cmd_get_disk_usage,
+            commands::monitor::cmd_get_network_interfaces,
+            commands::monitor::cmd_get_system_info,
+            // Config
+            commands::config::get_config,
+            commands::config::save_config,
+            commands::config::apply_recommended_settings,
+            commands::config::undo_settings,
+            commands::config::can_undo_settings,
+            // History
+            commands::history::get_traffic_history,
+            // Network Health
+            commands::network_health::get_quality,
+            commands::network_health::measure_latency,
+            commands::network_health::get_signal_strength,
+            commands::network_health::get_network_overview,
+            commands::network_health::run_speed_test,
+            commands::network_health::get_speed_test_history,
+            // App Monitor
+            commands::app_monitor::get_active_applications,
+            commands::app_monitor::get_app_monitor_status,
+            commands::app_monitor::terminate_application,
+            // Data Usage
+            commands::data_usage::get_usage,
+            commands::data_usage::set_data_limit,
+            commands::data_usage::get_remaining_allowance,
+            commands::data_usage::get_data_thresholds,
+            commands::data_usage::compare_usage,
+            // Profile
+            commands::profile::get_profiles,
+            commands::profile::get_active_profile,
+            commands::profile::set_active_profile,
+            commands::profile::get_profile_config,
+            // Troubleshooter
+            commands::troubleshooter::run_diagnostics,
+            // Export
+            commands::export::export_csv,
+            commands::export::export_pdf,
+            // Notifications
+            commands::notifications::dismiss_notification,
+            commands::notifications::notification_action,
+            // Window management
+            cmd_minimize_window,
+            cmd_close_window,
+            cmd_toggle_always_on_top,
+            cmd_show_main_window,
+            cmd_show_history_window,
+            cmd_toggle_widget_lock,
+            cmd_show_widget_context_menu,
+            cmd_get_widget_display_mode,
+        ])
+        .setup(move |app| {
+            if !start_minimized {
+                // Window state persistence can remember a hidden main window after
+                // "close to tray", so force a visible startup on normal launches.
+                show_main_window(app.handle());
+                let startup_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    show_main_window(&startup_handle);
+                });
+            }
+
+            // Create taskbar widget window
+            let taskbar_result = tauri::WebviewWindowBuilder::new(
+                app,
+                "taskbar",
+                tauri::WebviewUrl::App("taskbar.html".into()),
+            )
+            .title("Traffic Monitor Widget")
+            .inner_size(WIDGET_FULL_WIDTH, WIDGET_HEIGHT)
+            .resizable(false)
+            .decorations(false)
+            .transparent(true)
+            .shadow(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .visible(true)
+            .build();
+
+            // Apply initial Windows-specific hardening + grab the raw HWND for the keep-on-top loop
+            #[cfg(target_os = "windows")]
+            let widget_hwnd: Option<isize> = if let Ok(ref taskbar_win) = taskbar_result {
+                if let Ok(hwnd_val) = taskbar_win.hwnd() {
+                    let raw = hwnd_val.0 as isize;
+                    crate::taskbar_embed::apply_widget_styles(raw);
+                    let (preferred_width, preferred_height) =
+                        crate::taskbar_embed::get_window_size(raw).unwrap_or((160, 30));
+                    let _ = crate::taskbar_embed::enforce_widget(
+                        raw,
+                        preferred_width,
+                        preferred_height,
+                    );
+                    Some(raw)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            #[cfg(not(target_os = "windows"))]
+            let widget_hwnd: Option<isize> = None;
+
+            // System tray
+            setup_tray(app)?;
+
+            // Setup autostart based on saved config
+            let do_autostart = {
+                if let Some(state) = app.try_state::<Mutex<crate::commands::config::ConfigState>>()
+                {
+                    if let Ok(s) = state.lock() {
+                        s.config.start_on_boot
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            };
+
+            let autostart_mgr = app.autolaunch();
+            if do_autostart {
+                let _ = autostart_mgr.enable();
+            } else {
+                let _ = autostart_mgr.disable();
+            }
+
+            commands::app_monitor::start_tracker();
+
+            // Start metrics polling loop
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                metrics_loop(app_handle).await;
+            });
+
+            // Start history save loop
+            let app_handle2 = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                history_save_loop(app_handle2).await;
+            });
+
+            // Keep-on-top loop: every 500 ms re-assert TOPMOST so Windows can't push the widget behind
+            let app_handle3 = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                keep_widget_on_top_loop(app_handle3, widget_hwnd).await;
+            });
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Hide instead of close
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let show_item = MenuItemBuilder::with_id("show", "Show").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    let menu = MenuBuilder::new(app)
+        .item(&show_item)
+        .separator()
+        .item(&quit_item)
+        .build()?;
+
+    let icon = Image::from_bytes(include_bytes!("../icons/icon.png")).expect("Failed to load icon");
+
+    TrayIconBuilder::new()
+        .icon(icon)
+        .tooltip("Traffic Monitor")
+        .menu(&menu)
+        .on_menu_event(move |app, event| match event.id().as_ref() {
+            "show" => {
+                show_main_window(app);
+            }
+            "quit" => quit_application(app),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                show_main_window(app);
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+fn show_main_window<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
+    if let Some(window) = manager.get_webview_window("main") {
+        // Set body opacity to 0 first via JS, then show window, then animate opacity to 1.
+        let _ =
+            window.eval("document.body.style.transition='none'; document.body.style.opacity='0';");
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        let _ = window.eval(
+            "setTimeout(function(){\
+                document.body.style.transition='opacity 220ms cubic-bezier(0.16,1,0.3,1)';\
+                document.body.style.opacity='1';\
+            }, 16);",
+        );
+    }
+}
+
+fn quit_application<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
+    if let Some(state) = manager.try_state::<Mutex<HistoryState>>() {
+        if let Ok(mut s) = state.lock() {
+            s.save();
+        }
+    }
+    commands::app_monitor::shutdown_tracker();
+    #[cfg(target_os = "windows")]
+    crate::taskbar_embed::restore_taskbar_layout();
+    manager.app_handle().exit(0);
+}
+
+fn apply_widget_display_mode(app_handle: &tauri::AppHandle, network_only: bool) {
+    if let Some(taskbar) = app_handle.get_webview_window("taskbar") {
+        let width = if network_only {
+            WIDGET_NETWORK_ONLY_WIDTH
+        } else {
+            WIDGET_FULL_WIDTH
+        };
+        let _ = taskbar.set_size(Size::Logical(LogicalSize::new(width, WIDGET_HEIGHT)));
+        let _ = taskbar.emit(
+            "widget-display-mode-changed",
+            WidgetDisplayModePayload { network_only },
+        );
+    }
+}
+
+fn emit_widget_menu_action(
+    app_handle: &tauri::AppHandle,
+    tab: Option<&str>,
+    history_filter: Option<&str>,
+) {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let now = Local::now();
+        let payload = WidgetMenuActionPayload {
+            tab: tab.map(str::to_string),
+            history_filter: history_filter.map(str::to_string),
+            year: (history_filter == Some("monthly")).then_some(now.year()),
+            month: (history_filter == Some("monthly")).then_some(now.month()),
+        };
+        let _ = window.emit("widget-menu-action", payload);
+    }
+}
+
+fn emit_widget_feedback(app_handle: &tauri::AppHandle, message: &str, level: &str) {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let payload = serde_json::json!({
+            "message": message,
+            "level": level,
+        });
+        let _ = window.emit("widget-feedback", payload);
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum WidgetMenuCommand {
+    OpenDashboard,
+    OpenHistory,
+    ViewToday,
+    ViewLast7Days,
+    ViewMonthly,
+    ShowNetworkOnly,
+    ShowCpuMem,
+    ResetSessionCounters,
+    Exit,
+}
+
+#[cfg(target_os = "windows")]
+fn show_widget_context_menu_native(
+    owner_hwnd: HWND,
+    network_only: bool,
+) -> Option<WidgetMenuCommand> {
+    const MENU_OPEN_DASHBOARD: usize = 1001;
+    const MENU_OPEN_HISTORY: usize = 1002;
+    const MENU_VIEW_TODAY: usize = 1101;
+    const MENU_VIEW_LAST_7_DAYS: usize = 1102;
+    const MENU_VIEW_MONTHLY: usize = 1103;
+    const MENU_SHOW_NETWORK_ONLY: usize = 1201;
+    const MENU_SHOW_CPU_MEM: usize = 1202;
+    const MENU_RESET_SESSION_COUNTERS: usize = 1301;
+    const MENU_EXIT: usize = 1302;
+
+    let menu = unsafe { CreatePopupMenu() }.ok()?;
+    let view_menu = unsafe { CreatePopupMenu() }.ok()?;
+    let widget_menu = unsafe { CreatePopupMenu() }.ok()?;
+
+    let open_dashboard = wide_string("Open Dashboard");
+    let open_history = wide_string("Open History");
+    let view = wide_string("View");
+    let today = wide_string("Today");
+    let last_7_days = wide_string("Last 7 Days");
+    let monthly = wide_string("Monthly");
+    let widget = wide_string("Widget");
+    let show_network_only = wide_string("Show Network Only");
+    let show_cpu_mem = wide_string("Show CPU/MEM");
+    let reset_session_counters = wide_string("Reset Session Counters");
+    let exit = wide_string("Exit");
+
+    let menu_ok = unsafe {
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_OPEN_DASHBOARD,
+            PCWSTR(open_dashboard.as_ptr()),
+        )
+        .is_ok()
+            && AppendMenuW(
+                menu,
+                MF_STRING,
+                MENU_OPEN_HISTORY,
+                PCWSTR(open_history.as_ptr()),
+            )
+            .is_ok()
+            && AppendMenuW(
+                view_menu,
+                MF_STRING,
+                MENU_VIEW_TODAY,
+                PCWSTR(today.as_ptr()),
+            )
+            .is_ok()
+            && AppendMenuW(
+                view_menu,
+                MF_STRING,
+                MENU_VIEW_LAST_7_DAYS,
+                PCWSTR(last_7_days.as_ptr()),
+            )
+            .is_ok()
+            && AppendMenuW(
+                view_menu,
+                MF_STRING,
+                MENU_VIEW_MONTHLY,
+                PCWSTR(monthly.as_ptr()),
+            )
+            .is_ok()
+            && AppendMenuW(menu, MF_POPUP, view_menu.0 as usize, PCWSTR(view.as_ptr())).is_ok()
+            && AppendMenuW(
+                widget_menu,
+                if network_only {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                },
+                MENU_SHOW_NETWORK_ONLY,
+                PCWSTR(show_network_only.as_ptr()),
+            )
+            .is_ok()
+            && AppendMenuW(
+                widget_menu,
+                if network_only {
+                    MF_STRING
+                } else {
+                    MF_STRING | MF_CHECKED
+                },
+                MENU_SHOW_CPU_MEM,
+                PCWSTR(show_cpu_mem.as_ptr()),
+            )
+            .is_ok()
+            && AppendMenuW(
+                menu,
+                MF_POPUP,
+                widget_menu.0 as usize,
+                PCWSTR(widget.as_ptr()),
+            )
+            .is_ok()
+            && AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()).is_ok()
+            && AppendMenuW(
+                menu,
+                MF_STRING,
+                MENU_RESET_SESSION_COUNTERS,
+                PCWSTR(reset_session_counters.as_ptr()),
+            )
+            .is_ok()
+            && AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()).is_ok()
+            && AppendMenuW(menu, MF_STRING, MENU_EXIT, PCWSTR(exit.as_ptr())).is_ok()
+    };
+
+    if !menu_ok {
+        unsafe {
+            let _ = DestroyMenu(menu);
+        }
+        return None;
+    }
+
+    let mut cursor = POINT::default();
+    if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+        unsafe {
+            let _ = DestroyMenu(menu);
+        }
+        return None;
+    }
+
+    unsafe {
+        let _ = SetForegroundWindow(owner_hwnd);
+    }
+
+    let selected = unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
+            cursor.x,
+            cursor.y,
+            0,
+            owner_hwnd,
+            None,
+        )
+    };
+
+    unsafe {
+        let _ = PostMessageW(owner_hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+    }
+
+    match selected.0 as usize {
+        MENU_OPEN_DASHBOARD => Some(WidgetMenuCommand::OpenDashboard),
+        MENU_OPEN_HISTORY => Some(WidgetMenuCommand::OpenHistory),
+        MENU_VIEW_TODAY => Some(WidgetMenuCommand::ViewToday),
+        MENU_VIEW_LAST_7_DAYS => Some(WidgetMenuCommand::ViewLast7Days),
+        MENU_VIEW_MONTHLY => Some(WidgetMenuCommand::ViewMonthly),
+        MENU_SHOW_NETWORK_ONLY => Some(WidgetMenuCommand::ShowNetworkOnly),
+        MENU_SHOW_CPU_MEM => Some(WidgetMenuCommand::ShowCpuMem),
+        MENU_RESET_SESSION_COUNTERS => Some(WidgetMenuCommand::ResetSessionCounters),
+        MENU_EXIT => Some(WidgetMenuCommand::Exit),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wide_string(value: &str) -> Vec<u16> {
+    OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+async fn metrics_loop(app_handle: tauri::AppHandle) {
+    // Wait a moment for window to be ready
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    loop {
+        // Get metrics
+        let (payload, uploaded, downloaded) = {
+            let monitor_state = app_handle.state::<Mutex<MonitorState>>();
+            let mut ms = monitor_state.lock().unwrap();
+
+            let cpu = commands::monitor::get_cpu_usage(&mut ms);
+            let memory = commands::monitor::get_memory_usage(&mut ms);
+            let network = commands::monitor::get_network_stats(&mut ms);
+
+            let up = network.uploaded_bytes;
+            let down = network.downloaded_bytes;
+            (
+                commands::monitor::MetricsPayload {
+                    network,
+                    cpu,
+                    memory,
+                },
+                up,
+                down,
+            )
+        };
+
+        // Record traffic in history (separate scope)
+        let todays_total_bytes = {
+            let history_writer = app_handle.state::<HistoryWriterState>();
+            let history_state = app_handle.state::<Mutex<HistoryState>>();
+            let total = if let Ok(mut hs) = history_state.lock() {
+                if history_writer.can_write {
+                    hs.add_traffic(uploaded, downloaded);
+                }
+
+                hs.data
+                    .records
+                    .get(&current_day_string())
+                    .map(|record| record.upload.saturating_add(record.download))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            total
+        };
+
+        // Emit to all windows
+        let _ = app_handle.emit("metrics", &payload);
+        evaluate_high_usage_warnings(&app_handle, &payload, todays_total_bytes);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn history_save_loop(app_handle: tauri::AppHandle) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let history_state = app_handle.state::<Mutex<HistoryState>>();
+        if let Ok(mut hs) = history_state.lock() {
+            hs.save();
+        };
+    }
+}
+
+/// Keeps the taskbar widget pinned over the taskbar by periodically re-applying
+/// native placement and style flags. Windows can reshuffle taskbar child
+/// geometry whenever icons, flyouts, or full-screen apps change state.
+async fn keep_widget_on_top_loop(app_handle: tauri::AppHandle, hwnd_raw: Option<isize>) {
+    // Wait a bit for things to settle on startup
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    #[cfg(target_os = "windows")]
+    let mut last_placement: Option<crate::taskbar_embed::WidgetPlacement> = None;
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let taskbar_window = app_handle.get_webview_window("taskbar");
+        let main_window = app_handle.get_webview_window("main");
+
+        #[cfg(target_os = "windows")]
+        if let Some(raw) = hwnd_raw {
+            let main_hwnd_raw = main_window
+                .as_ref()
+                .and_then(|window| window.hwnd().ok())
+                .map(|hwnd| hwnd.0 as isize);
+
+            let should_show = crate::taskbar_embed::should_widget_be_visible(raw, main_hwnd_raw);
+            if let Some(win) = taskbar_window.as_ref() {
+                if should_show {
+                    let _ = win.show();
+                } else {
+                    crate::taskbar_embed::restore_taskbar_layout();
+                    let _ = win.hide();
+                    continue;
+                }
+            }
+
+            let (preferred_width, preferred_height) =
+                crate::taskbar_embed::get_window_size(raw).unwrap_or((160, 30));
+            if let Some(placement) =
+                crate::taskbar_embed::enforce_widget(raw, preferred_width, preferred_height)
+            {
+                if last_placement.as_ref() != Some(&placement) {
+                    let _ = app_handle.emit("taskbar-placement", &placement);
+                    last_placement = Some(placement);
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        if let Some(win) = taskbar_window.as_ref() {
+            let _ = win.show();
+        }
+    }
+}
+
+// Window management commands
+
+#[tauri::command]
+fn cmd_minimize_window(window: tauri::Window) {
+    let _ = window.minimize();
+}
+
+#[tauri::command]
+fn cmd_close_window(window: tauri::Window) {
+    let _ = window.hide();
+}
+
+#[tauri::command]
+fn cmd_toggle_always_on_top(window: tauri::Window) -> bool {
+    let is_on_top = window.is_always_on_top().unwrap_or(false);
+    let _ = window.set_always_on_top(!is_on_top);
+    !is_on_top
+}
+
+#[tauri::command]
+fn cmd_show_main_window(app_handle: tauri::AppHandle) {
+    show_main_window(&app_handle);
+}
+
+#[tauri::command]
+fn cmd_show_history_window(app_handle: tauri::AppHandle) {
+    show_main_window(&app_handle);
+    emit_widget_menu_action(&app_handle, Some("data-usage"), Some("last7days"));
+}
+
+#[tauri::command]
+fn cmd_toggle_widget_lock(app_handle: tauri::AppHandle, locked: bool) -> bool {
+    if let Some(taskbar) = app_handle.get_webview_window("taskbar") {
+        // When locked: no drag. When unlocked: allow drag via CSS -webkit-app-region
+        // We just return the state; the CSS handles drag behavior
+        let _ = locked; // state tracked in frontend
+        let _ = taskbar;
+    }
+    locked
+}
+
+#[tauri::command]
+fn cmd_get_widget_display_mode(
+    widget_state: tauri::State<'_, Mutex<WidgetDisplayState>>,
+) -> WidgetDisplayModePayload {
+    let network_only = widget_state
+        .lock()
+        .map(|state| state.network_only)
+        .unwrap_or(false);
+    WidgetDisplayModePayload { network_only }
+}
+
+#[tauri::command]
+fn cmd_show_widget_context_menu(
+    app_handle: tauri::AppHandle,
+    widget_state: tauri::State<'_, Mutex<WidgetDisplayState>>,
+    monitor_state: tauri::State<'_, Mutex<MonitorState>>,
+) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let taskbar = match app_handle.get_webview_window("taskbar") {
+            Some(window) => window,
+            None => return false,
+        };
+
+        let owner_hwnd = match taskbar.hwnd() {
+            Ok(hwnd) => HWND(hwnd.0 as isize),
+            Err(_) => return false,
+        };
+
+        let network_only = widget_state
+            .lock()
+            .map(|state| state.network_only)
+            .unwrap_or(false);
+
+        let Some(action) = show_widget_context_menu_native(owner_hwnd, network_only) else {
+            return true;
+        };
+
+        match action {
+            WidgetMenuCommand::OpenDashboard => {
+                show_main_window(&app_handle);
+                emit_widget_menu_action(&app_handle, Some("dashboard"), None);
+            }
+            WidgetMenuCommand::OpenHistory => {
+                cmd_show_history_window(app_handle.clone());
+            }
+            WidgetMenuCommand::ViewToday => {
+                show_main_window(&app_handle);
+                emit_widget_menu_action(&app_handle, Some("data-usage"), Some("today"));
+            }
+            WidgetMenuCommand::ViewLast7Days => {
+                show_main_window(&app_handle);
+                emit_widget_menu_action(&app_handle, Some("data-usage"), Some("last7days"));
+            }
+            WidgetMenuCommand::ViewMonthly => {
+                show_main_window(&app_handle);
+                emit_widget_menu_action(&app_handle, Some("data-usage"), Some("monthly"));
+            }
+            WidgetMenuCommand::ShowNetworkOnly => {
+                if let Ok(mut state) = widget_state.lock() {
+                    state.network_only = true;
+                }
+                apply_widget_display_mode(&app_handle, true);
+            }
+            WidgetMenuCommand::ShowCpuMem => {
+                if let Ok(mut state) = widget_state.lock() {
+                    state.network_only = false;
+                }
+                apply_widget_display_mode(&app_handle, false);
+            }
+            WidgetMenuCommand::ResetSessionCounters => {
+                if let Ok(mut state) = monitor_state.lock() {
+                    commands::monitor::reset_session_counters(&mut state);
+                }
+                emit_widget_feedback(&app_handle, "Session counters reset", "info");
+            }
+            WidgetMenuCommand::Exit => {
+                quit_application(&app_handle);
+            }
+        }
+
+        true
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app_handle;
+        let _ = widget_state;
+        let _ = monitor_state;
+        false
+    }
+}
