@@ -31,9 +31,10 @@ use windows::Win32::{
     Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, POINT, WPARAM},
     System::Threading::CreateMutexW,
     UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW, SetForegroundWindow,
-        TrackPopupMenu, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN,
-        TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_NULL,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, MessageBoxW, PostMessageW,
+        SetForegroundWindow, ShowWindow, TrackPopupMenu, MB_ICONINFORMATION, MB_OK, MF_CHECKED,
+        MF_POPUP, MF_SEPARATOR, MF_STRING, SW_RESTORE, TPM_LEFTALIGN, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_NULL,
     },
 };
 
@@ -45,12 +46,14 @@ pub struct HistoryWriterState {
 
 struct WidgetDisplayState {
     network_only: bool,
+    hidden: bool,
 }
 
 impl Default for WidgetDisplayState {
     fn default() -> Self {
         Self {
             network_only: false,
+            hidden: false,
         }
     }
 }
@@ -74,6 +77,10 @@ struct WidgetMenuActionPayload {
 struct AlertRuntimeState {
     memory_warning_active: bool,
     traffic_warning_active: bool,
+    cpu_temp_warning_active: bool,
+    gpu_temp_warning_active: bool,
+    disk_temp_warning_active: bool,
+    mainboard_temp_warning_active: bool,
     traffic_day: String,
 }
 
@@ -117,6 +124,10 @@ fn format_bytes_for_alert(bytes: u64) -> String {
 
     let precision = if unit_index == 0 { 0 } else { 2 };
     format!("{value:.precision$} {}", units[unit_index], precision = precision)
+}
+
+fn format_temperature_for_alert(value: f64) -> String {
+    format!("{value:.1}°C")
 }
 
 fn emit_high_usage_notification(
@@ -165,6 +176,10 @@ fn evaluate_high_usage_warnings(
 
     let mut emit_memory = false;
     let mut emit_traffic = false;
+    let mut emit_cpu_temp = false;
+    let mut emit_gpu_temp = false;
+    let mut emit_disk_temp = false;
+    let mut emit_mainboard_temp = false;
 
     {
         let alert_state = app_handle.state::<Mutex<AlertRuntimeState>>();
@@ -181,6 +196,10 @@ fn evaluate_high_usage_warnings(
         if !warnings_enabled {
             state.memory_warning_active = false;
             state.traffic_warning_active = false;
+            state.cpu_temp_warning_active = false;
+            state.gpu_temp_warning_active = false;
+            state.disk_temp_warning_active = false;
+            state.mainboard_temp_warning_active = false;
             return;
         }
 
@@ -210,6 +229,66 @@ fn evaluate_high_usage_warnings(
         } else if !traffic_exceeded {
             state.traffic_warning_active = false;
         }
+
+        let cpu_temp_exceeded = warning_settings.cpu_temp_enabled
+            && warning_settings.cpu_temp_threshold > 0
+            && payload
+                .temperatures
+                .cpu
+                .map(|value| value >= warning_settings.cpu_temp_threshold as f64)
+                .unwrap_or(false);
+
+        if cpu_temp_exceeded && !state.cpu_temp_warning_active {
+            state.cpu_temp_warning_active = true;
+            emit_cpu_temp = true;
+        } else if !cpu_temp_exceeded {
+            state.cpu_temp_warning_active = false;
+        }
+
+        let gpu_temp_exceeded = warning_settings.gpu_temp_enabled
+            && warning_settings.gpu_temp_threshold > 0
+            && payload
+                .temperatures
+                .gpu
+                .map(|value| value >= warning_settings.gpu_temp_threshold as f64)
+                .unwrap_or(false);
+
+        if gpu_temp_exceeded && !state.gpu_temp_warning_active {
+            state.gpu_temp_warning_active = true;
+            emit_gpu_temp = true;
+        } else if !gpu_temp_exceeded {
+            state.gpu_temp_warning_active = false;
+        }
+
+        let disk_temp_exceeded = warning_settings.disk_temp_enabled
+            && warning_settings.disk_temp_threshold > 0
+            && payload
+                .temperatures
+                .disk
+                .map(|value| value >= warning_settings.disk_temp_threshold as f64)
+                .unwrap_or(false);
+
+        if disk_temp_exceeded && !state.disk_temp_warning_active {
+            state.disk_temp_warning_active = true;
+            emit_disk_temp = true;
+        } else if !disk_temp_exceeded {
+            state.disk_temp_warning_active = false;
+        }
+
+        let mainboard_temp_exceeded = warning_settings.mainboard_temp_enabled
+            && warning_settings.mainboard_temp_threshold > 0
+            && payload
+                .temperatures
+                .mainboard
+                .map(|value| value >= warning_settings.mainboard_temp_threshold as f64)
+                .unwrap_or(false);
+
+        if mainboard_temp_exceeded && !state.mainboard_temp_warning_active {
+            state.mainboard_temp_warning_active = true;
+            emit_mainboard_temp = true;
+        } else if !mainboard_temp_exceeded {
+            state.mainboard_temp_warning_active = false;
+        }
     }
 
     if emit_memory {
@@ -236,6 +315,66 @@ fn evaluate_high_usage_warnings(
                 warning_settings.traffic_unit
             ),
         );
+    }
+
+    if emit_cpu_temp {
+        if let Some(value) = payload.temperatures.cpu {
+            emit_high_usage_notification(
+                app_handle,
+                "cpu-temperature",
+                "CPU temperature warning",
+                &format!(
+                    "CPU temperature reached {} and crossed your {}°C limit.",
+                    format_temperature_for_alert(value),
+                    warning_settings.cpu_temp_threshold
+                ),
+            );
+        }
+    }
+
+    if emit_gpu_temp {
+        if let Some(value) = payload.temperatures.gpu {
+            emit_high_usage_notification(
+                app_handle,
+                "gpu-temperature",
+                "GPU temperature warning",
+                &format!(
+                    "GPU temperature reached {} and crossed your {}°C limit.",
+                    format_temperature_for_alert(value),
+                    warning_settings.gpu_temp_threshold
+                ),
+            );
+        }
+    }
+
+    if emit_disk_temp {
+        if let Some(value) = payload.temperatures.disk {
+            emit_high_usage_notification(
+                app_handle,
+                "disk-temperature",
+                "Disk temperature warning",
+                &format!(
+                    "Disk temperature reached {} and crossed your {}°C limit.",
+                    format_temperature_for_alert(value),
+                    warning_settings.disk_temp_threshold
+                ),
+            );
+        }
+    }
+
+    if emit_mainboard_temp {
+        if let Some(value) = payload.temperatures.mainboard {
+            emit_high_usage_notification(
+                app_handle,
+                "mainboard-temperature",
+                "Mainboard temperature warning",
+                &format!(
+                    "Mainboard temperature reached {} and crossed your {}°C limit.",
+                    format_temperature_for_alert(value),
+                    warning_settings.mainboard_temp_threshold
+                ),
+            );
+        }
     }
 }
 
@@ -288,7 +427,6 @@ fn main() {
             MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
-        .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .manage(Mutex::new(MonitorState::new()))
@@ -311,6 +449,7 @@ fn main() {
             commands::monitor::cmd_get_memory_usage,
             commands::monitor::cmd_get_network_stats,
             commands::monitor::cmd_get_disk_usage,
+            commands::monitor::cmd_get_temperature_readings,
             commands::monitor::cmd_get_network_interfaces,
             commands::monitor::cmd_get_system_info,
             // Config
@@ -347,7 +486,6 @@ fn main() {
             commands::troubleshooter::run_diagnostics,
             // Export
             commands::export::export_csv,
-            commands::export::export_pdf,
             // Notifications
             commands::notifications::dismiss_notification,
             commands::notifications::notification_action,
@@ -362,13 +500,20 @@ fn main() {
             cmd_get_widget_display_mode,
         ])
         .setup(move |app| {
-            if !start_minimized {
+            if start_minimized {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.minimize();
+                    let _ = window.hide();
+                }
+            } else {
                 // Window state persistence can remember a hidden main window after
                 // "close to tray", so force a visible startup on normal launches.
                 show_main_window(app.handle());
                 let startup_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(350)).await;
+                    show_main_window(&startup_handle);
+                    tokio::time::sleep(Duration::from_millis(950)).await;
                     show_main_window(&startup_handle);
                 });
             }
@@ -379,7 +524,7 @@ fn main() {
                 "taskbar",
                 tauri::WebviewUrl::App("taskbar.html".into()),
             )
-            .title("Traffic Monitor Widget")
+                .title("Watchman Widget")
             .inner_size(WIDGET_FULL_WIDTH, WIDGET_HEIGHT)
             .resizable(false)
             .decorations(false)
@@ -387,7 +532,7 @@ fn main() {
             .shadow(false)
             .always_on_top(true)
             .skip_taskbar(true)
-            .visible(true)
+            .visible(false)
             .build();
 
             // Apply initial Windows-specific hardening + grab the raw HWND for the keep-on-top loop
@@ -472,10 +617,22 @@ fn main() {
 }
 
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let show_item = MenuItemBuilder::with_id("show", "Show").build(app)?;
+    let show_item = MenuItemBuilder::with_id("show", "Open Watchman").build(app)?;
+    let preferences_item = MenuItemBuilder::with_id("preferences", "Preferences").build(app)?;
+    let toggle_widget_item =
+        MenuItemBuilder::with_id("toggle_widget", "Show/Hide Widget").build(app)?;
+    let run_as_admin_item =
+        MenuItemBuilder::with_id("run_as_admin", "Run as Administrator").build(app)?;
+    let restart_item = MenuItemBuilder::with_id("restart", "Restart Watchman").build(app)?;
+    let help_about_item = MenuItemBuilder::with_id("help_about", "Help & About").build(app)?;
     let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
     let menu = MenuBuilder::new(app)
         .item(&show_item)
+        .item(&preferences_item)
+        .item(&toggle_widget_item)
+        .item(&run_as_admin_item)
+        .item(&restart_item)
+        .item(&help_about_item)
         .separator()
         .item(&quit_item)
         .build()?;
@@ -484,12 +641,15 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     TrayIconBuilder::new()
         .icon(icon)
-        .tooltip("Traffic Monitor")
+                    .tooltip("Watchman")
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id().as_ref() {
-            "show" => {
-                show_main_window(app);
-            }
+            "show" => show_main_window(app),
+            "preferences" => open_preferences(app),
+            "toggle_widget" => toggle_widget_visibility(app),
+            "run_as_admin" => relaunch_watchman_as_admin(app),
+            "restart" => restart_watchman(app),
+            "help_about" => show_help_about(app),
             "quit" => quit_application(app),
             _ => {}
         })
@@ -510,19 +670,37 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 fn show_main_window<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
     if let Some(window) = manager.get_webview_window("main") {
-        // Set body opacity to 0 first via JS, then show window, then animate opacity to 1.
-        let _ =
-            window.eval("document.body.style.transition='none'; document.body.style.opacity='0';");
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
-        let _ = window.eval(
-            "setTimeout(function(){\
-                document.body.style.transition='opacity 220ms cubic-bezier(0.16,1,0.3,1)';\
-                document.body.style.opacity='1';\
-            }, 16);",
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(hwnd) = window.hwnd() {
+                unsafe {
+                    let raw = HWND(hwnd.0 as isize);
+                    let _ = ShowWindow(raw, SW_RESTORE);
+                    let _ = SetForegroundWindow(raw);
+                }
+            }
+        }
+    }
+}
+
+fn emit_main_window_action<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>, action: &str) {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let _ = window.emit(
+            "tray-menu-action",
+            serde_json::json!({
+                "action": action,
+            }),
         );
     }
+}
+
+fn open_preferences<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
+    show_main_window(manager);
+    let app_handle = manager.app_handle().clone();
+    emit_main_window_action(&app_handle, "open-preferences");
 }
 
 fn quit_application<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
@@ -552,6 +730,116 @@ fn apply_widget_display_mode(app_handle: &tauri::AppHandle, network_only: bool) 
     }
 }
 
+fn toggle_widget_visibility<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
+    let app_handle = manager.app_handle().clone();
+    let hidden = {
+        let widget_state = app_handle.state::<Mutex<WidgetDisplayState>>();
+        let result = if let Ok(mut state) = widget_state.lock() {
+            state.hidden = !state.hidden;
+            state.hidden
+        } else {
+            return;
+        };
+        result
+    };
+
+    if let Some(taskbar) = app_handle.get_webview_window("taskbar") {
+        if hidden {
+            #[cfg(target_os = "windows")]
+            crate::taskbar_embed::restore_taskbar_layout();
+            let _ = taskbar.hide();
+            emit_widget_feedback(&app_handle, "Taskbar widget hidden", "info");
+        } else {
+            let _ = taskbar.show();
+            emit_widget_feedback(&app_handle, "Taskbar widget shown", "info");
+        }
+    }
+}
+
+fn restart_watchman<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => {
+            let app_handle = manager.app_handle().clone();
+            emit_widget_feedback(&app_handle, "Could not restart Watchman", "error");
+            return;
+        }
+    };
+
+    if std::process::Command::new(current_exe).spawn().is_ok() {
+        quit_application(manager);
+    } else {
+        let app_handle = manager.app_handle().clone();
+        emit_widget_feedback(&app_handle, "Could not restart Watchman", "error");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn relaunch_watchman_as_admin<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => {
+            let app_handle = manager.app_handle().clone();
+            emit_widget_feedback(&app_handle, "Could not relaunch as administrator", "error");
+            return;
+        }
+    };
+
+    let exe_path = current_exe.to_string_lossy().replace('\'', "''");
+    let command = format!("Start-Process -FilePath '{exe_path}' -Verb RunAs");
+    let status = std::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-WindowStyle")
+        .arg("Hidden")
+        .arg("-Command")
+        .arg(command)
+        .status();
+
+    match status {
+        Ok(status) if status.success() => quit_application(manager),
+        _ => {
+            let app_handle = manager.app_handle().clone();
+            emit_widget_feedback(&app_handle, "Could not relaunch as administrator", "error")
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn relaunch_watchman_as_admin<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
+    emit_widget_feedback(
+        &manager.app_handle(),
+        "Administrator relaunch is only available on Windows",
+        "info",
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn show_help_about<R: tauri::Runtime, M: Manager<R>>(_manager: &M) {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    let title = wide_string("Help & About");
+    let message = wide_string(&format!(
+        "Watchman v{VERSION}\n\nWatchman monitors your network activity, taskbar widget, and system status.\n\nTips:\n- Use Preferences for warning thresholds and startup options.\n- Run as administrator for per-app bandwidth and temperature warnings.\n- Use Show/Hide Widget from the tray if you want to hide the taskbar widget temporarily."
+    ));
+
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(message.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_help_about<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
+    emit_widget_feedback(
+        &manager.app_handle(),
+        &format!("Watchman v{}", env!("CARGO_PKG_VERSION")),
+        "info",
+    );
+}
+
 fn emit_widget_menu_action(
     app_handle: &tauri::AppHandle,
     tab: Option<&str>,
@@ -569,7 +857,11 @@ fn emit_widget_menu_action(
     }
 }
 
-fn emit_widget_feedback(app_handle: &tauri::AppHandle, message: &str, level: &str) {
+fn emit_widget_feedback<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    message: &str,
+    level: &str,
+) {
     if let Some(window) = app_handle.get_webview_window("main") {
         let payload = serde_json::json!({
             "message": message,
@@ -763,6 +1055,9 @@ fn wide_string(value: &str) -> Vec<u16> {
 async fn metrics_loop(app_handle: tauri::AppHandle) {
     // Wait a moment for window to be ready
     tokio::time::sleep(Duration::from_secs(1)).await;
+    let resource_dir = app_handle.path().resource_dir().ok();
+    let temperature_probe_paths =
+        commands::monitor::resolve_temperature_probe_paths(resource_dir.as_deref());
 
     loop {
         // Get metrics
@@ -772,6 +1067,11 @@ async fn metrics_loop(app_handle: tauri::AppHandle) {
 
             let cpu = commands::monitor::get_cpu_usage(&mut ms);
             let memory = commands::monitor::get_memory_usage(&mut ms);
+            let gpu = commands::monitor::get_gpu_usage(&mut ms);
+            let temperatures = commands::monitor::get_temperature_readings(
+                &mut ms,
+                temperature_probe_paths.as_ref(),
+            );
             let network = commands::monitor::get_network_stats(&mut ms);
 
             let up = network.uploaded_bytes;
@@ -781,6 +1081,8 @@ async fn metrics_loop(app_handle: tauri::AppHandle) {
                     network,
                     cpu,
                     memory,
+                    gpu,
+                    temperatures,
                 },
                 up,
                 down,
@@ -839,6 +1141,20 @@ async fn keep_widget_on_top_loop(app_handle: tauri::AppHandle, hwnd_raw: Option<
 
         let taskbar_window = app_handle.get_webview_window("taskbar");
         let main_window = app_handle.get_webview_window("main");
+        let widget_hidden = app_handle
+            .state::<Mutex<WidgetDisplayState>>()
+            .lock()
+            .map(|state| state.hidden)
+            .unwrap_or(false);
+
+        if widget_hidden {
+            #[cfg(target_os = "windows")]
+            crate::taskbar_embed::restore_taskbar_layout();
+            if let Some(win) = taskbar_window.as_ref() {
+                let _ = win.hide();
+            }
+            continue;
+        }
 
         #[cfg(target_os = "windows")]
         if let Some(raw) = hwnd_raw {

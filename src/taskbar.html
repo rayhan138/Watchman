@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Traffic Monitor - Taskbar</title>
+  <title>Watchman - Taskbar</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
       --widget-font-size: 11px;
@@ -25,17 +25,13 @@
 
     body {
       font-family: 'JetBrains Mono', 'Consolas', monospace;
-      color: #e0e0e0;
       overflow: hidden;
       cursor: default;
       height: 100vh;
       display: flex;
       align-items: center;
-    }
-
-    body[data-edge="top"],
-    body[data-edge="bottom"] {
       justify-content: center;
+      color: #d0d0e8;
     }
 
     body[data-edge="left"],
@@ -48,40 +44,62 @@
       align-items: center;
       gap: 0;
       padding: 0 4px;
-      height: 100%;
       width: 100%;
+      height: 100%;
+      min-height: 28px;
       background: transparent !important;
       border: none;
       border-radius: 0;
+      transition: background 0.16s ease;
+    }
+
+    .taskbar-widget:hover {
+      background: rgba(255, 255, 255, 0.03) !important;
     }
 
     .stat-group {
       display: flex;
       flex-direction: column;
       justify-content: center;
-      gap: 0px;
+      gap: 1px;
       padding: 1px 4px;
-      border-right: none;
-      height: 100%;
-    }
-
-    .stat-group:last-child {
-      border-right: none;
     }
 
     .stat-row {
       display: flex;
       align-items: center;
       gap: 4px;
-      line-height: 1.1;
+      line-height: 1.05;
       white-space: nowrap;
     }
 
-    .stat-arrow {
+    .stat-row[hidden],
+    .stat-group[hidden] {
+      display: none !important;
+    }
+
+    .stat-arrow,
+    .stat-label,
+    .stat-value,
+    .stat-percent {
       font-size: var(--widget-font-size);
-      font-weight: 600;
+      font-weight: 700;
+    }
+
+    .stat-arrow {
       width: 12px;
       text-align: center;
+    }
+
+    .stat-value {
+      min-width: 68px;
+      text-align: right;
+      color: #f5f6f8;
+    }
+
+    .stat-percent {
+      min-width: 30px;
+      text-align: right;
     }
 
     .stat-arrow.up {
@@ -92,57 +110,23 @@
       color: #00d4ff;
     }
 
-    .stat-value {
-      font-size: var(--widget-font-size);
-      font-weight: 500;
-      min-width: 68px;
-      text-align: right;
-      color: #d0d0e8;
-      letter-spacing: -0.2px;
-    }
-
-    .stat-label {
-      font-size: var(--widget-font-size);
-      font-weight: 600;
-      letter-spacing: 0.2px;
-    }
-
-    .cpu-label {
-      color: #ffb74d;
-    }
-
-    .mem-label {
-      color: #66bb6a;
-    }
-
-    .stat-percent {
-      font-size: var(--widget-font-size);
-      font-weight: 600;
-      min-width: 26px;
-      text-align: right;
-    }
-
+    .cpu-label,
     .cpu-value {
       color: #ffb74d;
     }
 
+    .mem-label,
     .mem-value {
       color: #66bb6a;
     }
 
-    /* Hover effect */
-    .taskbar-widget:hover {
-      background: rgba(255, 255, 255, 0.03) !important;
-    }
-
     body[data-mode="network-only"] #cpuMemGroup {
-      display: none;
+      display: none !important;
     }
 
-    /* Pulse animation for active data */
     @keyframes dataPulse {
       0%, 100% { opacity: 1; }
-      50% { opacity: 0.7; }
+      50% { opacity: 0.84; }
     }
 
     .active-data {
@@ -150,35 +134,33 @@
     }
   </style>
 </head>
-<body>
+<body data-mode="full">
   <div class="taskbar-widget" id="taskbarWidget">
-    <!-- Network Speed -->
     <div class="stat-group" id="networkGroup">
-      <div class="stat-row">
-        <span class="stat-arrow up">↑</span>
-        <span class="stat-value" id="uploadSpeed">0.00 KB/s</span>
+      <div class="stat-row" id="uploadRow">
+        <span class="stat-arrow up">&#8593;</span>
+        <span class="stat-value" id="uploadSpeed">0.0 KB/s</span>
       </div>
-      <div class="stat-row">
-        <span class="stat-arrow down">↓</span>
-        <span class="stat-value" id="downloadSpeed">0.00 KB/s</span>
+      <div class="stat-row" id="downloadRow">
+        <span class="stat-arrow down">&#8595;</span>
+        <span class="stat-value" id="downloadSpeed">0.0 KB/s</span>
       </div>
     </div>
 
-    <!-- CPU & Memory -->
     <div class="stat-group" id="cpuMemGroup">
-      <div class="stat-row">
+      <div class="stat-row" id="cpuRow">
         <span class="stat-label cpu-label">CPU</span>
-        <span class="stat-percent cpu-value" id="cpuValue">0 %</span>
+        <span class="stat-percent cpu-value" id="cpuValue">0%</span>
       </div>
-      <div class="stat-row">
+      <div class="stat-row" id="memRow">
         <span class="stat-label mem-label">MEM</span>
-        <span class="stat-percent mem-value" id="memValue">0 %</span>
+        <span class="stat-percent mem-value" id="memValue">0%</span>
       </div>
     </div>
   </div>
 
   <script>
-    (function() {
+    (function () {
       'use strict';
 
       function waitForTauri(callback) {
@@ -189,7 +171,6 @@
         }
       }
 
-      // Embedded mode defaults to fixed positioning.
       document.body.style.webkitAppRegion = 'no-drag';
 
       waitForTauri(() => {
@@ -197,21 +178,29 @@
         const { invoke } = window.__TAURI__.core;
 
         const dom = {
+          widget: document.getElementById('taskbarWidget'),
+          uploadRow: document.getElementById('uploadRow'),
+          downloadRow: document.getElementById('downloadRow'),
+          cpuMemGroup: document.getElementById('cpuMemGroup'),
           uploadSpeed: document.getElementById('uploadSpeed'),
           downloadSpeed: document.getElementById('downloadSpeed'),
           cpuValue: document.getElementById('cpuValue'),
-          memValue: document.getElementById('memValue'),
-          widget: document.getElementById('taskbarWidget')
+          memValue: document.getElementById('memValue')
         };
 
         function formatSpeed(bytesPerSec) {
-          if (bytesPerSec < 1024 * 1024) {
-            return (bytesPerSec / 1024).toFixed(1) + ' KB/s';
-          } else if (bytesPerSec < 1024 * 1024 * 1024) {
-            return (bytesPerSec / (1024 * 1024)).toFixed(2) + ' MB/s';
-          } else {
-            return (bytesPerSec / (1024 * 1024 * 1024)).toFixed(2) + ' GB/s';
+          if (!bytesPerSec || bytesPerSec < 1024 * 1024) {
+            return `${((bytesPerSec || 0) / 1024).toFixed(1)} KB/s`;
           }
+          if (bytesPerSec < 1024 * 1024 * 1024) {
+            return `${(bytesPerSec / (1024 * 1024)).toFixed(2)} MB/s`;
+          }
+          return `${(bytesPerSec / (1024 * 1024 * 1024)).toFixed(2)} GB/s`;
+        }
+
+        function markActive(row, bytesPerSec) {
+          if (!row) return;
+          row.classList.toggle('active-data', Number(bytesPerSec || 0) > 0);
         }
 
         function applyWidgetDisplayMode(payload) {
@@ -222,7 +211,6 @@
         listen('taskbar-placement', (event) => {
           const placement = event.payload || {};
           document.body.dataset.edge = placement.edge || 'bottom';
-          document.body.dataset.anchor = placement.anchor || 'tray';
         });
 
         listen('widget-display-mode-changed', (event) => {
@@ -231,22 +219,25 @@
 
         listen('metrics', (event) => {
           try {
-            const { network: net, cpu, memory: mem } = event.payload;
-            if (net) {
-              dom.uploadSpeed.textContent = formatSpeed(net.uploadSpeed);
-              dom.downloadSpeed.textContent = formatSpeed(net.downloadSpeed);
-            }
-            if (cpu) {
-              dom.cpuValue.textContent = Math.round(cpu.overall) + ' %';
-            }
-            if (mem) {
-              dom.memValue.textContent = Math.round(mem.percentUsed) + ' %';
-            }
-          } catch (e) {}
+            const payload = event.payload || {};
+            const network = payload.network || {};
+            const cpu = payload.cpu || {};
+            const memory = payload.memory || {};
+
+            dom.uploadSpeed.textContent = formatSpeed(network.uploadSpeed);
+            dom.downloadSpeed.textContent = formatSpeed(network.downloadSpeed);
+            dom.cpuValue.textContent = `${Math.round(cpu.overall || 0)}%`;
+            dom.memValue.textContent = `${Math.round(memory.percentUsed || 0)}%`;
+
+            markActive(dom.uploadRow, network.uploadSpeed);
+            markActive(dom.downloadRow, network.downloadSpeed);
+          } catch (_) {}
         });
 
         invoke('cmd_get_widget_display_mode')
-          .then(applyWidgetDisplayMode)
+          .then((payload) => {
+            applyWidgetDisplayMode(payload || {});
+          })
           .catch(() => {});
 
         dom.widget.addEventListener('dblclick', () => {

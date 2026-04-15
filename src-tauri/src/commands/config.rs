@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Mutex;
+use tauri::Emitter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -337,6 +338,7 @@ pub fn save_config(
     }
     s.config = serde_json::from_value(current_val.clone()).unwrap_or_default();
     save_config_to_path(&s.config_path, &s.config);
+    let _ = app_handle.emit("config-updated", &s.config);
 
     // Enforce autostart matching config
     {

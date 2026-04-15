@@ -851,7 +851,7 @@ fn monitor_status_from_state(session_state: TraceSessionState) -> AppMonitorStat
             bandwidth_available: false,
             requires_admin: true,
             message: Some(
-                "Run Traffic Monitor as administrator to show per-app bandwidth on Windows."
+                "Run Watchman as administrator to show per-app bandwidth on Windows."
                     .to_string(),
             ),
         },

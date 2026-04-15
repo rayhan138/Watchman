@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Traffic Monitor</title>
+  <title>Watchman</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Nunito+Sans:wght@400;600;700;800&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/plugins/monthSelect/style.css">
   <link rel="stylesheet" href="styles.css">
@@ -22,12 +22,8 @@
   <div class="titlebar" id="titlebar">
     <div class="titlebar-drag">
       <div class="app-title-wrapper">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <circle cx="12" cy="12" r="10"/>
-          <circle cx="12" cy="12" r="6"/>
-          <circle cx="12" cy="12" r="2"/>
-        </svg>
-        <span class="titlebar-title">Traffic Monitor</span>
+        <img class="titlebar-logo" src="watchman-logo.svg" alt="Watchman logo">
+        <span class="titlebar-title">Watchman</span>
       </div>
     </div>
     <div class="titlebar-controls">
@@ -41,11 +37,6 @@
       <button class="titlebar-btn theme-btn" id="themeToggleBtn" title="Toggle Theme">
         <svg id="themeIcon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
           <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
-        </svg>
-      </button>
-      <button class="titlebar-btn pin-btn" id="pinBtn" title="Lock Taskbar Widget">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M12 17v5M9 2h6l-1 7h3l-5 8h-1l1-8H9l1-7z"/>
         </svg>
       </button>
       <button class="titlebar-btn minimize-btn" id="minimizeBtn" title="Minimize">
@@ -186,15 +177,15 @@
           <div class="gauge-sub" id="ramInfo">-- / -- GB</div>
         </div>
 
-        <div class="gauge-card" id="diskGaugeCard">
+        <div class="gauge-card" id="gpuGaugeCard">
           <div class="minimal-gauge">
-            <div class="gauge-fill" id="diskRing" style="background: rgba(0,0,0,0.2)"></div>
+            <div class="gauge-fill" id="gpuRing" style="background: rgba(0,0,0,0.2)"></div>
             <div class="gauge-center">
-              <span class="gauge-value" id="diskValue">0</span><span class="gauge-percent">%</span>
+              <span class="gauge-value" id="gpuValue">0</span><span class="gauge-percent">%</span>
             </div>
           </div>
-          <div class="gauge-label">Disk</div>
-          <div class="gauge-sub" id="diskInfo">-- / -- GB</div>
+          <div class="gauge-label">GPU</div>
+          <div class="gauge-sub" id="gpuInfo">Waiting for data</div>
         </div>
       </section>
 
@@ -665,9 +656,11 @@
             </div>
             <input type="checkbox" id="cfgWarnMainboardTempEnabled" class="toggle-checkbox warning-toggle">
           </div>
+          <div class="warning-temperature-note">Temperature warnings may require administrator mode on some systems.</div>
         </div>
 
         <div class="settings-divider"></div>
+        <div class="settings-version">Watchman v1.0.0</div>
 
         <!-- Recommended + Undo (Task 20) -->
         <div class="settings-actions-row">

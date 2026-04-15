@@ -16,7 +16,6 @@
     isConnected: false,
     systemInfoLoaded: false,
     networkDetailsLoaded: false,
-    pinned: false,
     currentTab: 'dashboard',
     tabsInitialized: new Set(),
     appPollInterval: null,
@@ -24,6 +23,14 @@
     latencyPollInterval: null,
     currentDataPeriod: 'daily',
     exportFormat: 'csv',
+    latestMetrics: {
+      network: {
+        downloadSpeed: 18.2 * 1024,
+        uploadSpeed: 7.2 * 1024
+      },
+      cpu: { overall: 23 },
+      memory: { percentUsed: 76 }
+    },
 
     peakSpeed: 10, // MB/s, for traffic light calculation
     currentDownloadSpeed: 0, // bytes/sec, live from metrics
@@ -40,6 +47,8 @@
 
   // ====== DOM References ======
   const dom = {
+    content: document.getElementById('content'),
+
     // Speed
     downloadSpeed: document.getElementById('downloadSpeed'),
     downloadUnit: document.getElementById('downloadUnit'),
@@ -55,9 +64,9 @@
     ramValue: document.getElementById('ramValue'),
     ramRing: document.getElementById('ramRing'),
     ramInfo: document.getElementById('ramInfo'),
-    diskValue: document.getElementById('diskValue'),
-    diskRing: document.getElementById('diskRing'),
-    diskInfo: document.getElementById('diskInfo'),
+    gpuValue: document.getElementById('gpuValue'),
+    gpuRing: document.getElementById('gpuRing'),
+    gpuInfo: document.getElementById('gpuInfo'),
 
     // History
     historyViewType: document.getElementById('historyViewType'),
@@ -65,7 +74,9 @@
 
     // Details
     networkDetailsTable: document.getElementById('networkDetailsTable'),
+    networkDetailsContent: document.getElementById('networkDetailsContent'),
     systemInfoTable: document.getElementById('systemInfoTable'),
+    systemInfoContent: document.getElementById('systemInfoContent'),
 
     // Status
     statusDot: document.getElementById('statusDot'),
@@ -75,7 +86,6 @@
     // Controls
     minimizeBtn: document.getElementById('minimizeBtn'),
     closeBtn: document.getElementById('closeBtn'),
-    pinBtn: document.getElementById('pinBtn'),
     networkDetailsToggle: document.getElementById('networkDetailsToggle'),
     networkDetailsPanel: document.getElementById('networkDetailsPanel'),
     systemInfoToggle: document.getElementById('systemInfoToggle'),
@@ -169,6 +179,38 @@
     exportBtn: document.getElementById('exportBtn'),
     exportStatus: document.getElementById('exportStatus'),
 
+    // Widget Tab
+    widgetApplyBtn: document.getElementById('widgetApplyBtn'),
+    widgetResetBtn: document.getElementById('widgetResetBtn'),
+    widgetUseBackground: document.getElementById('widgetUseBackground'),
+    widgetBackgroundColor: document.getElementById('widgetBackgroundColor'),
+    widgetAccentColor: document.getElementById('widgetAccentColor'),
+    widgetTextColor: document.getElementById('widgetTextColor'),
+    widgetTransparency: document.getElementById('widgetTransparency'),
+    widgetTransparencyValue: document.getElementById('widgetTransparencyValue'),
+    widgetCompactSpacing: document.getElementById('widgetCompactSpacing'),
+    widgetOrder: document.getElementById('widgetOrder'),
+    widgetMode: document.getElementById('widgetMode'),
+    widgetShowDownload: document.getElementById('widgetShowDownload'),
+    widgetShowUpload: document.getElementById('widgetShowUpload'),
+    widgetShowCpu: document.getElementById('widgetShowCpu'),
+    widgetShowRam: document.getElementById('widgetShowRam'),
+    widgetTextSize: document.getElementById('widgetTextSize'),
+    widgetTextSizeValue: document.getElementById('widgetTextSizeValue'),
+    widgetFontStyle: document.getElementById('widgetFontStyle'),
+    widgetPreview: document.getElementById('widgetPreview'),
+    widgetPreviewNetworkGroup: document.getElementById('widgetPreviewNetworkGroup'),
+    widgetPreviewSystemGroup: document.getElementById('widgetPreviewSystemGroup'),
+    widgetPreviewUploadRow: document.getElementById('widgetPreviewUploadRow'),
+    widgetPreviewDownloadRow: document.getElementById('widgetPreviewDownloadRow'),
+    widgetPreviewCpuRow: document.getElementById('widgetPreviewCpuRow'),
+    widgetPreviewRamRow: document.getElementById('widgetPreviewRamRow'),
+    widgetPreviewUploadValue: document.getElementById('widgetPreviewUploadValue'),
+    widgetPreviewDownloadValue: document.getElementById('widgetPreviewDownloadValue'),
+    widgetPreviewCpuValue: document.getElementById('widgetPreviewCpuValue'),
+    widgetPreviewRamValue: document.getElementById('widgetPreviewRamValue'),
+    widgetPresetButtons: Array.from(document.querySelectorAll('[data-widget-preset]')),
+
 
 
     // Enhanced Settings (Task 20)
@@ -206,6 +248,7 @@
 
   let localConfig = {};
   let settingsBaselineConfig = null;
+  let widgetSettingsBaseline = null;
 
   // ====== Utility Functions ======
 
@@ -329,6 +372,20 @@
     };
   }
 
+  async function openSettingsModal() {
+    dom.settingsModal.classList.add('show');
+    await updateUndoState();
+    try {
+      localConfig = await window.systemAPI.getConfig();
+      applyConfigToDOM();
+      settingsBaselineConfig = cloneConfig(localConfig);
+      applySettingsModalToDOM(settingsBaselineConfig);
+      updateSettingsSaveState();
+    } catch (e) {
+      console.error('Failed to load settings modal data:', e);
+    }
+  }
+
   function applySettingsModalToDOM(sourceConfig = localConfig) {
     dom.cfgStartOnBoot.checked = !!sourceConfig.startOnBoot;
     dom.cfgUnitMode.checked = !!sourceConfig.unitModeBits;
@@ -373,6 +430,342 @@
     return nextConfig;
   }
 
+  function normalizeWidgetMode(mode) {
+    return ['full', 'network-only', 'system-only'].includes(mode) ? mode : 'full';
+  }
+
+  function getDefaultWidgetSettings(sourceConfig = localConfig) {
+    const settings = sourceConfig.widgetSettings || {};
+    return {
+      useBackground: !!settings.useBackground,
+      backgroundColor: settings.backgroundColor || '#14171d',
+      accentColor: settings.accentColor || '#20d39c',
+      textColor: settings.textColor || '#f7f4ed',
+      transparency: Number.isFinite(settings.transparency) ? settings.transparency : 24,
+      textSize: Number.isFinite(settings.textSize) ? settings.textSize : 11,
+      compactSpacing: settings.compactSpacing !== false,
+      order: settings.order === 'system-first' ? 'system-first' : 'network-first',
+      mode: normalizeWidgetMode(settings.mode),
+      showDownload: settings.showDownload !== false,
+      showUpload: settings.showUpload !== false,
+      showCpu: settings.showCpu !== false,
+      showRam: settings.showRam !== false,
+      fontStyle: ['jetbrains', 'inter', 'outfit', 'nunito', 'plex'].includes(settings.fontStyle)
+        ? settings.fontStyle
+        : 'jetbrains',
+      hoverEffect: false,
+      animateActiveData: false
+    };
+  }
+
+  function getWidgetPreset(name) {
+    const presets = {
+      default: {
+        useBackground: false,
+        backgroundColor: '#14171d',
+        accentColor: '#20d39c',
+        textColor: '#f7f4ed',
+        transparency: 24,
+        textSize: 11,
+        compactSpacing: true,
+        order: 'network-first',
+        mode: 'full',
+        showDownload: true,
+        showUpload: true,
+        showCpu: true,
+        showRam: true,
+        fontStyle: 'jetbrains',
+        animateActiveData: false
+      },
+      minimal: {
+        useBackground: false,
+        backgroundColor: '#111318',
+        accentColor: '#8bb7ff',
+        textColor: '#fbf8f2',
+        transparency: 0,
+        textSize: 10,
+        compactSpacing: true,
+        order: 'network-first',
+        mode: 'network-only',
+        showDownload: true,
+        showUpload: true,
+        showCpu: true,
+        showRam: true,
+        fontStyle: 'jetbrains',
+        animateActiveData: false
+      },
+      'soft-dark': {
+        useBackground: true,
+        backgroundColor: '#16181f',
+        accentColor: '#f3bf6a',
+        textColor: '#f8f3ea',
+        transparency: 22,
+        textSize: 11,
+        compactSpacing: false,
+        order: 'network-first',
+        mode: 'full',
+        showDownload: true,
+        showUpload: true,
+        showCpu: true,
+        showRam: true,
+        fontStyle: 'inter',
+        animateActiveData: false
+      },
+      glass: {
+        useBackground: true,
+        backgroundColor: '#dde6f4',
+        accentColor: '#20d39c',
+        textColor: '#0f141b',
+        transparency: 62,
+        textSize: 11,
+        compactSpacing: false,
+        order: 'system-first',
+        mode: 'full',
+        showDownload: true,
+        showUpload: true,
+        showCpu: true,
+        showRam: true,
+        fontStyle: 'outfit',
+        animateActiveData: false
+      },
+      'high-contrast': {
+        useBackground: true,
+        backgroundColor: '#000000',
+        accentColor: '#ffd166',
+        textColor: '#ffffff',
+        transparency: 0,
+        textSize: 12,
+        compactSpacing: false,
+        order: 'network-first',
+        mode: 'full',
+        showDownload: true,
+        showUpload: true,
+        showCpu: true,
+        showRam: true,
+        fontStyle: 'plex',
+        animateActiveData: false
+      }
+    };
+
+    return cloneConfig(presets[name] || presets.default);
+  }
+
+  function getWidgetFontFamily(fontStyle) {
+    switch (fontStyle) {
+      case 'inter':
+        return "'Inter', sans-serif";
+      case 'outfit':
+        return "'Outfit', sans-serif";
+      case 'nunito':
+        return "'Nunito Sans', sans-serif";
+      case 'plex':
+        return "'IBM Plex Sans', sans-serif";
+      default:
+        return "'JetBrains Mono', 'Consolas', monospace";
+    }
+  }
+
+  function hexToRgba(hex, alpha = 1) {
+    const value = String(hex || '').replace('#', '');
+    if (value.length !== 6) return `rgba(20, 23, 29, ${alpha})`;
+    const r = Number.parseInt(value.slice(0, 2), 16);
+    const g = Number.parseInt(value.slice(2, 4), 16);
+    const b = Number.parseInt(value.slice(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+
+  function getWidgetPreviewSpeed(bytesPerSec) {
+    const formatted = formatSpeed(bytesPerSec || 0);
+    return `${formatted.value} ${formatted.unit}`;
+  }
+
+  function collectWidgetSettingsFromDOM() {
+    return {
+      useBackground: !!dom.widgetUseBackground?.checked,
+      backgroundColor: dom.widgetBackgroundColor?.value || '#14171d',
+      accentColor: dom.widgetAccentColor?.value || '#20d39c',
+      textColor: dom.widgetTextColor?.value || '#f7f4ed',
+      transparency: Number.parseInt(dom.widgetTransparency?.value || '24', 10) || 0,
+      textSize: Number.parseInt(dom.widgetTextSize?.value || '11', 10) || 11,
+      compactSpacing: !!dom.widgetCompactSpacing?.checked,
+      order: dom.widgetOrder?.value === 'system-first' ? 'system-first' : 'network-first',
+      mode: normalizeWidgetMode(dom.widgetMode?.value),
+      showDownload: !!dom.widgetShowDownload?.checked,
+      showUpload: !!dom.widgetShowUpload?.checked,
+      showCpu: !!dom.widgetShowCpu?.checked,
+      showRam: !!dom.widgetShowRam?.checked,
+      fontStyle: dom.widgetFontStyle?.value || 'jetbrains',
+      hoverEffect: false,
+      animateActiveData: false
+    };
+  }
+
+  function applyWidgetSettingsToDOM(sourceConfig = localConfig, updateBaseline = true) {
+    const settings = getDefaultWidgetSettings(sourceConfig);
+
+    if (dom.widgetUseBackground) dom.widgetUseBackground.checked = settings.useBackground;
+    if (dom.widgetBackgroundColor) dom.widgetBackgroundColor.value = settings.backgroundColor;
+    if (dom.widgetAccentColor) dom.widgetAccentColor.value = settings.accentColor;
+    if (dom.widgetTextColor) dom.widgetTextColor.value = settings.textColor;
+    if (dom.widgetTransparency) dom.widgetTransparency.value = settings.transparency;
+    if (dom.widgetTransparencyValue) dom.widgetTransparencyValue.textContent = `${settings.transparency}%`;
+    if (dom.widgetCompactSpacing) dom.widgetCompactSpacing.checked = settings.compactSpacing;
+    if (dom.widgetOrder) dom.widgetOrder.value = settings.order;
+    if (dom.widgetMode) dom.widgetMode.value = settings.mode;
+    if (dom.widgetShowDownload) dom.widgetShowDownload.checked = settings.showDownload;
+    if (dom.widgetShowUpload) dom.widgetShowUpload.checked = settings.showUpload;
+    if (dom.widgetShowCpu) dom.widgetShowCpu.checked = settings.showCpu;
+    if (dom.widgetShowRam) dom.widgetShowRam.checked = settings.showRam;
+    if (dom.widgetTextSize) dom.widgetTextSize.value = settings.textSize;
+    if (dom.widgetTextSizeValue) dom.widgetTextSizeValue.textContent = `${settings.textSize}px`;
+    if (dom.widgetFontStyle) dom.widgetFontStyle.value = settings.fontStyle;
+
+    if (updateBaseline) {
+      widgetSettingsBaseline = cloneConfig(settings);
+    }
+    updateWidgetPreview();
+    updateWidgetTabActionState();
+  }
+
+  function buildWidgetConfig(baseConfig = localConfig) {
+    const nextConfig = cloneConfig(baseConfig);
+    nextConfig.widgetSettings = collectWidgetSettingsFromDOM();
+    return nextConfig;
+  }
+
+  function updateWidgetPreview() {
+    if (!dom.widgetPreview) return;
+
+    const settings = collectWidgetSettingsFromDOM();
+    const metrics = state.latestMetrics || {};
+    const network = metrics.network || {};
+    const cpu = metrics.cpu || {};
+    const memory = metrics.memory || {};
+
+    dom.widgetPreview.style.setProperty('--widget-preview-font-size', `${settings.textSize}px`);
+    dom.widgetPreview.style.setProperty(
+      '--widget-preview-bg',
+      settings.useBackground ? hexToRgba(settings.backgroundColor, (100 - settings.transparency) / 100) : 'transparent'
+    );
+    dom.widgetPreview.style.setProperty('--widget-preview-text', settings.textColor);
+    dom.widgetPreview.style.setProperty('--widget-preview-accent', settings.accentColor);
+    dom.widgetPreview.style.fontFamily = getWidgetFontFamily(settings.fontStyle);
+    dom.widgetPreview.dataset.mode = settings.mode;
+    dom.widgetPreview.classList.toggle('compact', settings.compactSpacing);
+    dom.widgetPreview.classList.toggle('with-background', settings.useBackground);
+    dom.widgetPreview.classList.add('no-hover');
+    dom.widgetPreview.classList.toggle('order-system-first', settings.order === 'system-first');
+
+    if (dom.widgetPreviewUploadValue) dom.widgetPreviewUploadValue.textContent = getWidgetPreviewSpeed(network.uploadSpeed);
+    if (dom.widgetPreviewDownloadValue) dom.widgetPreviewDownloadValue.textContent = getWidgetPreviewSpeed(network.downloadSpeed);
+    if (dom.widgetPreviewCpuValue) dom.widgetPreviewCpuValue.textContent = `${Math.round(cpu.overall || 0)}%`;
+    if (dom.widgetPreviewRamValue) dom.widgetPreviewRamValue.textContent = `${Math.round(memory.percentUsed || 0)}%`;
+
+    if (dom.widgetPreviewUploadRow) dom.widgetPreviewUploadRow.hidden = !settings.showUpload || settings.mode === 'system-only';
+    if (dom.widgetPreviewDownloadRow) dom.widgetPreviewDownloadRow.hidden = !settings.showDownload || settings.mode === 'system-only';
+    if (dom.widgetPreviewCpuRow) dom.widgetPreviewCpuRow.hidden = !settings.showCpu || settings.mode === 'network-only';
+    if (dom.widgetPreviewRamRow) dom.widgetPreviewRamRow.hidden = !settings.showRam || settings.mode === 'network-only';
+
+    const networkVisible = settings.mode !== 'system-only' && (settings.showDownload || settings.showUpload);
+    const systemVisible = settings.mode !== 'network-only' && (settings.showCpu || settings.showRam);
+
+    if (dom.widgetPreviewNetworkGroup) dom.widgetPreviewNetworkGroup.hidden = !networkVisible;
+    if (dom.widgetPreviewSystemGroup) dom.widgetPreviewSystemGroup.hidden = !systemVisible;
+
+    if (dom.widgetBackgroundColor) dom.widgetBackgroundColor.disabled = !settings.useBackground;
+    if (dom.widgetAccentColor) dom.widgetAccentColor.disabled = !settings.useBackground;
+    if (dom.widgetTransparency) dom.widgetTransparency.disabled = !settings.useBackground;
+  }
+
+  function updateWidgetTabActionState() {
+    if (!dom.widgetApplyBtn) return;
+    if (!widgetSettingsBaseline) {
+      dom.widgetApplyBtn.disabled = true;
+      return;
+    }
+
+    const pending = collectWidgetSettingsFromDOM();
+    dom.widgetApplyBtn.disabled = JSON.stringify(pending) === JSON.stringify(widgetSettingsBaseline);
+  }
+
+  async function saveWidgetSettings() {
+    const nextConfig = buildWidgetConfig(localConfig);
+    localConfig = nextConfig;
+    await saveLocalConfig();
+    if (window.systemAPI.setWidgetDisplayMode) {
+      await window.systemAPI.setWidgetDisplayMode(nextConfig.widgetSettings.mode);
+    }
+    localConfig = await window.systemAPI.getConfig();
+    applyWidgetSettingsToDOM(localConfig);
+    showToast('Widget settings saved', 'info');
+  }
+
+  function initWidgetTab() {
+    applyWidgetSettingsToDOM(localConfig);
+
+    const syncWidgetControls = () => {
+      if (dom.widgetTransparencyValue) {
+        dom.widgetTransparencyValue.textContent = `${dom.widgetTransparency?.value || 0}%`;
+      }
+      if (dom.widgetTextSizeValue) {
+        dom.widgetTextSizeValue.textContent = `${dom.widgetTextSize?.value || 11}px`;
+      }
+      updateWidgetPreview();
+      updateWidgetTabActionState();
+    };
+
+    [
+      dom.widgetUseBackground,
+      dom.widgetBackgroundColor,
+      dom.widgetAccentColor,
+      dom.widgetTextColor,
+      dom.widgetTransparency,
+      dom.widgetCompactSpacing,
+      dom.widgetOrder,
+      dom.widgetMode,
+      dom.widgetShowDownload,
+      dom.widgetShowUpload,
+      dom.widgetShowCpu,
+      dom.widgetShowRam,
+      dom.widgetTextSize,
+      dom.widgetFontStyle,
+    ].forEach((control) => {
+      if (!control || control.dataset.bound === 'true') return;
+      control.addEventListener('change', syncWidgetControls);
+      if (control.tagName === 'INPUT') {
+        control.addEventListener('input', syncWidgetControls);
+      }
+      control.dataset.bound = 'true';
+    });
+
+    if (dom.widgetApplyBtn && dom.widgetApplyBtn.dataset.bound !== 'true') {
+      dom.widgetApplyBtn.addEventListener('click', async () => {
+        try {
+          await saveWidgetSettings();
+        } catch (error) {
+          console.error('Failed to save widget settings:', error);
+          showToast('Failed to save widget settings', 'error');
+        }
+      });
+      dom.widgetApplyBtn.dataset.bound = 'true';
+    }
+
+    if (dom.widgetResetBtn && dom.widgetResetBtn.dataset.bound !== 'true') {
+      dom.widgetResetBtn.addEventListener('click', () => {
+        applyWidgetSettingsToDOM({ widgetSettings: getWidgetPreset('default') }, false);
+      });
+      dom.widgetResetBtn.dataset.bound = 'true';
+    }
+
+    dom.widgetPresetButtons.forEach((button) => {
+      if (!button || button.dataset.bound === 'true') return;
+      button.addEventListener('click', () => {
+        applyWidgetSettingsToDOM({ widgetSettings: getWidgetPreset(button.dataset.widgetPreset) }, false);
+      });
+      button.dataset.bound = 'true';
+    });
+  }
+
   function updateSettingsSaveState() {
     if (!dom.cfgSaveBtn) return;
 
@@ -399,6 +792,10 @@
 
   // ====== Tab System ======
   function switchTab(tabId) {
+    if (tabId === 'widget') {
+      tabId = 'dashboard';
+    }
+
     state.currentTab = tabId;
 
     // Update tab buttons
@@ -898,8 +1295,10 @@
       dom.nhJitterLabel.textContent = latency.samplesReceived > 1 ? `min ${latency.minLatency}ms / max ${latency.maxLatency}ms` : 'Need more than one reply';
       dom.nhLossValue.textContent = `${Math.round(latency.packetLoss)}%`;
       dom.nhLossLabel.textContent = `${latency.samplesSent - latency.samplesReceived} of ${latency.samplesSent} lost`;
-      dom.nhConnType.textContent = connection.connectionType === 'wifi' ? 'WiFi' : connection.connectionType === 'ethernet' ? 'Ethernet' : connection.connectionType === 'cellular' ? 'Cellular' : 'Unknown';
-      dom.nhConnName.textContent = connection.connectionType === 'wifi' && connection.ssid ? connection.ssid : connection.adapterName || connection.adapterDescription || 'Unavailable';
+      dom.nhConnType.textContent = connection.connectionType === 'wifi' ? 'Wi-Fi' : connection.connectionType === 'ethernet' ? 'Ethernet' : connection.connectionType === 'cellular' ? 'Cellular' : 'Unknown';
+      dom.nhConnName.textContent = connection.connectionType === 'wifi'
+        ? (connection.ssid || connection.adapterName || connection.adapterDescription || 'Unavailable')
+        : (connection.adapterName || connection.adapterDescription || 'Unavailable');
       dom.nhConnLink.textContent = connection.linkSpeed || 'Unavailable';
       dom.nhConnIp.textContent = connection.localIp || 'Unavailable';
       const bars = connection.bars || 0;
@@ -907,8 +1306,18 @@
         const barNum = parseInt(bar.dataset.bar, 10);
         bar.classList.toggle('signal-active', barNum <= bars);
       });
-      dom.nhSignalBars.style.opacity = connection.connectionType === 'wifi' ? '1' : '0.35';
-      dom.nhSignalLabel.textContent = connection.connectionType === 'wifi' ? (connection.percentage > 0 ? `${connection.percentage}% Signal` : 'WiFi') : connection.connectionType === 'ethernet' ? 'Wired Link' : connection.connectionType === 'cellular' ? 'Mobile Data' : 'No link info';
+      const isWireless = connection.connectionType === 'wifi' || connection.connectionType === 'cellular';
+      dom.nhSignalBars.style.opacity = isWireless ? '1' : '0.35';
+      const qualityLabel = connection.quality
+        ? connection.quality.charAt(0).toUpperCase() + connection.quality.slice(1)
+        : '';
+      dom.nhSignalLabel.textContent = connection.connectionType === 'wifi'
+        ? (connection.percentage > 0 ? `${qualityLabel} Wi-Fi` : 'Wi-Fi')
+        : connection.connectionType === 'cellular'
+          ? (connection.percentage > 0 ? `${qualityLabel} Mobile Data` : 'Mobile Data')
+          : connection.connectionType === 'ethernet'
+            ? 'Wired Link'
+            : 'No link info';
 
 
 
@@ -1287,7 +1696,8 @@
 
   // ====== Metrics Handler ======
   function processMetrics(payload) {
-    const { network: stats, cpu, memory } = payload;
+    const { network: stats, cpu, memory, gpu } = payload;
+    state.latestMetrics = payload;
     
     // Update network speed display
     const dl = formatSpeed(stats.downloadSpeed);
@@ -1319,6 +1729,11 @@
         const usedGB = (memory.active / (1024 * 1024 * 1024)).toFixed(1);
         const totalGB = (memory.total / (1024 * 1024 * 1024)).toFixed(1);
         dom.ramInfo.textContent = `${usedGB} / ${totalGB} GB`;
+      }
+
+      if (gpu) {
+        updateGauge(dom.gpuRing, dom.gpuValue, gpu.overall);
+        dom.gpuInfo.textContent = gpu.activeEngine || 'Idle';
       }
     }
 
@@ -1398,25 +1813,72 @@
     }
   }
 
+  function setDetailsExpanded(panel, expanded) {
+    panel.classList.toggle('open', expanded);
+    const toggle = panel.querySelector('.details-toggle');
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    }
+  }
+
+  async function toggleDetailsPanel(targetPanel, loadFn) {
+    const panelConfigs = [
+      dom.networkDetailsPanel,
+      dom.systemInfoPanel
+    ];
+
+    if (targetPanel.classList.contains('open')) {
+      setDetailsExpanded(targetPanel, false);
+      return;
+    }
+
+    for (const panel of panelConfigs) {
+      if (panel !== targetPanel && panel.classList.contains('open')) {
+        setDetailsExpanded(panel, false);
+      }
+    }
+
+    targetPanel.classList.add('loading');
+    try {
+      await loadFn();
+    } finally {
+      targetPanel.classList.remove('loading');
+    }
+
+    setDetailsExpanded(targetPanel, true);
+    requestAnimationFrame(() => revealDetailsPanel(targetPanel));
+  }
+
+  function revealDetailsPanel(panel) {
+    const container = dom.content;
+    if (!container) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const panelRect = panel.getBoundingClientRect();
+    const topPadding = 12;
+    const bottomPadding = 18;
+
+    if (panelRect.top < containerRect.top + topPadding) {
+      container.scrollBy({
+        top: panelRect.top - containerRect.top - topPadding,
+        behavior: 'smooth'
+      });
+      return;
+    }
+
+    if (panelRect.bottom > containerRect.bottom - bottomPadding) {
+      container.scrollBy({
+        top: panelRect.bottom - containerRect.bottom + bottomPadding,
+        behavior: 'smooth'
+      });
+    }
+  }
+
   // ====== Event Listeners ======
   function setupEventListeners() {
     // Window controls
     dom.minimizeBtn.addEventListener('click', () => window.systemAPI.minimizeWindow());
     dom.closeBtn.addEventListener('click', () => window.systemAPI.closeWindow());
-
-    // Pin button (Taskbar Widget Lock)
-    dom.pinBtn.addEventListener('click', () => {
-      // Toggle widget lock via state + emit
-      state.widgetLocked = !state.widgetLocked;
-      dom.pinBtn.classList.toggle('active', state.widgetLocked);
-      window.__TAURI__.event.emit('toggle_widget_lock', { locked: state.widgetLocked });
-      window.__TAURI__.core.invoke('cmd_toggle_widget_lock', { locked: state.widgetLocked }).catch(() => {});
-    });
-
-    window.__TAURI__.event.listen('widget_lock_changed', (event) => {
-      state.widgetLocked = event.payload.locked;
-      if (dom.pinBtn) dom.pinBtn.classList.toggle('active', state.widgetLocked);
-    });
 
     window.__TAURI__.event.listen('widget-menu-action', async (event) => {
       try {
@@ -1433,6 +1895,13 @@
       }
     });
 
+    window.__TAURI__.event.listen('tray-menu-action', async (event) => {
+      const payload = event.payload || {};
+      if (payload.action === 'open-preferences') {
+        await openSettingsModal();
+      }
+    });
+
     // Tab navigation
     dom.tabBar.addEventListener('click', (e) => {
       const btn = e.target.closest('.tab-item');
@@ -1442,18 +1911,12 @@
     });
 
     // Details panel toggles
-    dom.networkDetailsToggle.addEventListener('click', () => {
-      dom.networkDetailsPanel.classList.toggle('open');
-      if (dom.networkDetailsPanel.classList.contains('open')) {
-        loadNetworkDetails();
-      }
+    dom.networkDetailsToggle.addEventListener('click', async () => {
+      await toggleDetailsPanel(dom.networkDetailsPanel, loadNetworkDetails);
     });
 
-    dom.systemInfoToggle.addEventListener('click', () => {
-      dom.systemInfoPanel.classList.toggle('open');
-      if (dom.systemInfoPanel.classList.contains('open')) {
-        loadSystemInfo();
-      }
+    dom.systemInfoToggle.addEventListener('click', async () => {
+      await toggleDetailsPanel(dom.systemInfoPanel, loadSystemInfo);
     });
 
     if (dom.historyViewType) {
@@ -1470,18 +1933,8 @@
       });
     }
 
-    // Settings Modal
-    dom.settingsBtn.addEventListener('click', async () => {
-      dom.settingsModal.classList.add('show');
-      await updateUndoState();
-      try {
-        localConfig = await window.systemAPI.getConfig();
-        applyConfigToDOM();
-        settingsBaselineConfig = cloneConfig(localConfig);
-        applySettingsModalToDOM(settingsBaselineConfig);
-        updateSettingsSaveState();
-      } catch (e) { /* ignore */ }
-    });
+      // Settings Modal
+      dom.settingsBtn.addEventListener('click', openSettingsModal);
     
     dom.settingsCloseBtn.addEventListener('click', () => {
       settingsBaselineConfig = null;
@@ -1875,6 +2328,7 @@
     // Add click handlers
     if (todayBtn) {
       todayBtn.addEventListener('click', () => {
+        dismissHistoryPickers(chart);
         setActiveFilter(buttons, todayBtn);
         chart.updateChart('today');
       });
@@ -1882,6 +2336,7 @@
 
     if (last7DaysBtn) {
       last7DaysBtn.addEventListener('click', () => {
+        dismissHistoryPickers(chart);
         setActiveFilter(buttons, last7DaysBtn);
         chart.updateChart('last7days');
       });
@@ -1889,6 +2344,7 @@
 
     if (monthlyBtn) {
       monthlyBtn.addEventListener('click', () => {
+        dismissHistoryPickers(chart);
         setActiveFilter(buttons, monthlyBtn);
         const current = getDefaultMonthlyRange(chart);
         chart.updateChart('monthly', current);
@@ -1896,13 +2352,11 @@
     }
 
     if (yearlyBtn) {
-      yearlyBtn.addEventListener('click', () => {
+      yearlyBtn.addEventListener('click', async () => {
+        dismissHistoryPickers(chart);
         setActiveFilter(buttons, yearlyBtn);
         const current = getDefaultYearRange(chart);
-        chart.updateChart('yearly', current);
-        setTimeout(() => {
-          showYearPicker(chart, location);
-        }, 0);
+        await chart.updateChart('yearly', current);
       });
     }
 
@@ -1913,10 +2367,7 @@
 
         if (chart.currentFilter === 'yearly') {
           setActiveFilter(buttons, yearlyBtn);
-          await chart.updateChart('yearly', getDefaultYearRange(chart));
-          setTimeout(() => {
-            showYearPicker(chart, location);
-          }, 0);
+          await showYearPicker(chart, location);
           return;
         }
 
@@ -2028,101 +2479,315 @@
    * @param {TrafficHistoryChart} chart - Chart instance
    * @param {string} location - 'dashboard' or 'dataUsage'
    */
-  function showMonthPicker(chart, location) {
+  let activeHistoryPickerCleanup = null;
+
+  function closeActiveHistoryPicker() {
+    if (typeof activeHistoryPickerCleanup === 'function') {
+      activeHistoryPickerCleanup();
+      activeHistoryPickerCleanup = null;
+    }
+  }
+
+  function dismissHistoryPickers(chart) {
+    closeActiveHistoryPicker();
+    if (chart && chart.flatpickrInstance) {
+      chart.flatpickrInstance.destroy();
+      chart.flatpickrInstance = null;
+    }
+  }
+
+  async function showMonthPicker(chart, location) {
     const prefix = location === 'dashboard' ? 'th' : 'duTh';
     const monthlyBtn = document.getElementById(`${prefix}FilterMonthly`);
     const monthTrigger = document.getElementById(`${prefix}MonthTrigger`);
-    const monthPickerInput = document.getElementById(`${prefix}MonthPicker`);
 
-    if (!monthlyBtn || !monthTrigger || !monthPickerInput || !window.flatpickr) return;
+    if (!monthlyBtn || !monthTrigger) return;
 
-    // Destroy existing instance if any
-    if (chart.flatpickrInstance) {
-      chart.flatpickrInstance.destroy();
-    }
+    dismissHistoryPickers(chart);
 
-    const activeDate = chart.currentDateRange
-      ? new Date(chart.currentDateRange.year, chart.currentDateRange.month - 1, 1)
-      : new Date();
+    const years = await getAvailableHistoryYears();
+    const activeYear = (chart.currentDateRange && chart.currentDateRange.year) || years[0] || new Date().getFullYear();
+    const activeMonth = (chart.currentDateRange && chart.currentDateRange.month) || (new Date().getMonth() + 1);
+    let yearIndex = Math.max(0, years.findIndex((year) => year === activeYear));
 
-    // Create Flatpickr instance with month selection
-    chart.flatpickrInstance = flatpickr(monthPickerInput, {
-      clickOpens: false,
-      positionElement: monthTrigger,
-      plugins: [
-        new monthSelectPlugin({
-          shorthand: true,
-          dateFormat: "M Y",
-          altFormat: "F Y"
-        })
-      ],
-      dateFormat: "M Y",
-      altFormat: "F Y",
-      defaultDate: activeDate,
-      onChange: (selectedDates, dateStr, instance) => {
-        if (selectedDates.length > 0) {
-          const date = selectedDates[0];
-          const dateRange = {
-            year: date.getFullYear(),
-            month: date.getMonth() + 1
-          };
-          chart.updateChart('monthly', dateRange);
+    const buttons = [
+      document.getElementById(`${prefix}FilterToday`),
+      document.getElementById(`${prefix}FilterLast7Days`),
+      document.getElementById(`${prefix}FilterMonthly`),
+      document.getElementById(`${prefix}FilterYearly`)
+    ];
+
+    const popup = document.createElement('div');
+    popup.className = 'th-year-picker-popover th-month-picker-popover';
+    popup.setAttribute('role', 'dialog');
+    popup.setAttribute('aria-label', 'Choose month');
+
+    const positionPopup = () => {
+      const rect = monthTrigger.getBoundingClientRect();
+      const popupWidth = popup.offsetWidth || 292;
+      const left = clampHistoryPickerLeft(rect.right - popupWidth, popupWidth);
+      popup.style.top = `${rect.bottom + 10}px`;
+      popup.style.left = `${left}px`;
+    };
+
+    const render = () => {
+      const currentYear = years[yearIndex] || activeYear;
+
+      popup.innerHTML = `
+        <div class="th-year-picker-head">
+          <div class="th-year-picker-copy">
+            <span class="th-year-picker-title">Choose month</span>
+            <span class="th-year-picker-subtitle">Monthly view shows daily totals</span>
+          </div>
+          <div class="th-year-picker-nav">
+            <button class="th-year-picker-nav-btn" type="button" data-nav="prev" ${yearIndex <= 0 ? 'disabled' : ''} aria-label="Earlier year">&lsaquo;</button>
+            <span class="th-year-picker-range">${currentYear}</span>
+            <button class="th-year-picker-nav-btn" type="button" data-nav="next" ${yearIndex >= years.length - 1 ? 'disabled' : ''} aria-label="Later year">&rsaquo;</button>
+          </div>
+        </div>
+        <div class="th-year-picker-months">
+          <span class="th-year-picker-months-label">Months</span>
+          <div class="th-year-picker-month-grid">${buildYearPickerMonthsMarkup(currentYear, activeMonth)}</div>
+        </div>
+      `;
+
+      popup.querySelector('[data-nav="prev"]')?.addEventListener('click', () => {
+        if (yearIndex > 0) {
+          yearIndex -= 1;
+          render();
+          positionPopup();
         }
-      },
-      onClose: () => {
-        // Keep the monthly button active
-        const buttons = [
-          document.getElementById(`${prefix}FilterToday`),
-          document.getElementById(`${prefix}FilterLast7Days`),
-          document.getElementById(`${prefix}FilterMonthly`),
-          document.getElementById(`${prefix}FilterYearly`)
-        ];
-        setActiveFilter(buttons, monthlyBtn);
-      }
-    });
+      });
 
-    // Open the picker
-    chart.flatpickrInstance.open();
+      popup.querySelector('[data-nav="next"]')?.addEventListener('click', () => {
+        if (yearIndex < years.length - 1) {
+          yearIndex += 1;
+          render();
+          positionPopup();
+        }
+      });
+
+      popup.querySelectorAll('[data-month]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const year = Number.parseInt(button.dataset.year, 10);
+          const month = Number.parseInt(button.dataset.month, 10);
+          setActiveFilter(buttons, monthlyBtn);
+          closeActiveHistoryPicker();
+          await chart.updateChart('monthly', { year, month });
+        });
+      });
+    };
+
+    const closeOnPointerDown = (event) => {
+      if (!popup.contains(event.target) && !monthTrigger.contains(event.target)) {
+        closeActiveHistoryPicker();
+      }
+    };
+
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') {
+        closeActiveHistoryPicker();
+      }
+    };
+
+    const cleanup = () => {
+      popup.remove();
+      document.removeEventListener('mousedown', closeOnPointerDown, true);
+      document.removeEventListener('keydown', closeOnEscape, true);
+      window.removeEventListener('resize', positionPopup);
+      window.removeEventListener('scroll', positionPopup, true);
+      if (activeHistoryPickerCleanup === cleanup) {
+        activeHistoryPickerCleanup = null;
+      }
+    };
+
+    render();
+    document.body.appendChild(popup);
+    positionPopup();
+
+    document.addEventListener('mousedown', closeOnPointerDown, true);
+    document.addEventListener('keydown', closeOnEscape, true);
+    window.addEventListener('resize', positionPopup);
+    window.addEventListener('scroll', positionPopup, true);
+
+    activeHistoryPickerCleanup = cleanup;
+    setActiveFilter(buttons, monthlyBtn);
   }
 
-  function showYearPicker(chart, location) {
+  async function getAvailableHistoryYears() {
+    try {
+      const historyData = await window.systemAPI.getTrafficHistory('monthly');
+      const years = [...new Set(
+        (historyData || [])
+          .map((entry) => Number.parseInt(String(entry.date).slice(0, 4), 10))
+          .filter((year) => Number.isFinite(year))
+      )].sort((a, b) => b - a);
+      return years.length ? years : [new Date().getFullYear()];
+    } catch (error) {
+      console.error('Failed to load yearly history choices:', error);
+      return [new Date().getFullYear()];
+    }
+  }
+
+  function buildYearPickerMonthsMarkup(activeYear, activeMonth = null) {
+    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return monthNames
+      .map((month, index) => `
+        <button
+          class="th-year-picker-month${activeMonth === index + 1 ? ' active' : ''}"
+          type="button"
+          data-month="${index + 1}"
+          data-year="${activeYear}"
+          aria-label="Open ${month} ${activeYear}"
+        >
+          ${month}
+        </button>
+      `)
+      .join('');
+  }
+
+  function clampHistoryPickerLeft(preferredLeft, popupWidth) {
+    const viewportPadding = 12;
+    const maxLeft = window.innerWidth - popupWidth - viewportPadding;
+    return Math.max(viewportPadding, Math.min(preferredLeft, maxLeft));
+  }
+
+  async function showYearPicker(chart, location) {
     const prefix = location === 'dashboard' ? 'th' : 'duTh';
     const yearlyBtn = document.getElementById(`${prefix}FilterYearly`);
     const monthTrigger = document.getElementById(`${prefix}MonthTrigger`);
-    const monthPickerInput = document.getElementById(`${prefix}MonthPicker`);
 
-    if (!yearlyBtn || !monthTrigger || !monthPickerInput || !window.flatpickr) return;
+    if (!yearlyBtn || !monthTrigger) return;
 
-    if (chart.flatpickrInstance) {
-      chart.flatpickrInstance.destroy();
-    }
+    dismissHistoryPickers(chart);
 
-    const activeYear = (chart.currentDateRange && chart.currentDateRange.year) || new Date().getFullYear();
-    const activeDate = new Date(activeYear, 0, 1);
+    const years = await getAvailableHistoryYears();
+    const activeYear = (chart.currentDateRange && chart.currentDateRange.year) || years[0] || new Date().getFullYear();
+    const pageSize = 12;
+    const selectedIndex = Math.max(0, years.findIndex((year) => year === activeYear));
+    let pageIndex = Math.floor(selectedIndex / pageSize);
 
-    chart.flatpickrInstance = flatpickr(monthPickerInput, {
-      clickOpens: false,
-      positionElement: monthTrigger,
-      defaultDate: activeDate,
-      onChange: (selectedDates) => {
-        if (selectedDates.length > 0) {
-          chart.updateChart('yearly', {
-            year: selectedDates[0].getFullYear()
-          });
+    const buttons = [
+      document.getElementById(`${prefix}FilterToday`),
+      document.getElementById(`${prefix}FilterLast7Days`),
+      document.getElementById(`${prefix}FilterMonthly`),
+      document.getElementById(`${prefix}FilterYearly`)
+    ];
+
+    const popup = document.createElement('div');
+    popup.className = 'th-year-picker-popover';
+    popup.setAttribute('role', 'dialog');
+    popup.setAttribute('aria-label', 'Choose year');
+
+    const positionPopup = () => {
+      const rect = monthTrigger.getBoundingClientRect();
+      const popupWidth = popup.offsetWidth || 292;
+      const left = clampHistoryPickerLeft(rect.right - popupWidth, popupWidth);
+      popup.style.top = `${rect.bottom + 10}px`;
+      popup.style.left = `${left}px`;
+    };
+
+    const render = () => {
+      const pageYears = years.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize);
+      const pageFirst = pageYears[0] || activeYear;
+      const pageLast = pageYears[pageYears.length - 1] || activeYear;
+
+      popup.innerHTML = `
+        <div class="th-year-picker-head">
+          <div class="th-year-picker-copy">
+            <span class="th-year-picker-title">Choose year</span>
+            <span class="th-year-picker-subtitle">Yearly view shows Jan-Dec totals</span>
+          </div>
+          <div class="th-year-picker-nav">
+            <button class="th-year-picker-nav-btn" type="button" data-nav="prev" ${pageIndex <= 0 ? 'disabled' : ''} aria-label="Earlier years">&lsaquo;</button>
+            <span class="th-year-picker-range">${pageFirst}${pageLast !== pageFirst ? ` - ${pageLast}` : ''}</span>
+            <button class="th-year-picker-nav-btn" type="button" data-nav="next" ${((pageIndex + 1) * pageSize) >= years.length ? 'disabled' : ''} aria-label="Later years">&rsaquo;</button>
+          </div>
+        </div>
+        <div class="th-year-picker-grid">
+          ${pageYears.map((year) => `
+            <button class="th-year-picker-year${year === activeYear ? ' active' : ''}" type="button" data-year="${year}">
+              ${year}
+            </button>
+          `).join('')}
+        </div>
+        <div class="th-year-picker-months">
+          <span class="th-year-picker-months-label">Months</span>
+          <div class="th-year-picker-month-grid">${buildYearPickerMonthsMarkup(activeYear)}</div>
+        </div>
+      `;
+
+      popup.querySelectorAll('[data-year]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const year = Number.parseInt(button.dataset.year, 10);
+          setActiveFilter(buttons, yearlyBtn);
+          closeActiveHistoryPicker();
+          await chart.updateChart('yearly', { year });
+        });
+      });
+
+      popup.querySelector('[data-nav="prev"]')?.addEventListener('click', () => {
+        if (pageIndex > 0) {
+          pageIndex -= 1;
+          render();
+          positionPopup();
         }
-      },
-      onClose: () => {
-        const buttons = [
-          document.getElementById(`${prefix}FilterToday`),
-          document.getElementById(`${prefix}FilterLast7Days`),
-          document.getElementById(`${prefix}FilterMonthly`),
-          document.getElementById(`${prefix}FilterYearly`)
-        ];
-        setActiveFilter(buttons, yearlyBtn);
-      }
-    });
+      });
 
-    chart.flatpickrInstance.open();
+      popup.querySelector('[data-nav="next"]')?.addEventListener('click', () => {
+        if (((pageIndex + 1) * pageSize) < years.length) {
+          pageIndex += 1;
+          render();
+          positionPopup();
+        }
+      });
+
+      popup.querySelectorAll('[data-month]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const year = Number.parseInt(button.dataset.year, 10);
+          const month = Number.parseInt(button.dataset.month, 10);
+          const monthlyBtn = document.getElementById(`${prefix}FilterMonthly`);
+          setActiveFilter(buttons, monthlyBtn);
+          closeActiveHistoryPicker();
+          await chart.updateChart('monthly', { year, month });
+        });
+      });
+    };
+
+    const closeOnPointerDown = (event) => {
+      if (!popup.contains(event.target) && !monthTrigger.contains(event.target)) {
+        closeActiveHistoryPicker();
+      }
+    };
+
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') {
+        closeActiveHistoryPicker();
+      }
+    };
+
+    const cleanup = () => {
+      popup.remove();
+      document.removeEventListener('mousedown', closeOnPointerDown, true);
+      document.removeEventListener('keydown', closeOnEscape, true);
+      window.removeEventListener('resize', positionPopup);
+      window.removeEventListener('scroll', positionPopup, true);
+      if (activeHistoryPickerCleanup === cleanup) {
+        activeHistoryPickerCleanup = null;
+      }
+    };
+
+    render();
+    document.body.appendChild(popup);
+    positionPopup();
+
+    document.addEventListener('mousedown', closeOnPointerDown, true);
+    document.addEventListener('keydown', closeOnEscape, true);
+    window.addEventListener('resize', positionPopup);
+    window.addEventListener('scroll', positionPopup, true);
+
+    activeHistoryPickerCleanup = cleanup;
+    setActiveFilter(buttons, yearlyBtn);
   }
 
   /**
@@ -2590,18 +3255,6 @@
     if (window.systemAPI.onETWNetworkStats) {
       window.systemAPI.onETWNetworkStats(handleETWStats);
     }
-
-    // Initial load for things outside the fast loop
-    try {
-      const disks = await window.systemAPI.getDiskUsage();
-      if (disks.length > 0) {
-        const mainDisk = disks.find(d => d.mount === 'C:') || disks[0];
-        updateGauge(dom.diskRing, dom.diskValue, mainDisk.percentUsed);
-        const usedGB = (mainDisk.used / (1024 * 1024 * 1024)).toFixed(0);
-        const totalGB = (mainDisk.size / (1024 * 1024 * 1024)).toFixed(0);
-        dom.diskInfo.textContent = `${usedGB} / ${totalGB} GB`;
-      }
-    } catch(e) {}
 
     // Load last speed test result
     try {

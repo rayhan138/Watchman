@@ -300,7 +300,71 @@ fn collect_connection_details() -> SignalStrength {
         local_ip: String::new(),
     });
 
+    let connection_type = classify_connection_type(&adapter.name, &adapter.description);
     let wifi_details = fetch_wifi_details().unwrap_or_default();
+
+    if connection_type == "wifi" {
+        if let Some((ssid, percentage, adapter_name, adapter_description, link_speed)) = wifi_details {
+            let quality = classify_signal_quality(percentage);
+            return SignalStrength {
+                percentage,
+                bars: signal_bars(percentage),
+                quality: quality.to_string(),
+                connection_type: "wifi".to_string(),
+                adapter_name: if adapter_name.is_empty() {
+                    adapter.name
+                } else {
+                    adapter_name
+                },
+                adapter_description: if adapter_description.is_empty() {
+                    adapter.description
+                } else {
+                    adapter_description
+                },
+                ssid,
+                link_speed: if link_speed.is_empty() {
+                    adapter.link_speed
+                } else {
+                    link_speed
+                },
+                local_ip: adapter.local_ip,
+            };
+        }
+
+        return SignalStrength {
+            percentage: 0,
+            bars: 0,
+            quality: "unknown".to_string(),
+            connection_type: "wifi".to_string(),
+            adapter_name: adapter.name,
+            adapter_description: adapter.description,
+            ssid: String::new(),
+            link_speed: adapter.link_speed,
+            local_ip: adapter.local_ip,
+        };
+    }
+
+    if connection_type == "cellular" {
+        if let Some((percentage, provider_name)) = fetch_cellular_details().unwrap_or_default() {
+            let quality = classify_signal_quality(percentage);
+            return SignalStrength {
+                percentage,
+                bars: signal_bars(percentage),
+                quality: quality.to_string(),
+                connection_type: "cellular".to_string(),
+                adapter_name: if provider_name.is_empty() {
+                    adapter.name
+                } else {
+                    provider_name
+                },
+                adapter_description: adapter.description,
+                ssid: String::new(),
+                link_speed: adapter.link_speed,
+                local_ip: adapter.local_ip,
+            };
+        }
+    }
+
     if let Some((ssid, percentage, adapter_name, adapter_description, link_speed)) = wifi_details {
         let quality = classify_signal_quality(percentage);
         return SignalStrength {
@@ -328,7 +392,6 @@ fn collect_connection_details() -> SignalStrength {
         };
     }
 
-    let connection_type = classify_connection_type(&adapter.name, &adapter.description);
     SignalStrength {
         percentage: 0,
         bars: 0,
@@ -368,7 +431,9 @@ fn build_health_summary(latency: &LatencyResult, connection: &SignalStrength) ->
         )
     };
 
-    if connection.connection_type == "wifi" && connection.percentage > 0 {
+    if (connection.connection_type == "wifi" || connection.connection_type == "cellular")
+        && connection.percentage > 0
+    {
         subtitle.push_str(&format!(" · {}% signal", connection.percentage));
     } else if !connection.connection_type.is_empty() {
         subtitle.push_str(&format!(" · {}", connection_label(connection)));
@@ -524,6 +589,31 @@ fn fetch_wifi_details() -> Result<Option<(String, u32, String, String, String)>,
     )))
 }
 
+fn fetch_cellular_details() -> Result<Option<(u32, String)>, String> {
+    let output = hidden_cmd("netsh")
+        .args(["mbn", "show", "interfaces"])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let is_connected = stdout.lines().any(|line| {
+        let trimmed = line.trim().to_lowercase();
+        trimmed.starts_with("state") && trimmed.contains("connected")
+    });
+    if !is_connected {
+        return Ok(None);
+    }
+
+    let percentage = parse_key_value(&stdout, "signal")
+        .and_then(|value| value.trim_end_matches('%').trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let provider_name = parse_key_value(&stdout, "provider name")
+        .or_else(|| parse_key_value(&stdout, "name"))
+        .unwrap_or_default();
+
+    Ok(Some((percentage, provider_name)))
+}
+
 fn parse_key_value(stdout: &str, key: &str) -> Option<String> {
     stdout.lines().find_map(|line| {
         let trimmed = line.trim();
@@ -545,7 +635,30 @@ fn parse_key_value(stdout: &str, key: &str) -> Option<String> {
 
 fn fetch_primary_adapter() -> Result<AdapterSnapshot, String> {
     let script = r#"
-$adapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Sort-Object ifIndex | Select-Object -First 1 Name, InterfaceDescription, LinkSpeed, ifIndex
+$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+  Where-Object { $_.State -eq 'Alive' } |
+  Sort-Object RouteMetric, InterfaceMetric |
+  Select-Object -First 1
+
+$adapter = $null
+if ($route) {
+  $adapter = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue |
+    Where-Object Status -eq 'Up' |
+    Select-Object -First 1 Name, InterfaceDescription, LinkSpeed, ifIndex
+}
+
+if (-not $adapter) {
+  $adapter = Get-NetIPConfiguration |
+    Where-Object {
+      $_.NetAdapter.Status -eq 'Up' -and
+      $_.IPv4Address -and
+      ($_.IPv4DefaultGateway -or $_.NetAdapter.InterfaceDescription -match 'Wi-?Fi|Wireless|WLAN|WWAN|Cellular|Ethernet')
+    } |
+    Sort-Object InterfaceMetric |
+    Select-Object -First 1 -ExpandProperty NetAdapter |
+    Select-Object -First 1 Name, InterfaceDescription, LinkSpeed, ifIndex
+}
+
 if ($adapter) {
   $ip = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.IPAddress -and $_.IPAddress -notlike '169.254*' } |
@@ -586,6 +699,7 @@ fn classify_connection_type(name: &str, description: &str) -> &'static str {
     } else if combined.contains("wwan")
         || combined.contains("cellular")
         || combined.contains("mobile")
+        || combined.contains("mobile broadband")
         || combined.contains("lte")
         || combined.contains("5g")
         || combined.contains("4g")

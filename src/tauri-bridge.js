@@ -19,6 +19,7 @@
     getMemoryUsage: () => invoke('cmd_get_memory_usage'),
     getNetworkStats: () => invoke('cmd_get_network_stats'),
     getDiskUsage: () => invoke('cmd_get_disk_usage'),
+    getTemperatureReadings: () => invoke('cmd_get_temperature_readings'),
     getNetworkInterfaces: () => invoke('cmd_get_network_interfaces'),
     getSystemInfo: () => invoke('cmd_get_system_info'),
 
@@ -62,7 +63,6 @@
     runDiagnostics: () => invoke('run_diagnostics'),
 
     // ====== Export ======
-    exportPDF: (options) => invoke('export_pdf', { options }),
     exportCSV: (options) => invoke('export_csv', { options }),
 
     // ====== Notifications ======

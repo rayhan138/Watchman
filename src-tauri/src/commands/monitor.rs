@@ -1,8 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use sysinfo::{CpuRefreshKind, Disks, Networks, System};
+use tauri::Manager;
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+const TEMPERATURE_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 
 #[cfg(target_os = "windows")]
 mod windows_cpu {
@@ -353,6 +364,383 @@ mod windows_network {
     }
 }
 
+#[cfg(target_os = "windows")]
+mod windows_gpu {
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+    use std::mem::MaybeUninit;
+    use std::os::windows::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+
+    type PdhHCounter = isize;
+    type PdhHQuery = isize;
+    type PdhStatus = i32;
+
+    const ERROR_SUCCESS: PdhStatus = 0;
+    const PDH_MORE_DATA: PdhStatus = 0x8000_07D2u32 as i32;
+    const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
+    const GPU_COUNTER_WILDCARD: &str = r"\GPU Engine(*)\Utilization Percentage";
+    const COUNTER_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
+
+    #[repr(C)]
+    union PdhFmtCounterValueUnion {
+        long_value: i32,
+        double_value: f64,
+        large_value: i64,
+        ansi_string_value: *const u8,
+        wide_string_value: *const u16,
+    }
+
+    #[repr(C)]
+    struct PdhFmtCounterValue {
+        c_status: u32,
+        value: PdhFmtCounterValueUnion,
+    }
+
+    #[link(name = "pdh")]
+    unsafe extern "system" {
+        fn PdhOpenQueryW(
+            data_source: *const u16,
+            user_data: usize,
+            query: *mut PdhHQuery,
+        ) -> PdhStatus;
+        fn PdhAddEnglishCounterW(
+            query: PdhHQuery,
+            full_counter_path: *const u16,
+            user_data: usize,
+            counter: *mut PdhHCounter,
+        ) -> PdhStatus;
+        fn PdhCollectQueryData(query: PdhHQuery) -> PdhStatus;
+        fn PdhGetFormattedCounterValue(
+            counter: PdhHCounter,
+            format: u32,
+            counter_type: *mut u32,
+            value: *mut PdhFmtCounterValue,
+        ) -> PdhStatus;
+        fn PdhExpandWildCardPathW(
+            data_source: *const u16,
+            wildcard_path: *const u16,
+            expanded_path_list: *mut u16,
+            path_list_length: *mut u32,
+            flags: u32,
+        ) -> PdhStatus;
+        fn PdhCloseQuery(query: PdhHQuery) -> PdhStatus;
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct GpuUsageSnapshot {
+        pub overall: f64,
+        pub active_engine: String,
+    }
+
+    #[derive(Clone)]
+    struct GpuCounter {
+        path: String,
+        counter: PdhHCounter,
+    }
+
+    pub struct PdhGpuQuery {
+        query: PdhHQuery,
+        counters: Vec<GpuCounter>,
+        primed: bool,
+        last_refresh: Instant,
+    }
+
+    impl PdhGpuQuery {
+        pub fn new() -> Result<Self, ()> {
+            let paths = expand_gpu_counter_paths()?;
+            let (query, counters) = build_query(&paths)?;
+            Ok(Self {
+                query,
+                counters,
+                primed: false,
+                last_refresh: Instant::now(),
+            })
+        }
+
+        pub fn next_value(&mut self) -> Result<Option<GpuUsageSnapshot>, ()> {
+            self.refresh_counter_paths_if_needed();
+
+            let collect_status = unsafe { PdhCollectQueryData(self.query) };
+            if collect_status != ERROR_SUCCESS {
+                return Err(());
+            }
+
+            if !self.primed {
+                self.primed = true;
+                return Ok(None);
+            }
+
+            let mut per_gpu_engine = HashMap::<(String, String), f64>::new();
+            let mut busiest_engine = String::from("Idle");
+            let mut busiest_engine_value = 0.0;
+
+            for counter in &self.counters {
+                let value = get_counter_value(counter.counter)?;
+                if !value.is_finite() || value <= 0.0 {
+                    continue;
+                }
+
+                let gpu_key = extract_gpu_key(&counter.path);
+                let engine_name = extract_engine_name(&counter.path);
+                let entry = per_gpu_engine
+                    .entry((gpu_key, engine_name.clone()))
+                    .or_insert(0.0);
+                *entry += value;
+            }
+
+            let mut per_gpu_overall = HashMap::<String, f64>::new();
+
+            for ((gpu_key, engine_name), engine_total) in per_gpu_engine {
+                let clamped_total = engine_total.min(100.0);
+
+                let gpu_entry = per_gpu_overall.entry(gpu_key).or_insert(0.0);
+                if clamped_total > *gpu_entry {
+                    *gpu_entry = clamped_total;
+                }
+
+                if clamped_total > busiest_engine_value {
+                    busiest_engine_value = clamped_total;
+                    busiest_engine = engine_name;
+                }
+            }
+
+            let overall = per_gpu_overall
+                .values()
+                .copied()
+                .fold(0.0, f64::max);
+
+            Ok(Some(GpuUsageSnapshot {
+                overall: round_percent(overall),
+                active_engine: if overall > 0.0 {
+                    busiest_engine
+                } else {
+                    String::from("Idle")
+                },
+            }))
+        }
+
+        fn refresh_counter_paths_if_needed(&mut self) {
+            if self.last_refresh.elapsed() < COUNTER_REFRESH_INTERVAL {
+                return;
+            }
+            self.last_refresh = Instant::now();
+
+            let Ok(mut refreshed_paths) = expand_gpu_counter_paths() else {
+                return;
+            };
+            refreshed_paths.sort();
+
+            let mut current_paths: Vec<String> =
+                self.counters.iter().map(|counter| counter.path.clone()).collect();
+            current_paths.sort();
+
+            if refreshed_paths == current_paths {
+                return;
+            }
+
+            let Ok((new_query, new_counters)) = build_query(&refreshed_paths) else {
+                return;
+            };
+
+            close_query(self.query);
+            self.query = new_query;
+            self.counters = new_counters;
+            self.primed = false;
+        }
+    }
+
+    impl Drop for PdhGpuQuery {
+        fn drop(&mut self) {
+            close_query(self.query);
+        }
+    }
+
+    fn build_query(paths: &[String]) -> Result<(PdhHQuery, Vec<GpuCounter>), ()> {
+        let mut query = 0isize;
+        let open_status = unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) };
+        if open_status != ERROR_SUCCESS || query == 0 {
+            return Err(());
+        }
+
+        let mut counters = Vec::new();
+        for path in paths {
+            let mut counter = 0isize;
+            let wide_path = wide_string(path);
+            let add_status =
+                unsafe { PdhAddEnglishCounterW(query, wide_path.as_ptr(), 0, &mut counter) };
+            if add_status == ERROR_SUCCESS && counter != 0 {
+                counters.push(GpuCounter {
+                    path: path.clone(),
+                    counter,
+                });
+            }
+        }
+
+        if counters.is_empty() {
+            close_query(query);
+            return Err(());
+        }
+
+        Ok((query, counters))
+    }
+
+    fn expand_gpu_counter_paths() -> Result<Vec<String>, ()> {
+        let wide_path = wide_string(GPU_COUNTER_WILDCARD);
+        let mut buffer_len = 0u32;
+        let status = unsafe {
+            PdhExpandWildCardPathW(
+                std::ptr::null(),
+                wide_path.as_ptr(),
+                std::ptr::null_mut(),
+                &mut buffer_len,
+                0,
+            )
+        };
+
+        if status != PDH_MORE_DATA || buffer_len == 0 {
+            return Err(());
+        }
+
+        let mut buffer = vec![0u16; buffer_len as usize];
+        let status = unsafe {
+            PdhExpandWildCardPathW(
+                std::ptr::null(),
+                wide_path.as_ptr(),
+                buffer.as_mut_ptr(),
+                &mut buffer_len,
+                0,
+            )
+        };
+
+        if status != ERROR_SUCCESS {
+            return Err(());
+        }
+
+        let mut paths = parse_multi_sz(&buffer);
+        paths.retain(|path| !path.contains("_Total"));
+
+        if paths.is_empty() {
+            Err(())
+        } else {
+            Ok(paths)
+        }
+    }
+
+    fn parse_multi_sz(buffer: &[u16]) -> Vec<String> {
+        let mut items = Vec::new();
+        let mut start = 0usize;
+
+        while start < buffer.len() {
+            if buffer[start] == 0 {
+                break;
+            }
+
+            let Some(relative_end) = buffer[start..].iter().position(|value| *value == 0) else {
+                break;
+            };
+
+            let end = start + relative_end;
+            items.push(String::from_utf16_lossy(&buffer[start..end]));
+            start = end + 1;
+        }
+
+        items
+    }
+
+    fn get_counter_value(counter: PdhHCounter) -> Result<f64, ()> {
+        let mut counter_type = 0u32;
+        let mut value = MaybeUninit::<PdhFmtCounterValue>::zeroed();
+        let status = unsafe {
+            PdhGetFormattedCounterValue(
+                counter,
+                PDH_FMT_DOUBLE,
+                &mut counter_type,
+                value.as_mut_ptr(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(());
+        }
+
+        let value = unsafe { value.assume_init() };
+        if value.c_status != ERROR_SUCCESS as u32 {
+            return Err(());
+        }
+
+        Ok(unsafe { value.value.double_value })
+    }
+
+    fn extract_gpu_key(counter_path: &str) -> String {
+        let instance = extract_instance_name(counter_path);
+
+        if let Some(index) = instance.find("_phys_") {
+            let physical = instance[index + 6..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if !physical.is_empty() {
+                return format!("phys_{physical}");
+            }
+        }
+
+        instance
+    }
+
+    fn extract_engine_name(counter_path: &str) -> String {
+        let instance = extract_instance_name(counter_path);
+        if let Some(index) = instance.find("_engtype_") {
+            return prettify_engine_name(&instance[index + 9..]);
+        }
+
+        String::from("Active engine")
+    }
+
+    fn extract_instance_name(counter_path: &str) -> String {
+        let start = counter_path.find('(').map(|value| value + 1).unwrap_or(0);
+        let end = counter_path[start..]
+            .find(')')
+            .map(|value| start + value)
+            .unwrap_or(counter_path.len());
+        counter_path[start..end].to_string()
+    }
+
+    fn prettify_engine_name(raw: &str) -> String {
+        let normalized = raw.replace('_', " ");
+        let mut pretty = String::with_capacity(normalized.len() + 4);
+        let mut previous_lowercase = false;
+
+        for ch in normalized.chars() {
+            if previous_lowercase && ch.is_ascii_uppercase() {
+                pretty.push(' ');
+            }
+            pretty.push(ch);
+            previous_lowercase = ch.is_ascii_lowercase();
+        }
+
+        pretty.trim().to_string()
+    }
+
+    fn round_percent(value: f64) -> f64 {
+        (value.clamp(0.0, 100.0) * 10.0).round() / 10.0
+    }
+
+    fn close_query(query: PdhHQuery) {
+        if query != 0 {
+            unsafe {
+                let _ = PdhCloseQuery(query);
+            }
+        }
+    }
+
+    fn wide_string(value: &str) -> Vec<u16> {
+        OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CpuUsage {
     pub overall: f64,
@@ -367,6 +755,21 @@ pub struct MemoryUsage {
     pub available: u64,
     #[serde(rename = "percentUsed")]
     pub percent_used: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuUsage {
+    pub overall: f64,
+    #[serde(rename = "activeEngine")]
+    pub active_engine: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TemperatureReadings {
+    pub cpu: Option<f64>,
+    pub gpu: Option<f64>,
+    pub disk: Option<f64>,
+    pub mainboard: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -449,6 +852,14 @@ pub struct MetricsPayload {
     pub network: NetworkStats,
     pub cpu: CpuUsage,
     pub memory: MemoryUsage,
+    pub gpu: GpuUsage,
+    pub temperatures: TemperatureReadings,
+}
+
+#[derive(Debug, Clone)]
+pub struct TemperatureProbePaths {
+    pub script_path: PathBuf,
+    pub sensor_root: PathBuf,
 }
 
 pub struct MonitorState {
@@ -467,6 +878,10 @@ pub struct MonitorState {
     pub pdh_cpu_query: Option<windows_cpu::PdhCpuQuery>,
     #[cfg(target_os = "windows")]
     pub prev_cpu_times: Option<windows_cpu::CpuTimesSnapshot>,
+    #[cfg(target_os = "windows")]
+    pub pdh_gpu_query: Option<windows_gpu::PdhGpuQuery>,
+    pub temperatures: TemperatureReadings,
+    pub last_temperature_refresh: Option<Instant>,
 }
 
 impl MonitorState {
@@ -489,8 +904,122 @@ impl MonitorState {
             pdh_cpu_query: None,
             #[cfg(target_os = "windows")]
             prev_cpu_times: None,
+            #[cfg(target_os = "windows")]
+            pdh_gpu_query: None,
+            temperatures: TemperatureReadings::default(),
+            last_temperature_refresh: None,
         }
     }
+}
+
+pub fn resolve_temperature_probe_paths(resource_dir: Option<&Path>) -> Option<TemperatureProbePaths> {
+    let dev_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script_candidates = [
+        resource_dir.map(|dir| dir.join("scripts").join("temperature_probe.ps1")),
+        resource_dir.map(|dir| dir.join("temperature_probe.ps1")),
+        Some(dev_root.join("scripts").join("temperature_probe.ps1")),
+    ];
+    let root_candidates = [
+        resource_dir.map(|dir| dir.join("vendor").join("libre-hardware-monitor")),
+        resource_dir.map(|dir| dir.join("libre-hardware-monitor")),
+        Some(dev_root.join("vendor").join("libre-hardware-monitor")),
+    ];
+
+    let script_path = script_candidates.into_iter().flatten().find(|path| path.exists())?;
+    let sensor_root = root_candidates.into_iter().flatten().find(|path| path.exists())?;
+
+    Some(TemperatureProbePaths {
+        script_path,
+        sensor_root,
+    })
+}
+
+pub fn get_temperature_readings(
+    state: &mut MonitorState,
+    probe_paths: Option<&TemperatureProbePaths>,
+) -> TemperatureReadings {
+    if let Some(last_refresh) = state.last_temperature_refresh {
+        if last_refresh.elapsed() < TEMPERATURE_REFRESH_INTERVAL {
+            return state.temperatures.clone();
+        }
+    }
+
+    state.last_temperature_refresh = Some(Instant::now());
+
+    let Some(paths) = probe_paths else {
+        state.temperatures = TemperatureReadings::default();
+        return state.temperatures.clone();
+    };
+
+    match query_temperature_readings(paths) {
+        Ok(readings) => {
+            state.temperatures = readings.clone();
+            readings
+        }
+        Err(_) => state.temperatures.clone(),
+    }
+}
+
+fn query_temperature_readings(paths: &TemperatureProbePaths) -> Result<TemperatureReadings, String> {
+    if !paths.script_path.exists() {
+        return Err(format!(
+            "Temperature probe script missing: {}",
+            paths.script_path.display()
+        ));
+    }
+
+    if !paths.sensor_root.exists() {
+        return Err(format!(
+            "Temperature sensor root missing: {}",
+            paths.sensor_root.display()
+        ));
+    }
+
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(&paths.script_path)
+        .arg("-SensorRoot")
+        .arg(&paths.sensor_root);
+
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = command
+        .output()
+        .map_err(|err| format!("Failed to run temperature probe: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Temperature probe exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut readings: TemperatureReadings =
+        serde_json::from_str(stdout.trim()).map_err(|err| format!("Invalid temperature JSON: {err}"))?;
+
+    readings.cpu = normalize_temperature(readings.cpu);
+    readings.gpu = normalize_temperature(readings.gpu);
+    readings.disk = normalize_temperature(readings.disk);
+    readings.mainboard = normalize_temperature(readings.mainboard);
+
+    Ok(readings)
+}
+
+fn normalize_temperature(value: Option<f64>) -> Option<f64> {
+    value
+        .filter(|reading| reading.is_finite() && *reading > 0.0 && *reading < 150.0)
+        .map(|reading| (reading * 10.0).round() / 10.0)
 }
 
 pub fn reset_session_counters(state: &mut MonitorState) {
@@ -610,6 +1139,43 @@ pub fn get_memory_usage(state: &mut MonitorState) -> MemoryUsage {
         active,
         available,
         percent_used,
+    }
+}
+
+pub fn get_gpu_usage(state: &mut MonitorState) -> GpuUsage {
+    #[cfg(target_os = "windows")]
+    if let Some(gpu) = get_windows_gpu_usage(state) {
+        return gpu;
+    }
+
+    GpuUsage {
+        overall: 0.0,
+        active_engine: String::from("Unavailable"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn get_windows_gpu_usage(state: &mut MonitorState) -> Option<GpuUsage> {
+    use windows_gpu::PdhGpuQuery;
+
+    if state.pdh_gpu_query.is_none() {
+        state.pdh_gpu_query = PdhGpuQuery::new().ok();
+    }
+
+    let query = state.pdh_gpu_query.as_mut()?;
+    match query.next_value() {
+        Ok(Some(snapshot)) => Some(GpuUsage {
+            overall: snapshot.overall,
+            active_engine: snapshot.active_engine,
+        }),
+        Ok(None) => Some(GpuUsage {
+            overall: 0.0,
+            active_engine: String::from("Starting..."),
+        }),
+        Err(_) => {
+            state.pdh_gpu_query = None;
+            None
+        }
     }
 }
 
@@ -855,6 +1421,17 @@ pub fn cmd_get_network_stats(state: tauri::State<'_, Mutex<MonitorState>>) -> Ne
 #[tauri::command]
 pub fn cmd_get_disk_usage() -> Vec<DiskInfo> {
     get_disk_usage()
+}
+
+#[tauri::command]
+pub fn cmd_get_temperature_readings(
+    state: tauri::State<'_, Mutex<MonitorState>>,
+    app_handle: tauri::AppHandle,
+) -> TemperatureReadings {
+    let resource_dir = app_handle.path().resource_dir().ok();
+    let probe_paths = resolve_temperature_probe_paths(resource_dir.as_deref());
+    let mut s = state.lock().unwrap();
+    get_temperature_readings(&mut s, probe_paths.as_ref())
 }
 
 #[tauri::command]

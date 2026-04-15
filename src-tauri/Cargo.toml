@@ -1,7 +1,7 @@
 [package]
 name = "traffic-monitor"
 version = "1.0.0"
-description = "A lightweight desktop traffic monitor"
+description = "Watchman — A lightweight desktop network monitor"
 authors = ["TrafficMonitor"]
 edition = "2021"
 

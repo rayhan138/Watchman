@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/tauri-v2.10.3/crates/tauri-config-schema/schema.json",
-  "productName": "TrafficMonitor",
+  "productName": "Watchman",
   "version": "1.0.0",
   "identifier": "com.trafficmonitor.app",
   "build": {
@@ -10,7 +10,8 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Traffic Monitor",
+        "label": "main",
+        "title": "Watchman",
         "width": 520,
         "height": 780,
         "minWidth": 460,
@@ -18,8 +19,7 @@
         "resizable": true,
         "decorations": false,
         "transparent": false,
-        "visible": false,
-        "label": "main"
+        "visible": true
       }
     ],
     "security": {
@@ -31,12 +31,18 @@
     "targets": [
       "nsis"
     ],
+    "resources": [
+      "scripts/temperature_probe.ps1",
+      "vendor/libre-hardware-monitor/*"
+    ],
     "icon": [
+      "icons/icon.ico",
       "icons/icon.png"
     ],
     "windows": {
       "nsis": {
-        "installMode": "perMachine"
+        "installMode": "perMachine",
+        "installerIcon": "icons/icon.ico"
       }
     }
   },
