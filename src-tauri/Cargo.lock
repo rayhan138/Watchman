@@ -4884,31 +4884,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "traffic-monitor"
-version = "1.0.0"
-dependencies = [
- "cc",
- "chrono",
- "dirs 6.0.0",
- "dns-lookup",
- "open",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sysinfo",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-notification",
- "tauri-plugin-shell",
- "tauri-plugin-single-instance",
- "tauri-plugin-window-state",
- "tokio",
- "windows 0.57.0",
- "winreg 0.55.0",
-]
-
-[[package]]
 name = "tray-icon"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5260,6 +5235,31 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "semver",
+]
+
+[[package]]
+name = "watchman"
+version = "1.0.0"
+dependencies = [
+ "cc",
+ "chrono",
+ "dirs 6.0.0",
+ "dns-lookup",
+ "open",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-notification",
+ "tauri-plugin-shell",
+ "tauri-plugin-single-instance",
+ "tauri-plugin-window-state",
+ "tokio",
+ "windows 0.57.0",
+ "winreg 0.55.0",
 ]
 
 [[package]]

@@ -1,12 +1,12 @@
 [package]
-name = "traffic-monitor"
+name = "watchman"
 version = "1.0.0"
 description = "Watchman — A lightweight desktop network monitor"
 authors = ["TrafficMonitor"]
 edition = "2021"
 
 [lib]
-name = "traffic_monitor_lib"
+name = "watchman_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
