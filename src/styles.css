@@ -653,6 +653,18 @@ button:not(.titlebar-btn):active {
   transition: height 0.3s ease;
 }
 
+#cpuGauge .gauge-fill {
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.02) 0%, rgba(0, 0, 0, 0.10) 100%);
+}
+
+#ramGauge .gauge-fill {
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.03) 0%, rgba(0, 0, 0, 0.15) 100%);
+}
+
+#gpuGaugeCard .gauge-fill {
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.04) 0%, rgba(0, 0, 0, 0.20) 100%);
+}
+
 .gauge-center {
   position: relative;
   z-index: 2;
@@ -3400,6 +3412,22 @@ body.dark-mode .dash-snapshot-chip:hover {
 
 body.dark-mode .minimal-gauge {
   border-color: rgba(247, 242, 234, 0.14);
+  background: radial-gradient(circle at 35% 28%, rgba(247, 242, 234, 0.04), rgba(247, 242, 234, 0.015) 58%, rgba(247, 242, 234, 0.01) 100%);
+  box-shadow: inset 0 1px 0 rgba(247, 242, 234, 0.06);
+}
+
+body.dark-mode #cpuGauge .gauge-fill {
+  background: linear-gradient(180deg, rgba(247, 242, 234, 0.06) 0%, rgba(247, 242, 234, 0.18) 100%);
+}
+
+body.dark-mode #ramGauge .gauge-fill {
+  background: linear-gradient(180deg, rgba(247, 242, 234, 0.12) 0%, rgba(247, 242, 234, 0.30) 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+body.dark-mode #gpuGaugeCard .gauge-fill {
+  background: linear-gradient(180deg, rgba(247, 242, 234, 0.14) 0%, rgba(247, 242, 234, 0.34) 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
 }
 
 body.dark-mode .app-row-alt {

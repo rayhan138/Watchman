@@ -19,7 +19,6 @@
       widget: document.getElementById("taskbarWidget"),
       uploadRow: document.getElementById("uploadRow"),
       downloadRow: document.getElementById("downloadRow"),
-      cpuMemGroup: document.getElementById("cpuMemGroup"),
       uploadSpeed: document.getElementById("uploadSpeed"),
       downloadSpeed: document.getElementById("downloadSpeed"),
       cpuValue: document.getElementById("cpuValue"),
@@ -27,13 +26,14 @@
     };
 
     function formatSpeed(bytesPerSec) {
-      if (!bytesPerSec || bytesPerSec < 1024 * 1024) {
-        return `${((bytesPerSec || 0) / 1024).toFixed(1)} KB/s`;
+      const value = Number(bytesPerSec || 0);
+      if (value < 1024 * 1024) {
+        return `${(value / 1024).toFixed(1)} KB/s`;
       }
-      if (bytesPerSec < 1024 * 1024 * 1024) {
-        return `${(bytesPerSec / (1024 * 1024)).toFixed(2)} MB/s`;
+      if (value < 1024 * 1024 * 1024) {
+        return `${(value / (1024 * 1024)).toFixed(1)} MB/s`;
       }
-      return `${(bytesPerSec / (1024 * 1024 * 1024)).toFixed(2)} GB/s`;
+      return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB/s`;
     }
 
     function markActive(row, bytesPerSec) {
@@ -64,8 +64,8 @@
 
         dom.uploadSpeed.textContent = formatSpeed(network.uploadSpeed);
         dom.downloadSpeed.textContent = formatSpeed(network.downloadSpeed);
-        dom.cpuValue.textContent = `${Math.round(cpu.overall || 0)}%`;
-        dom.memValue.textContent = `${Math.round(memory.percentUsed || 0)}%`;
+        dom.cpuValue.textContent = `${Math.round(cpu.overall || 0)}`;
+        dom.memValue.textContent = `${Math.round(memory.percentUsed || 0)}`;
 
         markActive(dom.uploadRow, network.uploadSpeed);
         markActive(dom.downloadRow, network.downloadSpeed);
@@ -78,14 +78,22 @@
       })
       .catch(() => {});
 
+    const openWidgetMenu = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      invoke("cmd_show_widget_context_menu").catch(() => {});
+    };
+
     dom.widget.addEventListener("dblclick", () => {
       invoke("cmd_show_history_window").catch(() => {});
     });
 
-    dom.widget.addEventListener("contextmenu", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      invoke("cmd_show_widget_context_menu").catch(() => {});
+    dom.widget.addEventListener("contextmenu", openWidgetMenu);
+    document.addEventListener("contextmenu", openWidgetMenu);
+    document.addEventListener("mousedown", (event) => {
+      if (event.button === 2) {
+        openWidgetMenu(event);
+      }
     });
   });
 })();

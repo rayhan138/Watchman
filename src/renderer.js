@@ -1649,6 +1649,8 @@
 
   // ====== History Table ======
   async function loadTrafficHistory() {
+    // historyViewType and historyTableBody are legacy elements; skip if not present
+    if (!dom.historyViewType || !dom.historyTableBody) return;
     try {
       const viewType = dom.historyViewType.value;
       const historyData = await window.systemAPI.getTrafficHistory(viewType);

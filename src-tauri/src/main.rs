@@ -28,13 +28,14 @@ use windows::core::PCWSTR;
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{
-    Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, POINT, WPARAM},
+    Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM},
     System::Threading::CreateMutexW,
+    UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_RBUTTON},
     UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, MessageBoxW, PostMessageW,
-        SetForegroundWindow, ShowWindow, TrackPopupMenu, MB_ICONINFORMATION, MB_OK, MF_CHECKED,
-        MF_POPUP, MF_SEPARATOR, MF_STRING, SW_RESTORE, TPM_LEFTALIGN, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_NULL,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, GetWindowRect,
+        MessageBoxW, PostMessageW, SendMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
+        MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_RESTORE,
+        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_CANCELMODE, WM_NULL,
     },
 };
 
@@ -84,9 +85,9 @@ struct AlertRuntimeState {
     traffic_day: String,
 }
 
-const WIDGET_FULL_WIDTH: f64 = 160.0;
-const WIDGET_NETWORK_ONLY_WIDTH: f64 = 104.0;
-const WIDGET_HEIGHT: f64 = 30.0;
+const WIDGET_FULL_WIDTH: f64 = 136.0;
+const WIDGET_NETWORK_ONLY_WIDTH: f64 = 84.0;
+const WIDGET_HEIGHT: f64 = 32.0;
 
 fn current_day_string() -> String {
     Local::now().format("%Y-%m-%d").to_string()
@@ -542,7 +543,7 @@ fn main() {
                     let raw = hwnd_val.0 as isize;
                     crate::taskbar_embed::apply_widget_styles(raw);
                     let (preferred_width, preferred_height) =
-                        crate::taskbar_embed::get_window_size(raw).unwrap_or((160, 30));
+                        crate::taskbar_embed::get_window_size(raw).unwrap_or((136, 32));
                     let _ = crate::taskbar_embed::enforce_widget(
                         raw,
                         preferred_width,
@@ -558,6 +559,64 @@ fn main() {
 
             #[cfg(not(target_os = "windows"))]
             let widget_hwnd: Option<isize> = None;
+
+            #[cfg(target_os = "windows")]
+            if let Some(raw_widget_hwnd) = widget_hwnd {
+                let startup_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let widget_hwnd = HWND(raw_widget_hwnd);
+                    let mut right_button_was_down = false;
+                    let mut context_menu_armed = false;
+
+                    loop {
+                        std::thread::sleep(Duration::from_millis(35));
+
+                        let right_button_down =
+                            unsafe { (GetAsyncKeyState(VK_RBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+
+                        if right_button_down {
+                            if right_button_was_down {
+                                continue;
+                            }
+
+                            right_button_was_down = true;
+
+                            let mut rect = RECT::default();
+                            if unsafe { GetWindowRect(widget_hwnd, &mut rect) }.is_err() {
+                                context_menu_armed = false;
+                                continue;
+                            }
+
+                            let mut cursor = POINT::default();
+                            if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+                                context_menu_armed = false;
+                                continue;
+                            }
+
+                            context_menu_armed = cursor.x >= rect.left
+                                && cursor.x < rect.right
+                                && cursor.y >= rect.top
+                                && cursor.y < rect.bottom;
+
+                            continue;
+                        }
+
+                        if right_button_was_down && context_menu_armed {
+                            context_menu_armed = false;
+                            right_button_was_down = false;
+
+                            let menu_handle = startup_handle.clone();
+                            let _ = startup_handle.run_on_main_thread(move || {
+                                let _ = show_widget_context_menu_for_app(&menu_handle);
+                            });
+                            continue;
+                        }
+
+                        right_button_was_down = false;
+                        context_menu_armed = false;
+                    }
+                });
+            }
 
             // System tray
             setup_tray(app)?;
@@ -1175,7 +1234,7 @@ async fn keep_widget_on_top_loop(app_handle: tauri::AppHandle, hwnd_raw: Option<
             }
 
             let (preferred_width, preferred_height) =
-                crate::taskbar_embed::get_window_size(raw).unwrap_or((160, 30));
+                crate::taskbar_embed::get_window_size(raw).unwrap_or((136, 32));
             if let Some(placement) =
                 crate::taskbar_embed::enforce_widget(raw, preferred_width, preferred_height)
             {
@@ -1245,6 +1304,114 @@ fn cmd_get_widget_display_mode(
     WidgetDisplayModePayload { network_only }
 }
 
+#[cfg(target_os = "windows")]
+fn handle_widget_menu_action(
+    app_handle: &tauri::AppHandle,
+    widget_state: &Mutex<WidgetDisplayState>,
+    monitor_state: &Mutex<MonitorState>,
+    action: WidgetMenuCommand,
+) {
+    match action {
+        WidgetMenuCommand::OpenDashboard => {
+            show_main_window(app_handle);
+            emit_widget_menu_action(app_handle, Some("dashboard"), None);
+        }
+        WidgetMenuCommand::OpenHistory => {
+            show_main_window(app_handle);
+            emit_widget_menu_action(app_handle, Some("data-usage"), Some("last7days"));
+        }
+        WidgetMenuCommand::ViewToday => {
+            show_main_window(app_handle);
+            emit_widget_menu_action(app_handle, Some("data-usage"), Some("today"));
+        }
+        WidgetMenuCommand::ViewLast7Days => {
+            show_main_window(app_handle);
+            emit_widget_menu_action(app_handle, Some("data-usage"), Some("last7days"));
+        }
+        WidgetMenuCommand::ViewMonthly => {
+            show_main_window(app_handle);
+            emit_widget_menu_action(app_handle, Some("data-usage"), Some("monthly"));
+        }
+        WidgetMenuCommand::ShowNetworkOnly => {
+            if let Ok(mut state) = widget_state.lock() {
+                state.network_only = true;
+            }
+            apply_widget_display_mode(app_handle, true);
+        }
+        WidgetMenuCommand::ShowCpuMem => {
+            if let Ok(mut state) = widget_state.lock() {
+                state.network_only = false;
+            }
+            apply_widget_display_mode(app_handle, false);
+        }
+        WidgetMenuCommand::ResetSessionCounters => {
+            if let Ok(mut state) = monitor_state.lock() {
+                commands::monitor::reset_session_counters(&mut state);
+            }
+            emit_widget_feedback(app_handle, "Session counters reset", "info");
+        }
+        WidgetMenuCommand::Exit => {
+            quit_application(app_handle);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_widget_context_menu_for_app(app_handle: &tauri::AppHandle) -> bool {
+    let taskbar = match app_handle.get_webview_window("taskbar") {
+        Some(window) => window,
+        None => return false,
+    };
+
+    let _widget_hwnd = match taskbar.hwnd() {
+        Ok(hwnd) => HWND(hwnd.0 as isize),
+        Err(_) => return false,
+    };
+
+    let owner_hwnd = if let Some(main_window) = app_handle.get_webview_window("main") {
+        match main_window.hwnd() {
+            Ok(hwnd) => HWND(hwnd.0 as isize),
+            Err(_) => return false,
+        }
+    } else {
+        return false;
+    };
+
+    let Some(widget_state) = app_handle.try_state::<Mutex<WidgetDisplayState>>() else {
+        return false;
+    };
+    let Some(monitor_state) = app_handle.try_state::<Mutex<MonitorState>>() else {
+        return false;
+    };
+
+    let network_only = widget_state
+        .lock()
+        .map(|state| state.network_only)
+        .unwrap_or(false);
+
+    cancel_shell_taskbar_menu();
+
+    let Some(action) = show_widget_context_menu_native(owner_hwnd, network_only) else {
+        cancel_shell_taskbar_menu();
+        return true;
+    };
+
+    cancel_shell_taskbar_menu();
+    handle_widget_menu_action(app_handle, &widget_state, &monitor_state, action);
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn cancel_shell_taskbar_menu() {
+    let class_name = wide_string("Shell_TrayWnd");
+    let shell = unsafe { FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null()) };
+    if shell.0 != 0 {
+        unsafe {
+            let _ = SendMessageW(shell, WM_CANCELMODE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
 #[tauri::command]
 fn cmd_show_widget_context_menu(
     app_handle: tauri::AppHandle,
@@ -1253,69 +1420,9 @@ fn cmd_show_widget_context_menu(
 ) -> bool {
     #[cfg(target_os = "windows")]
     {
-        let taskbar = match app_handle.get_webview_window("taskbar") {
-            Some(window) => window,
-            None => return false,
-        };
-
-        let owner_hwnd = match taskbar.hwnd() {
-            Ok(hwnd) => HWND(hwnd.0 as isize),
-            Err(_) => return false,
-        };
-
-        let network_only = widget_state
-            .lock()
-            .map(|state| state.network_only)
-            .unwrap_or(false);
-
-        let Some(action) = show_widget_context_menu_native(owner_hwnd, network_only) else {
-            return true;
-        };
-
-        match action {
-            WidgetMenuCommand::OpenDashboard => {
-                show_main_window(&app_handle);
-                emit_widget_menu_action(&app_handle, Some("dashboard"), None);
-            }
-            WidgetMenuCommand::OpenHistory => {
-                cmd_show_history_window(app_handle.clone());
-            }
-            WidgetMenuCommand::ViewToday => {
-                show_main_window(&app_handle);
-                emit_widget_menu_action(&app_handle, Some("data-usage"), Some("today"));
-            }
-            WidgetMenuCommand::ViewLast7Days => {
-                show_main_window(&app_handle);
-                emit_widget_menu_action(&app_handle, Some("data-usage"), Some("last7days"));
-            }
-            WidgetMenuCommand::ViewMonthly => {
-                show_main_window(&app_handle);
-                emit_widget_menu_action(&app_handle, Some("data-usage"), Some("monthly"));
-            }
-            WidgetMenuCommand::ShowNetworkOnly => {
-                if let Ok(mut state) = widget_state.lock() {
-                    state.network_only = true;
-                }
-                apply_widget_display_mode(&app_handle, true);
-            }
-            WidgetMenuCommand::ShowCpuMem => {
-                if let Ok(mut state) = widget_state.lock() {
-                    state.network_only = false;
-                }
-                apply_widget_display_mode(&app_handle, false);
-            }
-            WidgetMenuCommand::ResetSessionCounters => {
-                if let Ok(mut state) = monitor_state.lock() {
-                    commands::monitor::reset_session_counters(&mut state);
-                }
-                emit_widget_feedback(&app_handle, "Session counters reset", "info");
-            }
-            WidgetMenuCommand::Exit => {
-                quit_application(&app_handle);
-            }
-        }
-
-        true
+        let _ = widget_state;
+        let _ = monitor_state;
+        show_widget_context_menu_for_app(&app_handle)
     }
 
     #[cfg(not(target_os = "windows"))]

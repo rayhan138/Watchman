@@ -212,6 +212,7 @@ mod windows_network {
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     const NO_ERROR: u32 = 0;
     const OCTET_COUNTER_RANGE: u64 = u32::MAX as u64 + 1;
+    const BEST_ROUTE_PROBES: [[u8; 4]; 2] = [[8, 8, 4, 4], [1, 0, 0, 1]];
 
     pub const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
     pub const IF_TYPE_TUNNEL: u32 = 131;
@@ -255,6 +256,7 @@ mod windows_network {
     #[link(name = "iphlpapi")]
     unsafe extern "system" {
         fn GetIfTable(table: *mut MibIfTable, size: *mut u32, order: i32) -> u32;
+        fn GetBestInterface(dest_addr: u32, best_if_index: *mut u32) -> u32;
     }
 
     #[derive(Clone, Debug)]
@@ -298,6 +300,19 @@ mod windows_network {
                 tx_bytes: row.dw_out_octets as u64,
             })
             .collect())
+    }
+
+    pub fn get_best_interface_index() -> Option<u32> {
+        for probe in BEST_ROUTE_PROBES {
+            let mut best_if_index = 0u32;
+            let dest_addr = u32::from_be_bytes(probe);
+            let status = unsafe { GetBestInterface(dest_addr, &mut best_if_index) };
+            if status == NO_ERROR && best_if_index != 0 {
+                return Some(best_if_index);
+            }
+        }
+
+        None
     }
 
     fn is_active_interface(row: &MibIfRow) -> bool {
@@ -1263,12 +1278,14 @@ pub fn get_network_stats(state: &mut MonitorState) -> NetworkStats {
 
 #[cfg(target_os = "windows")]
 fn get_windows_network_stats(state: &mut MonitorState) -> Option<NetworkStats> {
-    use windows_network::{diff_counter, get_interfaces};
+    use windows_network::{diff_counter, get_best_interface_index, get_interfaces};
 
     let samples = match get_interfaces() {
         Ok(samples) => samples,
         Err(_) => return None,
     };
+    let preferred_index = get_best_interface_index()
+        .filter(|preferred| samples.iter().any(|sample| sample.index == *preferred));
 
     let now = Instant::now();
     let elapsed_ms = now.duration_since(state.prev_time).as_millis() as f64;
@@ -1279,17 +1296,25 @@ fn get_windows_network_stats(state: &mut MonitorState) -> Option<NetworkStats> {
     let mut interfaces = Vec::with_capacity(samples.len());
 
     for sample in samples {
-        if let Some(previous) = state.prev_interfaces.get(&sample.index) {
-            downloaded_bytes += diff_counter(sample.rx_bytes, previous.rx_bytes);
-            uploaded_bytes += diff_counter(sample.tx_bytes, previous.tx_bytes);
+        let use_for_bandwidth = preferred_index
+            .map(|preferred| preferred == sample.index)
+            .unwrap_or(true);
+
+        if use_for_bandwidth {
+            if let Some(previous) = state.prev_interfaces.get(&sample.index) {
+                downloaded_bytes += diff_counter(sample.rx_bytes, previous.rx_bytes);
+                uploaded_bytes += diff_counter(sample.tx_bytes, previous.tx_bytes);
+            }
         }
 
+        let display_name = if sample.description.is_empty() {
+            sample.name.clone()
+        } else {
+            sample.description.clone()
+        };
+
         interfaces.push(InterfaceStat {
-            iface: if sample.description.is_empty() {
-                sample.name.clone()
-            } else {
-                sample.description.clone()
-            },
+            iface: display_name,
             rx_bytes: sample.rx_bytes,
             tx_bytes: sample.tx_bytes,
         });

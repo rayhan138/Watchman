@@ -82,7 +82,7 @@ pub fn enforce_widget(
         width: placement.width,
         height: placement.height,
         edge: edge_name(placement.edge).to_string(),
-        anchor: "tray".to_string(),
+        anchor: "taskbar".to_string(),
     })
 }
 
