@@ -821,11 +821,15 @@ pub struct NetworkInterface {
     #[serde(rename = "ifaceName")]
     pub iface_name: String,
     pub ip4: String,
+    #[serde(rename = "ip4subnet")]
+    pub ip4subnet: String,
+    pub ip6: String,
     pub mac: String,
     #[serde(rename = "type")]
     pub iface_type: String,
     pub speed: u64,
     pub operstate: String,
+    pub dhcp: bool,
     pub internal: bool,
 }
 
@@ -1324,6 +1328,219 @@ fn get_windows_network_stats(state: &mut MonitorState) -> Option<NetworkStats> {
     })
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Debug, Deserialize)]
+struct PowerShellNetworkInterface {
+    alias: String,
+    description: String,
+    #[serde(default, rename = "type")]
+    iface_type: String,
+    #[serde(default)]
+    mac: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default, rename = "linkSpeed")]
+    link_speed: String,
+    #[serde(default)]
+    ipv4: String,
+    #[serde(default, rename = "ipv4Prefix")]
+    ipv4_prefix: Option<u8>,
+    #[serde(default)]
+    ipv6: String,
+    #[serde(default)]
+    dhcp: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_network_interfaces() -> Result<Vec<NetworkInterface>, String> {
+    let script = r#"
+$adapters = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | ForEach-Object {
+  $adapter = $_
+  $cfg = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue
+  [pscustomobject]@{
+    alias = $adapter.Name
+    description = $adapter.InterfaceDescription
+    type = if ($adapter.NdisPhysicalMedium) { [string]$adapter.NdisPhysicalMedium } elseif ($adapter.MediaType) { [string]$adapter.MediaType } else { '' }
+    mac = [string]$adapter.MacAddress
+    status = [string]$adapter.Status
+    linkSpeed = [string]$adapter.LinkSpeed
+    ipv4 = if ($cfg -and $cfg.IPv4Address) { ($cfg.IPv4Address | Select-Object -ExpandProperty IPAddress -First 1) } else { '' }
+    ipv4Prefix = if ($cfg -and $cfg.IPv4Address) { ($cfg.IPv4Address | Select-Object -ExpandProperty PrefixLength -First 1) } else { $null }
+    ipv6 = if ($cfg -and $cfg.IPv6Address) { ($cfg.IPv6Address | Select-Object -ExpandProperty IPAddress -First 1) } else { '' }
+    dhcp = if ($cfg -and $cfg.NetIPv4Interface) { [bool]$cfg.NetIPv4Interface.Dhcp } else { $false }
+  }
+}
+$adapters | ConvertTo-Json -Compress
+"#;
+
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script);
+
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = command
+        .output()
+        .map_err(|err| format!("Failed to query network adapters: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Network adapter query exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw = stdout.trim();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let entries: Vec<PowerShellNetworkInterface> = if raw.starts_with('[') {
+        serde_json::from_str(raw).map_err(|err| format!("Invalid adapter JSON: {err}"))?
+    } else {
+        vec![serde_json::from_str(raw).map_err(|err| format!("Invalid adapter JSON: {err}"))?]
+    };
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let iface_name = if entry.alias.trim().is_empty() {
+                entry.description.clone()
+            } else {
+                entry.alias.clone()
+            };
+            let iface_type = normalize_interface_type(&entry.iface_type, &entry.alias, &entry.description);
+
+            NetworkInterface {
+                iface: entry.alias.clone(),
+                iface_name,
+                ip4: entry.ipv4.trim().to_string(),
+                ip4subnet: entry
+                    .ipv4_prefix
+                    .map(prefix_length_to_mask)
+                    .unwrap_or_default(),
+                ip6: entry.ipv6.trim().to_string(),
+                mac: entry.mac.trim().to_string(),
+                iface_type: iface_type.clone(),
+                speed: parse_link_speed_mbps(&entry.link_speed),
+                operstate: normalize_operstate(&entry.status),
+                dhcp: entry.dhcp,
+                internal: is_internal_interface(&entry.alias, &entry.description, &iface_type),
+            }
+        })
+        .collect())
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_operstate(status: &str) -> String {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "up" | "connected" => "up".to_string(),
+        "down" | "disconnected" => "down".to_string(),
+        "disabled" => "disabled".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_interface_type(raw_type: &str, alias: &str, description: &str) -> String {
+    let joined = format!("{raw_type} {alias} {description}").to_ascii_lowercase();
+
+    if joined.contains("wireless")
+        || joined.contains("wi-fi")
+        || joined.contains("wifi")
+        || joined.contains("802.11")
+        || joined.contains("native 802.11")
+    {
+        "Wi-Fi".to_string()
+    } else if joined.contains("wwan")
+        || joined.contains("cellular")
+        || joined.contains("mobile")
+        || joined.contains("lte")
+    {
+        "Cellular".to_string()
+    } else if joined.contains("ethernet") {
+        "Ethernet".to_string()
+    } else if joined.contains("loopback") {
+        "Loopback".to_string()
+    } else if !raw_type.trim().is_empty() {
+        raw_type.trim().to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_internal_interface(alias: &str, description: &str, iface_type: &str) -> bool {
+    let joined = format!("{alias} {description} {iface_type}").to_ascii_lowercase();
+    joined.contains("loopback")
+        || joined.contains("virtualbox")
+        || joined.contains("hyper-v")
+        || joined.contains("vmware")
+        || joined.contains("npcap")
+        || joined.contains("tunnel")
+}
+
+#[cfg(target_os = "windows")]
+fn parse_link_speed_mbps(raw: &str) -> u64 {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let Some(number_part) = parts.next() else {
+        return 0;
+    };
+    let Some(unit_part) = parts.next() else {
+        return 0;
+    };
+
+    let value = number_part.parse::<f64>().unwrap_or(0.0);
+    if value <= 0.0 {
+        return 0;
+    }
+
+    let mbps = match unit_part {
+        "gbps" => value * 1000.0,
+        "mbps" => value,
+        "kbps" => value / 1000.0,
+        "bps" => value / 1_000_000.0,
+        _ => value,
+    };
+
+    mbps.round() as u64
+}
+
+#[cfg(target_os = "windows")]
+fn prefix_length_to_mask(prefix: u8) -> String {
+    if prefix > 32 {
+        return String::new();
+    }
+
+    let mask = if prefix == 0 {
+        0u32
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+
+    format!(
+        "{}.{}.{}.{}",
+        (mask >> 24) & 0xff,
+        (mask >> 16) & 0xff,
+        (mask >> 8) & 0xff,
+        mask & 0xff
+    )
+}
+
 pub fn get_disk_usage() -> Vec<DiskInfo> {
     let disks = Disks::new_with_refreshed_list();
     disks
@@ -1351,6 +1568,22 @@ pub fn get_disk_usage() -> Vec<DiskInfo> {
 }
 
 pub fn get_network_interfaces() -> Vec<NetworkInterface> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(mut interfaces) = query_windows_network_interfaces() {
+            if !interfaces.is_empty() {
+                interfaces.sort_by_key(|iface| {
+                    (
+                        iface.internal,
+                        iface.operstate != "up",
+                        iface.iface_name.to_lowercase(),
+                    )
+                });
+                return interfaces;
+            }
+        }
+    }
+
     let networks = Networks::new_with_refreshed_list();
     networks
         .iter()
@@ -1358,10 +1591,13 @@ pub fn get_network_interfaces() -> Vec<NetworkInterface> {
             iface: name.clone(),
             iface_name: name.clone(),
             ip4: String::new(),
+            ip4subnet: String::new(),
+            ip6: String::new(),
             mac: String::new(),
             iface_type: "unknown".to_string(),
             speed: 0,
             operstate: "up".to_string(),
+            dhcp: false,
             internal: name.to_lowercase().contains("loopback") || name.to_lowercase() == "lo",
         })
         .collect()

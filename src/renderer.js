@@ -692,9 +692,6 @@
     const nextConfig = buildWidgetConfig(localConfig);
     localConfig = nextConfig;
     await saveLocalConfig();
-    if (window.systemAPI.setWidgetDisplayMode) {
-      await window.systemAPI.setWidgetDisplayMode(nextConfig.widgetSettings.mode);
-    }
     localConfig = await window.systemAPI.getConfig();
     applyWidgetSettingsToDOM(localConfig);
     showToast('Widget settings saved', 'info');

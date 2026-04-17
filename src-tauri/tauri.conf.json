@@ -4,7 +4,10 @@
   "version": "1.0.0",
   "identifier": "com.trafficmonitor.app",
   "build": {
-    "frontendDist": "../src"
+    "beforeDevCommand": "bun --cwd .. run dev",
+    "beforeBuildCommand": "bun --cwd .. run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
   },
   "app": {
     "withGlobalTauri": true,
