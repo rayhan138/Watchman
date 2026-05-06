@@ -389,16 +389,6 @@ pub fn undo_settings(state: tauri::State<'_, Mutex<ConfigState>>) -> serde_json:
 }
 
 #[tauri::command]
-pub fn get_undo_history(state: tauri::State<'_, Mutex<ConfigState>>) -> Vec<serde_json::Value> {
-    let s = state.lock().unwrap();
-    s.undo_history
-        .iter()
-        .enumerate()
-        .map(|(i, _)| serde_json::json!({ "index": i, "timestamp": "saved" }))
-        .collect()
-}
-
-#[tauri::command]
 pub fn can_undo_settings(state: tauri::State<'_, Mutex<ConfigState>>) -> bool {
     let s = state.lock().unwrap();
     !s.undo_history.is_empty()

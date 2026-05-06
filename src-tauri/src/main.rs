@@ -10,7 +10,7 @@ use commands::history::HistoryState;
 use commands::monitor::MonitorState;
 use serde::Serialize;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
@@ -30,7 +30,7 @@ use windows::core::PCWSTR;
 use windows::Win32::{
     Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM},
     System::Threading::CreateMutexW,
-    UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_RBUTTON},
+    UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON},
     UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, GetWindowRect,
         MessageBoxW, PostMessageW, SendMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
@@ -63,6 +63,13 @@ impl Default for WidgetDisplayState {
 #[serde(rename_all = "camelCase")]
 struct WidgetDisplayModePayload {
     network_only: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskbarThemePayload {
+    is_light: bool,
+    source: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -124,7 +131,11 @@ fn format_bytes_for_alert(bytes: u64) -> String {
     }
 
     let precision = if unit_index == 0 { 0 } else { 2 };
-    format!("{value:.precision$} {}", units[unit_index], precision = precision)
+    format!(
+        "{value:.precision$} {}",
+        units[unit_index],
+        precision = precision
+    )
 }
 
 fn format_temperature_for_alert(value: f64) -> String {
@@ -498,7 +509,9 @@ fn main() {
             cmd_show_history_window,
             cmd_toggle_widget_lock,
             cmd_show_widget_context_menu,
+            cmd_reset_session_counters,
             cmd_get_widget_display_mode,
+            cmd_get_taskbar_theme,
         ])
         .setup(move |app| {
             if start_minimized {
@@ -525,7 +538,7 @@ fn main() {
                 "taskbar",
                 tauri::WebviewUrl::App("taskbar.html".into()),
             )
-                .title("Watchman Widget")
+            .title("Watchman Widget")
             .inner_size(WIDGET_FULL_WIDTH, WIDGET_HEIGHT)
             .resizable(false)
             .decorations(false)
@@ -567,15 +580,122 @@ fn main() {
                     let widget_hwnd = HWND(raw_widget_hwnd);
                     let mut right_button_was_down = false;
                     let mut context_menu_armed = false;
+                    let mut left_button_was_down = false;
+                    let mut left_click_armed = false;
+                    let mut last_left_click_at: Option<Instant> = None;
+                    let mut last_left_click_pos: Option<(i32, i32)> = None;
+                    let mut last_context_menu_at: Option<Instant> = None;
+                    let mut last_history_at: Option<Instant> = None;
 
                     loop {
                         std::thread::sleep(Duration::from_millis(35));
 
+                        if crate::taskbar_embed::take_widget_double_click_request() {
+                            let now = Instant::now();
+                            let can_open = last_history_at
+                                .map(|last| now.duration_since(last) > Duration::from_millis(450))
+                                .unwrap_or(true);
+
+                            if can_open {
+                                last_history_at = Some(now);
+                                let history_handle = startup_handle.clone();
+                                let _ = startup_handle.run_on_main_thread(move || {
+                                    cmd_show_history_window(history_handle);
+                                });
+                            }
+                            continue;
+                        }
+
+                        if crate::taskbar_embed::take_widget_context_menu_request() {
+                            let now = Instant::now();
+                            let can_open = last_context_menu_at
+                                .map(|last| now.duration_since(last) > Duration::from_millis(350))
+                                .unwrap_or(true);
+
+                            if can_open {
+                                last_context_menu_at = Some(now);
+                                let menu_handle = startup_handle.clone();
+                                let _ = startup_handle.run_on_main_thread(move || {
+                                    let _ = show_widget_context_menu_for_app(&menu_handle);
+                                });
+                            }
+                            continue;
+                        }
+
                         let right_button_down =
                             unsafe { (GetAsyncKeyState(VK_RBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+                        let left_button_down =
+                            unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+
+                        if left_button_down {
+                            if !left_button_was_down {
+                                left_button_was_down = true;
+
+                                let mut rect = RECT::default();
+                                let mut cursor = POINT::default();
+                                left_click_armed = unsafe { GetWindowRect(widget_hwnd, &mut rect) }
+                                    .is_ok()
+                                    && unsafe { GetCursorPos(&mut cursor) }.is_ok()
+                                    && cursor.x >= rect.left
+                                    && cursor.x < rect.right
+                                    && cursor.y >= rect.top
+                                    && cursor.y < rect.bottom;
+                            }
+                        } else if left_button_was_down {
+                            left_button_was_down = false;
+
+                            let mut rect = RECT::default();
+                            let mut cursor = POINT::default();
+                            let released_inside = unsafe { GetWindowRect(widget_hwnd, &mut rect) }
+                                .is_ok()
+                                && unsafe { GetCursorPos(&mut cursor) }.is_ok()
+                                && cursor.x >= rect.left
+                                && cursor.x < rect.right
+                                && cursor.y >= rect.top
+                                && cursor.y < rect.bottom;
+
+                            if left_click_armed && released_inside {
+                                let now = Instant::now();
+                                let previous_click_matches = last_left_click_at
+                                    .zip(last_left_click_pos)
+                                    .map(|(last, (x, y))| {
+                                        now.duration_since(last) <= Duration::from_millis(420)
+                                            && (cursor.x - x).abs() <= 8
+                                            && (cursor.y - y).abs() <= 8
+                                    })
+                                    .unwrap_or(false);
+
+                                if previous_click_matches {
+                                    last_left_click_at = None;
+                                    last_left_click_pos = None;
+
+                                    let can_open = last_history_at
+                                        .map(|last| {
+                                            now.duration_since(last) > Duration::from_millis(450)
+                                        })
+                                        .unwrap_or(true);
+
+                                    if can_open {
+                                        last_history_at = Some(now);
+                                        let history_handle = startup_handle.clone();
+                                        let _ = startup_handle.run_on_main_thread(move || {
+                                            cmd_show_history_window(history_handle);
+                                        });
+                                    }
+                                } else {
+                                    last_left_click_at = Some(now);
+                                    last_left_click_pos = Some((cursor.x, cursor.y));
+                                }
+                            }
+
+                            left_click_armed = false;
+                        }
 
                         if right_button_down {
                             if right_button_was_down {
+                                if context_menu_armed {
+                                    cancel_shell_taskbar_menu();
+                                }
                                 continue;
                             }
 
@@ -598,17 +718,30 @@ fn main() {
                                 && cursor.y >= rect.top
                                 && cursor.y < rect.bottom;
 
+                            if context_menu_armed {
+                                cancel_shell_taskbar_menu();
+                            }
+
                             continue;
                         }
 
                         if right_button_was_down && context_menu_armed {
                             context_menu_armed = false;
                             right_button_was_down = false;
+                            cancel_shell_taskbar_menu();
 
-                            let menu_handle = startup_handle.clone();
-                            let _ = startup_handle.run_on_main_thread(move || {
-                                let _ = show_widget_context_menu_for_app(&menu_handle);
-                            });
+                            let now = Instant::now();
+                            let can_open = last_context_menu_at
+                                .map(|last| now.duration_since(last) > Duration::from_millis(350))
+                                .unwrap_or(true);
+
+                            if can_open {
+                                last_context_menu_at = Some(now);
+                                let menu_handle = startup_handle.clone();
+                                let _ = startup_handle.run_on_main_thread(move || {
+                                    let _ = show_widget_context_menu_for_app(&menu_handle);
+                                });
+                            }
                             continue;
                         }
 
@@ -642,7 +775,12 @@ fn main() {
                 let _ = autostart_mgr.disable();
             }
 
-            commands::app_monitor::start_tracker();
+            // App-level network tracking can be slow when Watchman is elevated.
+            // Start it after the UI is already responsive instead of blocking launch.
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(8));
+                commands::app_monitor::start_tracker();
+            });
 
             // Start metrics polling loop
             let app_handle = app.handle().clone();
@@ -700,7 +838,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     TrayIconBuilder::new()
         .icon(icon)
-                    .tooltip("Watchman")
+        .tooltip("Watchman")
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
@@ -1117,6 +1255,7 @@ async fn metrics_loop(app_handle: tauri::AppHandle) {
     let resource_dir = app_handle.path().resource_dir().ok();
     let temperature_probe_paths =
         commands::monitor::resolve_temperature_probe_paths(resource_dir.as_deref());
+    let temperature_probe_ready_at = Instant::now() + Duration::from_secs(12);
 
     loop {
         // Get metrics
@@ -1127,10 +1266,14 @@ async fn metrics_loop(app_handle: tauri::AppHandle) {
             let cpu = commands::monitor::get_cpu_usage(&mut ms);
             let memory = commands::monitor::get_memory_usage(&mut ms);
             let gpu = commands::monitor::get_gpu_usage(&mut ms);
-            let temperatures = commands::monitor::get_temperature_readings(
-                &mut ms,
-                temperature_probe_paths.as_ref(),
-            );
+            let temperatures = if Instant::now() >= temperature_probe_ready_at {
+                commands::monitor::get_temperature_readings(
+                    &mut ms,
+                    temperature_probe_paths.as_ref(),
+                )
+            } else {
+                ms.temperatures.clone()
+            };
             let network = commands::monitor::get_network_stats(&mut ms);
 
             let up = network.uploaded_bytes;
@@ -1305,6 +1448,40 @@ fn cmd_get_widget_display_mode(
 }
 
 #[cfg(target_os = "windows")]
+fn read_windows_taskbar_light_theme() -> Option<bool> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let personalize = hkcu
+        .open_subkey_with_flags(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            KEY_READ,
+        )
+        .ok()?;
+    let value: u32 = personalize.get_value("SystemUsesLightTheme").ok()?;
+    Some(value != 0)
+}
+
+#[tauri::command]
+fn cmd_get_taskbar_theme() -> TaskbarThemePayload {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(is_light) = read_windows_taskbar_light_theme() {
+            return TaskbarThemePayload {
+                is_light,
+                source: "windows-system-theme".to_string(),
+            };
+        }
+    }
+
+    TaskbarThemePayload {
+        is_light: false,
+        source: "fallback-dark".to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn handle_widget_menu_action(
     app_handle: &tauri::AppHandle,
     widget_state: &Mutex<WidgetDisplayState>,
@@ -1390,13 +1567,16 @@ fn show_widget_context_menu_for_app(app_handle: &tauri::AppHandle) -> bool {
         .unwrap_or(false);
 
     cancel_shell_taskbar_menu();
+    cancel_shell_taskbar_menu_soon();
 
     let Some(action) = show_widget_context_menu_native(owner_hwnd, network_only) else {
         cancel_shell_taskbar_menu();
+        cancel_shell_taskbar_menu_soon();
         return true;
     };
 
     cancel_shell_taskbar_menu();
+    cancel_shell_taskbar_menu_soon();
     handle_widget_menu_action(app_handle, &widget_state, &monitor_state, action);
     true
 }
@@ -1410,6 +1590,16 @@ fn cancel_shell_taskbar_menu() {
             let _ = SendMessageW(shell, WM_CANCELMODE, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn cancel_shell_taskbar_menu_soon() {
+    std::thread::spawn(|| {
+        for delay_ms in [30_u64, 90, 180] {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            cancel_shell_taskbar_menu();
+        }
+    });
 }
 
 #[tauri::command]
@@ -1431,5 +1621,25 @@ fn cmd_show_widget_context_menu(
         let _ = widget_state;
         let _ = monitor_state;
         false
+    }
+}
+
+#[tauri::command]
+fn cmd_reset_session_counters(
+    _app_handle: tauri::AppHandle,
+    monitor_state: tauri::State<'_, Mutex<MonitorState>>,
+) -> serde_json::Value {
+    match monitor_state.lock() {
+        Ok(mut state) => {
+            commands::monitor::reset_session_counters(&mut state);
+            serde_json::json!({
+                "success": true,
+                "message": "Current session reset"
+            })
+        }
+        Err(_) => serde_json::json!({
+            "success": false,
+            "message": "Could not reset current session"
+        }),
     }
 }

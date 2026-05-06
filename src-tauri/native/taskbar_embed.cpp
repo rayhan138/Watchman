@@ -50,16 +50,130 @@ struct SavedTaskbarLayout {
 };
 
 SavedTaskbarLayout g_layout;
+LONG g_pending_widget_context_menu = 0;
+LONG g_pending_widget_double_click = 0;
+LONG g_mouse_hook_started = 0;
+HHOOK g_mouse_hook = nullptr;
+POINT g_last_left_click_point{0, 0};
+DWORD g_last_left_click_time = 0;
+
+bool IsPointInsideWidget(POINT point) {
+    if (!g_layout.widget_embedded || g_layout.widget == nullptr || !IsWindow(g_layout.widget)) {
+        return false;
+    }
+
+    RECT rect{};
+    if (!GetWindowRect(g_layout.widget, &rect)) {
+        return false;
+    }
+
+    return point.x >= rect.left &&
+           point.x < rect.right &&
+           point.y >= rect.top &&
+           point.y < rect.bottom;
+}
+
+void QueueLeftClickOrDoubleClick(POINT point) {
+    const DWORD now = GetTickCount();
+    const DWORD double_click_time = GetDoubleClickTime();
+    const int max_dx = GetSystemMetrics(SM_CXDOUBLECLK);
+    const int max_dy = GetSystemMetrics(SM_CYDOUBLECLK);
+
+    const bool is_double_click =
+        g_last_left_click_time != 0 &&
+        now - g_last_left_click_time <= double_click_time &&
+        std::abs(point.x - g_last_left_click_point.x) <= max_dx &&
+        std::abs(point.y - g_last_left_click_point.y) <= max_dy;
+
+    if (is_double_click) {
+        g_last_left_click_time = 0;
+        InterlockedExchange(&g_pending_widget_double_click, 1);
+        return;
+    }
+
+    g_last_left_click_point = point;
+    g_last_left_click_time = now;
+}
+
+LRESULT CALLBACK WidgetMouseHookProc(int code, WPARAM w_param, LPARAM l_param) {
+    if (code == HC_ACTION && l_param != 0) {
+        const auto* mouse = reinterpret_cast<MSLLHOOKSTRUCT*>(l_param);
+
+        if (mouse != nullptr && IsPointInsideWidget(mouse->pt)) {
+            switch (w_param) {
+                case WM_RBUTTONDOWN:
+                case WM_NCRBUTTONDOWN:
+                    return 1;
+                case WM_RBUTTONUP:
+                case WM_RBUTTONDBLCLK:
+                case WM_NCRBUTTONUP:
+                case WM_NCRBUTTONDBLCLK:
+                    InterlockedExchange(&g_pending_widget_context_menu, 1);
+                    return 1;
+                case WM_LBUTTONDOWN:
+                case WM_NCLBUTTONDOWN:
+                    return 1;
+                case WM_LBUTTONUP:
+                case WM_NCLBUTTONUP:
+                    QueueLeftClickOrDoubleClick(mouse->pt);
+                    return 1;
+                default:
+                    break;
+            }
+        }
+    }
+
+    return CallNextHookEx(g_mouse_hook, code, w_param, l_param);
+}
+
+DWORD WINAPI WidgetMouseHookThread(LPVOID) {
+    g_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, WidgetMouseHookProc, GetModuleHandleW(nullptr), 0);
+    if (g_mouse_hook == nullptr) {
+        InterlockedExchange(&g_mouse_hook_started, 0);
+        return 0;
+    }
+
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+
+    UnhookWindowsHookEx(g_mouse_hook);
+    g_mouse_hook = nullptr;
+    InterlockedExchange(&g_mouse_hook_started, 0);
+    return 0;
+}
+
+void EnsureWidgetMouseHook() {
+    if (InterlockedCompareExchange(&g_mouse_hook_started, 1, 0) != 0) {
+        return;
+    }
+
+    HANDLE thread = CreateThread(nullptr, 0, WidgetMouseHookThread, nullptr, 0, nullptr);
+    if (thread == nullptr) {
+        InterlockedExchange(&g_mouse_hook_started, 0);
+        return;
+    }
+
+    CloseHandle(thread);
+}
 
 LRESULT CALLBACK WidgetSubclassProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param) {
     switch (message) {
         case WM_CONTEXTMENU:
-        case WM_RBUTTONDOWN:
         case WM_RBUTTONUP:
         case WM_RBUTTONDBLCLK:
-        case WM_NCRBUTTONDOWN:
         case WM_NCRBUTTONUP:
         case WM_NCRBUTTONDBLCLK:
+            InterlockedExchange(&g_pending_widget_context_menu, 1);
+            return 0;
+        case WM_RBUTTONDOWN:
+        case WM_NCRBUTTONDOWN:
+            return 0;
+        case WM_LBUTTONDBLCLK:
+        case WM_NCLBUTTONDBLCLK:
+            InterlockedExchange(&g_pending_widget_double_click, 1);
             return 0;
         default:
             break;
@@ -406,6 +520,7 @@ bool EnsureWidgetEmbedded(HWND hwnd, const TaskbarHandles& handles) {
         return false;
     }
 
+    EnsureWidgetMouseHook();
     ApplyBaseWidgetStyles(hwnd);
 
     LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
@@ -651,6 +766,14 @@ int tm_embed_widget(void* widget_hwnd, int preferred_width, int preferred_height
 
 int tm_restore_taskbar_layout() {
     return RestoreTaskbarLayoutInternal() ? 1 : 0;
+}
+
+int tm_take_widget_context_menu_request() {
+    return InterlockedExchange(&g_pending_widget_context_menu, 0) != 0 ? 1 : 0;
+}
+
+int tm_take_widget_double_click_request() {
+    return InterlockedExchange(&g_pending_widget_double_click, 0) != 0 ? 1 : 0;
 }
 
 int tm_should_widget_be_visible(void* widget_hwnd, void* main_hwnd, int* visible) {

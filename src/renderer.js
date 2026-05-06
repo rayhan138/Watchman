@@ -56,6 +56,10 @@
     uploadUnit: document.getElementById('uploadUnit'),
     totalDownloaded: document.getElementById('totalDownloaded'),
     totalUploaded: document.getElementById('totalUploaded'),
+    sessionDownload: document.getElementById('sessionDownload'),
+    sessionUpload: document.getElementById('sessionUpload'),
+    sessionTotal: document.getElementById('sessionTotal'),
+    sessionResetBtn: document.getElementById('sessionResetBtn'),
 
     // Gauges
     cpuValue: document.getElementById('cpuValue'),
@@ -1157,6 +1161,36 @@
     }
   }
 
+  function renderConnectionVisual(connection = {}) {
+    const type = connection.connectionType || 'unknown';
+    const bars = Math.max(0, Math.min(4, Number(connection.bars || 0)));
+    dom.nhSignalBars.className = `nh-signal-bars signal-${type}`;
+
+    if (type === 'wifi') {
+      dom.nhSignalBars.innerHTML = `
+        <svg class="wifi-signal-icon" viewBox="0 0 44 32" aria-hidden="true">
+          <path class="wifi-arc ${bars >= 4 ? 'signal-active' : ''}" d="M5 13c9.5-8.5 24.5-8.5 34 0" />
+          <path class="wifi-arc ${bars >= 3 ? 'signal-active' : ''}" d="M12 19c5.7-5 14.3-5 20 0" />
+          <path class="wifi-arc ${bars >= 2 ? 'signal-active' : ''}" d="M18 24c2.5-2 5.5-2 8 0" />
+          <circle class="wifi-dot ${bars >= 1 ? 'signal-active' : ''}" cx="22" cy="28" r="2.8" />
+        </svg>
+      `;
+      return;
+    }
+
+    if (type === 'cellular') {
+      dom.nhSignalBars.innerHTML = [1, 2, 3, 4]
+        .map((bar) => `<div class="signal-bar ${bar <= bars ? 'signal-active' : ''}" data-bar="${bar}"></div>`)
+        .join('');
+      return;
+    }
+
+    dom.nhSignalBars.innerHTML = `
+      <div class="wired-signal-dot"></div>
+      <div class="wired-signal-line"></div>
+    `;
+  }
+
   function updateAppMonitorStatus(statusInfo = {}) {
     if (!dom.appHeaderSubtitle) return;
 
@@ -1298,11 +1332,7 @@
         : (connection.adapterName || connection.adapterDescription || 'Unavailable');
       dom.nhConnLink.textContent = connection.linkSpeed || 'Unavailable';
       dom.nhConnIp.textContent = connection.localIp || 'Unavailable';
-      const bars = connection.bars || 0;
-      dom.nhSignalBars.querySelectorAll('.signal-bar').forEach(bar => {
-        const barNum = parseInt(bar.dataset.bar, 10);
-        bar.classList.toggle('signal-active', barNum <= bars);
-      });
+      renderConnectionVisual(connection);
       const isWireless = connection.connectionType === 'wifi' || connection.connectionType === 'cellular';
       dom.nhSignalBars.style.opacity = isWireless ? '1' : '0.35';
       const qualityLabel = connection.quality
@@ -1710,6 +1740,11 @@
     // Update network totals
     if (dom.totalDownloaded) dom.totalDownloaded.textContent = formatBytes(stats.totalDownloaded);
     if (dom.totalUploaded) dom.totalUploaded.textContent = formatBytes(stats.totalUploaded);
+    const sessionDownloaded = Number(stats.totalDownloaded) || 0;
+    const sessionUploaded = Number(stats.totalUploaded) || 0;
+    if (dom.sessionDownload) dom.sessionDownload.textContent = formatBytes(sessionDownloaded);
+    if (dom.sessionUpload) dom.sessionUpload.textContent = formatBytes(sessionUploaded);
+    if (dom.sessionTotal) dom.sessionTotal.textContent = formatBytes(sessionDownloaded + sessionUploaded);
 
     // Update connection status
     state.isConnected = stats.downloadSpeed > 0 || stats.uploadSpeed > 0 || stats.totalDownloaded > 0;
@@ -1878,6 +1913,29 @@
     // Window controls
     dom.minimizeBtn.addEventListener('click', () => window.systemAPI.minimizeWindow());
     dom.closeBtn.addEventListener('click', () => window.systemAPI.closeWindow());
+
+    if (dom.sessionResetBtn) {
+      dom.sessionResetBtn.addEventListener('click', async () => {
+        const originalLabel = dom.sessionResetBtn.textContent;
+        dom.sessionResetBtn.disabled = true;
+        dom.sessionResetBtn.textContent = 'Resetting';
+        try {
+          const result = await window.systemAPI.resetSessionCounters();
+          if (result?.success !== false) {
+            if (dom.sessionDownload) dom.sessionDownload.textContent = '0 B';
+            if (dom.sessionUpload) dom.sessionUpload.textContent = '0 B';
+            if (dom.sessionTotal) dom.sessionTotal.textContent = '0 B';
+          }
+          showToast(result?.message || 'Current session reset', result?.success === false ? 'error' : 'info');
+        } catch (e) {
+          console.error('Failed to reset session counters:', e);
+          showToast('Could not reset current session', 'error');
+        } finally {
+          dom.sessionResetBtn.disabled = false;
+          dom.sessionResetBtn.textContent = originalLabel;
+        }
+      });
+    }
 
     window.__TAURI__.event.listen('widget-menu-action', async (event) => {
       try {

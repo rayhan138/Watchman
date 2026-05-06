@@ -303,45 +303,10 @@ fn collect_connection_details() -> SignalStrength {
     let connection_type = classify_connection_type(&adapter.name, &adapter.description);
     let wifi_details = fetch_wifi_details().unwrap_or_default();
 
-    if connection_type == "wifi" {
-        if let Some((ssid, percentage, adapter_name, adapter_description, link_speed)) = wifi_details {
-            let quality = classify_signal_quality(percentage);
-            return SignalStrength {
-                percentage,
-                bars: signal_bars(percentage),
-                quality: quality.to_string(),
-                connection_type: "wifi".to_string(),
-                adapter_name: if adapter_name.is_empty() {
-                    adapter.name
-                } else {
-                    adapter_name
-                },
-                adapter_description: if adapter_description.is_empty() {
-                    adapter.description
-                } else {
-                    adapter_description
-                },
-                ssid,
-                link_speed: if link_speed.is_empty() {
-                    adapter.link_speed
-                } else {
-                    link_speed
-                },
-                local_ip: adapter.local_ip,
-            };
-        }
-
-        return SignalStrength {
-            percentage: 0,
-            bars: 0,
-            quality: "unknown".to_string(),
-            connection_type: "wifi".to_string(),
-            adapter_name: adapter.name,
-            adapter_description: adapter.description,
-            ssid: String::new(),
-            link_speed: adapter.link_speed,
-            local_ip: adapter.local_ip,
-        };
+    // Prefer an actively connected Wi-Fi interface. Some PCs keep a mobile
+    // broadband provider visible even while traffic is actually on Wi-Fi.
+    if let Some(wifi) = wifi_details {
+        return build_wifi_signal(adapter, wifi);
     }
 
     if connection_type == "cellular" {
@@ -365,33 +330,6 @@ fn collect_connection_details() -> SignalStrength {
         }
     }
 
-    if let Some((ssid, percentage, adapter_name, adapter_description, link_speed)) = wifi_details {
-        let quality = classify_signal_quality(percentage);
-        return SignalStrength {
-            percentage,
-            bars: signal_bars(percentage),
-            quality: quality.to_string(),
-            connection_type: "wifi".to_string(),
-            adapter_name: if adapter_name.is_empty() {
-                adapter.name
-            } else {
-                adapter_name
-            },
-            adapter_description: if adapter_description.is_empty() {
-                adapter.description
-            } else {
-                adapter_description
-            },
-            ssid,
-            link_speed: if link_speed.is_empty() {
-                adapter.link_speed
-            } else {
-                link_speed
-            },
-            local_ip: adapter.local_ip,
-        };
-    }
-
     SignalStrength {
         percentage: 0,
         bars: 0,
@@ -411,7 +349,42 @@ fn collect_connection_details() -> SignalStrength {
     }
 }
 
-fn build_health_summary(latency: &LatencyResult, connection: &SignalStrength) -> NetworkHealthSummary {
+fn build_wifi_signal(
+    adapter: AdapterSnapshot,
+    wifi: (String, u32, String, String, String),
+) -> SignalStrength {
+    let (ssid, percentage, adapter_name, adapter_description, link_speed) = wifi;
+    let quality = classify_signal_quality(percentage);
+
+    SignalStrength {
+        percentage,
+        bars: signal_bars(percentage),
+        quality: quality.to_string(),
+        connection_type: "wifi".to_string(),
+        adapter_name: if adapter_name.is_empty() {
+            adapter.name
+        } else {
+            adapter_name
+        },
+        adapter_description: if adapter_description.is_empty() {
+            adapter.description
+        } else {
+            adapter_description
+        },
+        ssid,
+        link_speed: if link_speed.is_empty() {
+            adapter.link_speed
+        } else {
+            link_speed
+        },
+        local_ip: adapter.local_ip,
+    }
+}
+
+fn build_health_summary(
+    latency: &LatencyResult,
+    connection: &SignalStrength,
+) -> NetworkHealthSummary {
     let (level, color) = if latency.samples_received == 0 {
         ("Offline", "#ef4444")
     } else if latency.packet_loss >= 20.0 || latency.latency >= 180 || latency.jitter >= 50 {
@@ -698,8 +671,8 @@ fn classify_connection_type(name: &str, description: &str) -> &'static str {
         "wifi"
     } else if combined.contains("wwan")
         || combined.contains("cellular")
-        || combined.contains("mobile")
         || combined.contains("mobile broadband")
+        || combined.contains("mbim")
         || combined.contains("lte")
         || combined.contains("5g")
         || combined.contains("4g")

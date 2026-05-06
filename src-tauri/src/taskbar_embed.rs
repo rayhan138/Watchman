@@ -24,6 +24,8 @@ unsafe extern "C" {
         placement: *mut NativeWidgetPlacement,
     ) -> i32;
     fn tm_restore_taskbar_layout() -> i32;
+    fn tm_take_widget_context_menu_request() -> i32;
+    fn tm_take_widget_double_click_request() -> i32;
     fn tm_should_widget_be_visible(
         widget_hwnd: *mut c_void,
         main_hwnd: *mut c_void,
@@ -91,6 +93,16 @@ pub fn restore_taskbar_layout() {
     unsafe {
         let _ = tm_restore_taskbar_layout();
     }
+}
+
+#[cfg(target_os = "windows")]
+pub fn take_widget_context_menu_request() -> bool {
+    unsafe { tm_take_widget_context_menu_request() != 0 }
+}
+
+#[cfg(target_os = "windows")]
+pub fn take_widget_double_click_request() -> bool {
+    unsafe { tm_take_widget_double_click_request() != 0 }
 }
 
 #[cfg(target_os = "windows")]

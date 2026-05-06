@@ -119,7 +119,10 @@ async fn test_default_route(internet_ok: bool) -> TestResult {
             };
             let next_hop = route.next_hop.trim();
 
-            if next_hop.is_empty() || next_hop == "0.0.0.0" || next_hop.eq_ignore_ascii_case("on-link") {
+            if next_hop.is_empty()
+                || next_hop == "0.0.0.0"
+                || next_hop.eq_ignore_ascii_case("on-link")
+            {
                 return TestResult {
                     name: "Default Route".into(),
                     status: if internet_ok { "pass".into() } else { "warning".into() },
@@ -174,7 +177,11 @@ async fn test_default_route(internet_ok: bool) -> TestResult {
         }
         Ok(None) => TestResult {
             name: "Default Route".into(),
-            status: if internet_ok { "warning".into() } else { "fail".into() },
+            status: if internet_ok {
+                "warning".into()
+            } else {
+                "fail".into()
+            },
             message: if internet_ok {
                 "Internet works, but no default route details were exposed".into()
             } else {
@@ -189,7 +196,11 @@ async fn test_default_route(internet_ok: bool) -> TestResult {
         },
         Err(err) => TestResult {
             name: "Default Route".into(),
-            status: if internet_ok { "warning".into() } else { "fail".into() },
+            status: if internet_ok {
+                "warning".into()
+            } else {
+                "fail".into()
+            },
             message: if internet_ok {
                 "Could not inspect the default route, but internet access is working".into()
             } else {

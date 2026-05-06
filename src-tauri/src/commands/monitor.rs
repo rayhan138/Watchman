@@ -520,10 +520,7 @@ mod windows_gpu {
                 }
             }
 
-            let overall = per_gpu_overall
-                .values()
-                .copied()
-                .fold(0.0, f64::max);
+            let overall = per_gpu_overall.values().copied().fold(0.0, f64::max);
 
             Ok(Some(GpuUsageSnapshot {
                 overall: round_percent(overall),
@@ -546,8 +543,11 @@ mod windows_gpu {
             };
             refreshed_paths.sort();
 
-            let mut current_paths: Vec<String> =
-                self.counters.iter().map(|counter| counter.path.clone()).collect();
+            let mut current_paths: Vec<String> = self
+                .counters
+                .iter()
+                .map(|counter| counter.path.clone())
+                .collect();
             current_paths.sort();
 
             if refreshed_paths == current_paths {
@@ -889,7 +889,6 @@ pub struct MonitorState {
     pub initial_rx: Option<u64>,
     pub initial_tx: Option<u64>,
     pub prev_time: Instant,
-    pub is_connected: bool,
     pub prev_interfaces: HashMap<u32, CounterSnapshot>,
     pub runtime_downloaded: u64,
     pub runtime_uploaded: u64,
@@ -915,7 +914,6 @@ impl MonitorState {
             initial_rx: None,
             initial_tx: None,
             prev_time: Instant::now(),
-            is_connected: true,
             prev_interfaces: HashMap::new(),
             runtime_downloaded: 0,
             runtime_uploaded: 0,
@@ -931,7 +929,9 @@ impl MonitorState {
     }
 }
 
-pub fn resolve_temperature_probe_paths(resource_dir: Option<&Path>) -> Option<TemperatureProbePaths> {
+pub fn resolve_temperature_probe_paths(
+    resource_dir: Option<&Path>,
+) -> Option<TemperatureProbePaths> {
     let dev_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let script_candidates = [
         resource_dir.map(|dir| dir.join("scripts").join("temperature_probe.ps1")),
@@ -944,8 +944,14 @@ pub fn resolve_temperature_probe_paths(resource_dir: Option<&Path>) -> Option<Te
         Some(dev_root.join("vendor").join("libre-hardware-monitor")),
     ];
 
-    let script_path = script_candidates.into_iter().flatten().find(|path| path.exists())?;
-    let sensor_root = root_candidates.into_iter().flatten().find(|path| path.exists())?;
+    let script_path = script_candidates
+        .into_iter()
+        .flatten()
+        .find(|path| path.exists())?;
+    let sensor_root = root_candidates
+        .into_iter()
+        .flatten()
+        .find(|path| path.exists())?;
 
     Some(TemperatureProbePaths {
         script_path,
@@ -979,7 +985,9 @@ pub fn get_temperature_readings(
     }
 }
 
-fn query_temperature_readings(paths: &TemperatureProbePaths) -> Result<TemperatureReadings, String> {
+fn query_temperature_readings(
+    paths: &TemperatureProbePaths,
+) -> Result<TemperatureReadings, String> {
     if !paths.script_path.exists() {
         return Err(format!(
             "Temperature probe script missing: {}",
@@ -1024,8 +1032,8 @@ fn query_temperature_readings(paths: &TemperatureProbePaths) -> Result<Temperatu
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut readings: TemperatureReadings =
-        serde_json::from_str(stdout.trim()).map_err(|err| format!("Invalid temperature JSON: {err}"))?;
+    let mut readings: TemperatureReadings = serde_json::from_str(stdout.trim())
+        .map_err(|err| format!("Invalid temperature JSON: {err}"))?;
 
     readings.cpu = normalize_temperature(readings.cpu);
     readings.gpu = normalize_temperature(readings.gpu);
@@ -1442,7 +1450,8 @@ $adapters | ConvertTo-Json -Compress
             } else {
                 entry.alias.clone()
             };
-            let iface_type = normalize_interface_type(&entry.iface_type, &entry.alias, &entry.description);
+            let iface_type =
+                normalize_interface_type(&entry.iface_type, &entry.alias, &entry.description);
 
             NetworkInterface {
                 iface: entry.alias.clone(),
@@ -1488,8 +1497,9 @@ fn normalize_interface_type(raw_type: &str, alias: &str, description: &str) -> S
         "Wi-Fi".to_string()
     } else if joined.contains("wwan")
         || joined.contains("cellular")
-        || joined.contains("mobile")
         || joined.contains("lte")
+        || joined.contains("mobile broadband")
+        || joined.contains("mbim")
     {
         "Cellular".to_string()
     } else if joined.contains("ethernet") {

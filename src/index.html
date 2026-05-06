@@ -114,6 +114,33 @@
         </div>
       </section>
 
+      <!-- Current Session Summary -->
+      <section class="session-section">
+        <div class="session-card">
+          <div class="session-header">
+            <div>
+              <span class="session-title">Current Session</span>
+              <span class="session-subtitle">Since app opened or last reset</span>
+            </div>
+            <button class="session-reset-btn" id="sessionResetBtn" type="button">Reset Session</button>
+          </div>
+          <div class="session-stats">
+            <div class="session-stat">
+              <span class="session-stat-label">Download</span>
+              <span class="session-stat-value" id="sessionDownload">0 B</span>
+            </div>
+            <div class="session-stat">
+              <span class="session-stat-label">Upload</span>
+              <span class="session-stat-value" id="sessionUpload">0 B</span>
+            </div>
+            <div class="session-stat session-stat-total">
+              <span class="session-stat-label">Total</span>
+              <span class="session-stat-value" id="sessionTotal">0 B</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- Dashboard Data Usage Summary -->
       <section class="dash-usage-section">
         <div class="dash-snapshot-card">

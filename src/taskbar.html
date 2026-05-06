@@ -25,6 +25,8 @@
 
     html, body {
       background: transparent !important;
+      width: 100%;
+      height: 100%;
     }
 
     body {
@@ -36,9 +38,11 @@
       align-items: center;
       justify-content: center;
       color: #ffffff;
+      -webkit-user-select: none;
     }
 
     .taskbar-widget {
+      position: relative;
       display: flex;
       flex-direction: column;
       justify-content: center;
@@ -54,7 +58,17 @@
       pointer-events: auto;
     }
 
+    .taskbar-widget::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      background: rgba(0, 0, 0, 0.001);
+    }
+
     .stat-row {
+      position: relative;
+      z-index: 1;
       display: flex;
       align-items: center;
       gap: var(--row-gap);
@@ -73,9 +87,11 @@
     .stat-arrow,
     .stat-label,
     .stat-value,
-    .stat-percent {
+    .stat-percent,
+    .stat-unit {
       font-size: var(--widget-font-size);
       font-weight: 700;
+      text-shadow: 0 1px 1px rgba(0, 0, 0, 0.9), 0 0 2px rgba(0, 0, 0, 0.75);
     }
 
     .stat-arrow {
@@ -105,8 +121,6 @@
     .stat-unit {
       min-width: 6px;
       text-align: left;
-      font-size: var(--widget-font-size);
-      font-weight: 700;
     }
 
     .stat-arrow.up {
@@ -129,6 +143,42 @@
       color: #86d96c;
     }
 
+    body[data-taskbar-theme="light"] .taskbar-widget {
+      background: rgba(255, 255, 255, 0.01) !important;
+    }
+
+    body[data-taskbar-theme="light"] .stat-arrow,
+    body[data-taskbar-theme="light"] .stat-label,
+    body[data-taskbar-theme="light"] .stat-value,
+    body[data-taskbar-theme="light"] .stat-percent,
+    body[data-taskbar-theme="light"] .stat-unit {
+      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.8), 0 0 2px rgba(255, 255, 255, 0.7);
+    }
+
+    body[data-taskbar-theme="light"] .stat-value {
+      color: #26313a;
+    }
+
+    body[data-taskbar-theme="light"] .stat-arrow.up {
+      color: #d13f83;
+    }
+
+    body[data-taskbar-theme="light"] .stat-arrow.down {
+      color: #0078d4;
+    }
+
+    body[data-taskbar-theme="light"] .cpu-label,
+    body[data-taskbar-theme="light"] .cpu-value,
+    body[data-taskbar-theme="light"] .cpu-unit {
+      color: #a45f00;
+    }
+
+    body[data-taskbar-theme="light"] .mem-label,
+    body[data-taskbar-theme="light"] .mem-value,
+    body[data-taskbar-theme="light"] .mem-unit {
+      color: #167a38;
+    }
+
     body[data-mode="network-only"] .system-part,
     body[data-mode="network-only"] .stat-divider {
       display: none !important;
@@ -136,6 +186,10 @@
 
     .taskbar-widget .active-data .stat-value {
       color: #ffffff;
+    }
+
+    body[data-taskbar-theme="light"] .taskbar-widget .active-data .stat-value {
+      color: #26313a;
     }
 
     body[data-edge="left"] .taskbar-widget,
@@ -153,7 +207,7 @@
     }
   </style>
 </head>
-<body data-mode="full">
+<body data-mode="full" data-taskbar-theme="dark">
   <div class="taskbar-widget" id="taskbarWidget">
     <div class="stat-row" id="uploadRow">
       <span class="stat-arrow up">&#8593;</span>

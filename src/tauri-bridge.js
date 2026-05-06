@@ -18,6 +18,7 @@
     getCpuUsage: () => invoke('cmd_get_cpu_usage'),
     getMemoryUsage: () => invoke('cmd_get_memory_usage'),
     getNetworkStats: () => invoke('cmd_get_network_stats'),
+    resetSessionCounters: () => invoke('cmd_reset_session_counters'),
     getDiskUsage: () => invoke('cmd_get_disk_usage'),
     getTemperatureReadings: () => invoke('cmd_get_temperature_readings'),
     getNetworkInterfaces: () => invoke('cmd_get_network_interfaces'),
