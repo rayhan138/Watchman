@@ -21,7 +21,13 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(target_os = "windows")]
-use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+use std::{
+    ffi::OsStr,
+    os::windows::{ffi::OsStrExt, process::CommandExt},
+};
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
@@ -397,7 +403,7 @@ struct HistoryWriterLock {
 
 #[cfg(target_os = "windows")]
 fn create_history_writer_state() -> HistoryWriterState {
-    let mut name: Vec<u16> = std::ffi::OsStr::new("Local\\TrafficMonitorHistoryWriter")
+    let mut name: Vec<u16> = std::ffi::OsStr::new("Local\\WatchmanHistoryWriter")
         .encode_wide()
         .collect();
     name.push(0);
@@ -512,6 +518,7 @@ fn main() {
             cmd_reset_session_counters,
             cmd_get_widget_display_mode,
             cmd_get_taskbar_theme,
+            cmd_open_windows_data_usage_settings,
         ])
         .setup(move |app| {
             if start_minimized {
@@ -1423,6 +1430,170 @@ fn cmd_show_main_window(app_handle: tauri::AppHandle) {
 fn cmd_show_history_window(app_handle: tauri::AppHandle) {
     show_main_window(&app_handle);
     emit_widget_menu_action(&app_handle, Some("data-usage"), Some("last7days"));
+}
+
+#[tauri::command]
+fn cmd_open_windows_data_usage_settings() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        open_windows_data_usage_page()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Windows Data Usage settings are only available on Windows.".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_data_usage_page() -> Result<(), String> {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$code = 'using System; using System.Runtime.InteropServices; public static class WatchmanSettingsWindow { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); }'
+Add-Type -TypeDefinition $code
+
+function Open-WatchmanSettingsUri($uri) {
+  Start-Process $uri
+  Start-Sleep -Milliseconds 1200
+}
+
+function Get-WatchmanSettingsRoot {
+  $proc = Get-Process ApplicationFrameHost -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowTitle -like '*Settings*' -and $_.MainWindowHandle -ne 0 } |
+    Select-Object -First 1
+  if (-not $proc) { return $null }
+  [WatchmanSettingsWindow]::ShowWindow([intptr]$proc.MainWindowHandle, 9) | Out-Null
+  [WatchmanSettingsWindow]::SetForegroundWindow([intptr]$proc.MainWindowHandle) | Out-Null
+  return [System.Windows.Automation.AutomationElement]::FromHandle([intptr]$proc.MainWindowHandle)
+}
+
+function Find-WatchmanElementByName($root, $name) {
+  $nameCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $name)
+  $buttonCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+  $exactButtonCond = New-Object System.Windows.Automation.AndCondition($nameCond, $buttonCond)
+  $exactButton = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $exactButtonCond)
+  if ($exactButton) { return $exactButton }
+
+  $exact = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $nameCond)
+  if ($exact) { return $exact }
+
+  $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+  foreach ($element in $all) {
+    if ($element.Current.Name -like "$name*" -and $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button) {
+      return $element
+    }
+  }
+
+  return $null
+}
+
+function Invoke-WatchmanPattern($element) {
+  if (-not $element) { return $false }
+
+  try {
+    $scrollPattern = $element.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern)
+    if ($scrollPattern) {
+      $scrollPattern.ScrollIntoView()
+      Start-Sleep -Milliseconds 120
+    }
+  } catch {}
+
+  try {
+    $invokePattern = $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    if ($invokePattern) {
+      $invokePattern.Invoke()
+      Start-Sleep -Milliseconds 700
+      return $true
+    }
+  } catch {}
+
+  try {
+    $selectionPattern = $element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+    if ($selectionPattern) {
+      $selectionPattern.Select()
+      Start-Sleep -Milliseconds 700
+      return $true
+    }
+  } catch {}
+
+  try {
+    $legacyPattern = $element.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
+    if ($legacyPattern) {
+      $legacyPattern.DoDefaultAction()
+      Start-Sleep -Milliseconds 700
+      return $true
+    }
+  } catch {}
+
+  return $false
+}
+
+function Invoke-WatchmanElement($element) {
+  if (-not $element) { return $false }
+
+  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+  $candidate = $element
+
+  for ($i = 0; $i -lt 8; $i++) {
+    if (Invoke-WatchmanPattern $candidate) {
+      return $true
+    }
+
+    $candidate = $walker.GetParent($candidate)
+    if (-not $candidate) {
+      break
+    }
+  }
+
+  return $false
+}
+
+function Try-OpenDataUsageFromCurrentSettings {
+  for ($i = 0; $i -lt 8; $i++) {
+    $root = Get-WatchmanSettingsRoot
+    if ($root) {
+      $target = Find-WatchmanElementByName $root 'Data usage'
+      if (Invoke-WatchmanElement $target) {
+        return $true
+      }
+    }
+    Start-Sleep -Milliseconds 250
+  }
+  return $false
+}
+
+Open-WatchmanSettingsUri 'ms-settings:network-advancedsettings'
+if (Try-OpenDataUsageFromCurrentSettings) { exit 0 }
+
+Open-WatchmanSettingsUri 'ms-settings:datausage'
+if (Try-OpenDataUsageFromCurrentSettings) { exit 0 }
+
+exit 1
+"#;
+
+    let mut command = std::process::Command::new("powershell.exe");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let status = command
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            script,
+        ])
+        .status()
+        .map_err(|err| format!("Failed to start Windows Settings navigation: {err}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        open::that("ms-settings:datausage")
+            .map_err(|err| format!("Failed to open Windows Data Usage settings: {err}"))
+    }
 }
 
 #[tauri::command]

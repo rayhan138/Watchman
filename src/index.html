@@ -167,7 +167,7 @@
       </section>
 
 
-      <!-- Traffic Light Indicator (Task 16) -->
+      <!-- Traffic Light Indicator -->
       <section class="traffic-light-section">
         <div class="traffic-light-card">
           <div class="traffic-light" id="trafficLight">
@@ -255,7 +255,7 @@
 
 
     <!-- ============================================ -->
-    <!--  TAB: Data Usage (Task 12)                   -->
+    <!--  TAB: Data Usage                             -->
     <!-- ============================================ -->
     <div class="tab-panel" id="panelDataUsage">
 
@@ -360,7 +360,7 @@
 
 
     <!-- ============================================ -->
-    <!--  TAB: Applications (Task 14)                 -->
+    <!--  TAB: Applications                           -->
     <!-- ============================================ -->
     <div class="tab-panel" id="panelApps">
 
@@ -369,7 +369,19 @@
           <span class="chart-title">App Network Activity</span>
           <span class="app-header-subtitle" id="appHeaderSubtitle">Live now and recent background traffic stay listed here for this session.</span>
         </div>
-        <span class="app-count-badge" id="appCountBadge">0</span>
+        <div class="app-header-actions">
+          <button class="app-data-usage-btn" id="appDataUsageSettingsBtn" type="button" title="Open Windows Data Usage">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M4 19V5"></path>
+              <path d="M8 17v-5"></path>
+              <path d="M13 17V8"></path>
+              <path d="M18 17v-8"></path>
+              <path d="M4 19h17"></path>
+            </svg>
+            <span>Usage by App</span>
+          </button>
+          <span class="app-count-badge" id="appCountBadge">0</span>
+        </div>
       </div>
 
       <div class="app-table-wrapper" id="appTableWrapper">
@@ -392,7 +404,7 @@
 
 
     <!-- ============================================ -->
-    <!--  TAB: Network Health (Task 13)               -->
+    <!--  TAB: Network Health                         -->
     <!-- ============================================ -->
     <div class="tab-panel" id="panelNetwork">
 
@@ -470,6 +482,7 @@
           <div class="spinner"></div>
           <span>Running speed test...</span>
         </div>
+        <p class="nh-speedtest-note">M-Lab may collect public IP and test data for internet research.</p>
         <div class="nh-speedtest-results" id="nhSpeedTestResults">
           <div class="nh-st-row">
             <span class="nh-st-label">Download</span>
@@ -480,7 +493,7 @@
             <span class="nh-st-value" id="nhStUpload">—</span>
           </div>
           <div class="nh-st-row">
-            <span class="nh-st-label">Server Ping</span>
+            <span class="nh-st-label">Latency</span>
             <span class="nh-st-value" id="nhStPing">—</span>
           </div>
           <div class="nh-st-row">
@@ -498,7 +511,7 @@
 
 
     <!-- ============================================ -->
-    <!--  TAB: Tools (Task 18 + 19)                   -->
+    <!--  TAB: Tools                                  -->
     <!-- ============================================ -->
     <div class="tab-panel" id="panelTools">
 
@@ -576,7 +589,7 @@
   <!-- In-App Notification Toast -->
   <div class="toast-container" id="toastContainer"></div>
 
-  <!-- Settings Modal (Enhanced — Task 20) -->
+  <!-- Settings Modal -->
   <div class="settings-modal" id="settingsModal">
     <div class="settings-content">
       <div class="settings-header">
@@ -587,7 +600,7 @@
       </div>
       <div class="settings-body">
         <!-- Existing settings -->
-        <label class="setting-row" data-tooltip="Start Electron automatically when Windows starts">
+        <label class="setting-row" data-tooltip="Start Watchman automatically when Windows starts">
           <span class="setting-label">Run on Windows Startup</span>
           <input type="checkbox" id="cfgStartOnBoot" class="toggle-checkbox">
         </label>
@@ -602,7 +615,7 @@
 
         <div class="settings-divider"></div>
 
-        <!-- Data Limit (Task 20) -->
+        <!-- Data Limit -->
         <label class="setting-row" data-tooltip="Set a monthly data cap. Alerts trigger at 80%, 95%, and 100% usage">
           <span class="setting-label">Monthly Data Limit (GB)</span>
           <input type="number" id="cfgDataLimit" class="setting-input" placeholder="0 = none" min="0" step="1">
@@ -689,7 +702,7 @@
         <div class="settings-divider"></div>
         <div class="settings-version">Watchman v1.0.0</div>
 
-        <!-- Recommended + Undo (Task 20) -->
+        <!-- Recommended + Undo -->
         <div class="settings-actions-row">
           <div class="settings-actions-left">
             <button class="btn-small btn-accent" id="cfgRecommendedBtn" data-tooltip="Apply optimal settings based on your system">Use Recommended</button>

@@ -1,5 +1,5 @@
 /* ========================================
-   Electron — Light Pastel Grid Theme
+   Watchman - Light Pastel Grid Theme
    ======================================== */
 
 :root {
@@ -1600,6 +1600,74 @@ svg { stroke: var(--text-dark); }
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
+}
+
+.app-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+
+.app-data-usage-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 5px 10px;
+  border: var(--border-thickness) solid var(--border-color);
+  border-radius: var(--radius-pill);
+  background: var(--surface-bg);
+  color: var(--text-dark);
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+
+.app-data-usage-btn svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.app-data-usage-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.app-data-usage-btn:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+@media (max-width: 560px) {
+  .app-header-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .app-header-actions {
+    justify-content: space-between;
+  }
+
+  .app-data-usage-btn {
+    flex: 1 1 auto;
+  }
 }
 
 .app-header-subtitle {
@@ -2058,6 +2126,11 @@ svg { stroke: var(--text-dark); }
   background: var(--text-muted);
 }
 
+.nh-signal-bars.signal-ethernet .wired-signal-dot,
+.nh-signal-bars.signal-ethernet .wired-signal-line {
+  background: var(--success);
+}
+
 /* Speed Test */
 .nh-speedtest-card {
   border: var(--border-thickness) solid var(--border-color);
@@ -2076,6 +2149,14 @@ svg { stroke: var(--text-dark); }
   padding: 12px 0;
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.nh-speedtest-note {
+  margin: -2px 0 2px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 .nh-speedtest-results {
@@ -2853,7 +2934,7 @@ svg { stroke: var(--text-dark); }
   color: #fff;
 }
 
-/* ---------- In-App Notifications (Task 22.2) ---------- */
+/* ---------- In-App Notifications ---------- */
 .notification {
   display: flex;
   align-items: flex-start;
@@ -2979,7 +3060,7 @@ svg { stroke: var(--text-dark); }
 }
 
 
-/* ---------- Traffic History Chart (Task 31) ---------- */
+/* ---------- Traffic History Chart ---------- */
 .traffic-history-panel {
   background: var(--surface-bg);
   border: var(--border-thickness) solid var(--border-color);
@@ -3476,6 +3557,18 @@ body.dark-mode .export-fmt-btn:hover {
   background: rgba(255, 255, 255, 0.06);
 }
 
+body.dark-mode .tab-item.active:hover,
+body.dark-mode .tab-item.active:focus-visible,
+body.dark-mode .du-period-btn.active:hover,
+body.dark-mode .du-period-btn.active:focus-visible,
+body.dark-mode .th-filter-btn.active:hover,
+body.dark-mode .th-filter-btn.active:focus-visible,
+body.dark-mode .export-fmt-btn.active:hover,
+body.dark-mode .export-fmt-btn.active:focus-visible {
+  background: linear-gradient(135deg, #f7f2ea, #ebe2d4);
+  color: #101215;
+}
+
 body.dark-mode .th-year-picker-popover {
   background: #111317;
   border-color: rgba(247, 242, 234, 0.14);
@@ -3621,6 +3714,18 @@ body.dark-mode .history-table th {
 
 body.dark-mode .app-name-icon {
   background: rgba(255, 255, 255, 0.08);
+}
+
+body.dark-mode .app-data-usage-btn {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(247, 242, 234, 0.14);
+  color: #f7f2ea;
+}
+
+body.dark-mode .app-data-usage-btn:hover:not(:disabled) {
+  background: rgba(31, 210, 155, 0.14);
+  border-color: rgba(31, 210, 155, 0.28);
+  color: #86efcf;
 }
 
 body.dark-mode .app-status-live {

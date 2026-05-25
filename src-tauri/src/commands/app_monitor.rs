@@ -52,7 +52,7 @@ const TCPIP_SEND_IPV6_EVENT: u16 = 26;
 #[cfg(windows)]
 const TCPIP_RECV_IPV6_EVENT: u16 = 27;
 #[cfg(windows)]
-const TRACE_SESSION_NAME: &str = "TrafficMonitor App Network Session";
+const TRACE_SESSION_NAME: &str = "Watchman App Network Session";
 #[cfg(windows)]
 const TRACE_SESSION_GUID: GUID = GUID::from_u128(0x9d1d28f2_8d75_4b16_b6f7_87e5f9b87af7);
 #[cfg(windows)]

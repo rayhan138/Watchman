@@ -1488,28 +1488,101 @@ fn normalize_operstate(status: &str) -> String {
 fn normalize_interface_type(raw_type: &str, alias: &str, description: &str) -> String {
     let joined = format!("{raw_type} {alias} {description}").to_ascii_lowercase();
 
-    if joined.contains("wireless")
-        || joined.contains("wi-fi")
-        || joined.contains("wifi")
-        || joined.contains("802.11")
-        || joined.contains("native 802.11")
-    {
-        "Wi-Fi".to_string()
-    } else if joined.contains("wwan")
-        || joined.contains("cellular")
-        || joined.contains("lte")
-        || joined.contains("mobile broadband")
-        || joined.contains("mbim")
-    {
+    if has_strong_cellular_interface_indicator(&joined) {
         "Cellular".to_string()
-    } else if joined.contains("ethernet") {
+    } else if has_wifi_interface_indicator(&joined) {
+        "Wi-Fi".to_string()
+    } else if has_ethernet_interface_indicator(&joined) {
         "Ethernet".to_string()
+    } else if has_cellular_interface_indicator(&joined) {
+        "Cellular".to_string()
     } else if joined.contains("loopback") {
         "Loopback".to_string()
     } else if !raw_type.trim().is_empty() {
         raw_type.trim().to_string()
     } else {
         "unknown".to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn has_wifi_interface_indicator(value: &str) -> bool {
+    value.contains("wi-fi")
+        || value.contains("wifi")
+        || value.contains("wireless lan")
+        || value.contains("wlan")
+        || value.contains("802.11")
+        || value.contains("native 802.11")
+}
+
+#[cfg(target_os = "windows")]
+fn has_ethernet_interface_indicator(value: &str) -> bool {
+    value.contains("ethernet")
+        || value.contains("802.3")
+        || value.contains("gbe")
+        || value.contains("gigabit")
+        || value.contains("realtek pcie")
+        || value.contains("intel ethernet")
+        || value.contains("killer e")
+        || has_interface_token(value, "lan")
+}
+
+#[cfg(target_os = "windows")]
+fn has_cellular_interface_indicator(value: &str) -> bool {
+    has_strong_cellular_interface_indicator(value)
+        || has_interface_token(value, "5g")
+        || has_interface_token(value, "4g")
+}
+
+#[cfg(target_os = "windows")]
+fn has_strong_cellular_interface_indicator(value: &str) -> bool {
+    value.contains("wwan")
+        || value.contains("wireless wan")
+        || value.contains("cellular")
+        || value.contains("mobile broadband")
+        || value.contains("mbim")
+        || value.contains("modem")
+        || value.contains("sim")
+        || has_interface_token(value, "lte")
+}
+
+#[cfg(target_os = "windows")]
+fn has_interface_token(value: &str, token: &str) -> bool {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == token)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_gbe_adapters_as_ethernet_not_cellular() {
+        assert_eq!(
+            normalize_interface_type("802.3", "Ethernet", "Realtek PCIe 2.5GbE Family Controller"),
+            "Ethernet"
+        );
+    }
+
+    #[test]
+    fn normalizes_mobile_broadband_as_cellular() {
+        assert_eq!(
+            normalize_interface_type(
+                "Wireless WAN",
+                "Cellular",
+                "Fibocom LTE Mobile Broadband Adapter"
+            ),
+            "Cellular"
+        );
+    }
+
+    #[test]
+    fn normalizes_wifi_adapters_as_wifi() {
+        assert_eq!(
+            normalize_interface_type("Native 802.11", "Wi-Fi", "Intel(R) Wi-Fi 6 AX201 160MHz"),
+            "Wi-Fi"
+        );
     }
 }
 

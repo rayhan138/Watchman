@@ -4,6 +4,8 @@ use std::fs;
 use std::sync::Mutex;
 use tauri::Emitter;
 
+const APP_CONFIG_DIR_NAME: &str = "Watchman";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(rename = "startOnBoot", default = "default_true")]
@@ -274,7 +276,7 @@ impl ConfigState {
 
 fn get_config_dir() -> std::path::PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let dir = base.join("traffic-monitor");
+    let dir = base.join(APP_CONFIG_DIR_NAME);
     let _ = fs::create_dir_all(&dir);
     dir
 }
