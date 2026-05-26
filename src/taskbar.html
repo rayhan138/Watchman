@@ -10,6 +10,10 @@
   <style>
     :root {
       --widget-font-size: 11px;
+      --row-gap: 2px;
+      --widget-gap: 4px;
+      --net-width: 66px;
+      --metric-width: 16px;
     }
 
     * {
@@ -21,6 +25,8 @@
 
     html, body {
       background: transparent !important;
+      width: 100%;
+      height: 100%;
     }
 
     body {
@@ -31,59 +37,61 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      color: #d0d0e8;
-    }
-
-    body[data-edge="left"],
-    body[data-edge="right"] {
-      justify-content: flex-start;
+      color: #ffffff;
+      -webkit-user-select: none;
     }
 
     .taskbar-widget {
-      display: flex;
-      align-items: center;
-      gap: 0;
-      padding: 0 4px;
-      width: 100%;
-      height: 100%;
-      min-height: 28px;
-      background: transparent !important;
-      border: none;
-      border-radius: 0;
-      transition: background 0.16s ease;
-    }
-
-    .taskbar-widget:hover {
-      background: rgba(255, 255, 255, 0.03) !important;
-    }
-
-    .stat-group {
+      position: relative;
       display: flex;
       flex-direction: column;
       justify-content: center;
-      gap: 1px;
-      padding: 1px 4px;
+      gap: 0;
+      padding: 0 3px;
+      width: 100%;
+      height: 100%;
+      min-height: 30px;
+      overflow: hidden;
+      background: rgba(0, 0, 0, 0.05) !important;
+      border: none;
+      border-radius: 0;
+      pointer-events: auto;
+    }
+
+    .taskbar-widget::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      background: rgba(0, 0, 0, 0.001);
     }
 
     .stat-row {
+      position: relative;
+      z-index: 1;
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: var(--row-gap);
+      justify-content: flex-start;
       line-height: 1.05;
       white-space: nowrap;
+      pointer-events: auto;
+      min-width: 0;
+      overflow: hidden;
     }
 
-    .stat-row[hidden],
-    .stat-group[hidden] {
+    .stat-row[hidden] {
       display: none !important;
     }
 
     .stat-arrow,
     .stat-label,
     .stat-value,
-    .stat-percent {
+    .stat-percent,
+    .stat-unit {
       font-size: var(--widget-font-size);
       font-weight: 700;
+      text-shadow: 0 1px 1px rgba(0, 0, 0, 0.9), 0 0 2px rgba(0, 0, 0, 0.75);
     }
 
     .stat-arrow {
@@ -92,165 +100,133 @@
     }
 
     .stat-value {
-      min-width: 68px;
+      min-width: var(--net-width);
+      max-width: var(--net-width);
       text-align: right;
-      color: #f5f6f8;
+      color: #ffffff;
+      overflow: hidden;
+    }
+
+    .stat-divider {
+      width: var(--widget-gap);
+      min-width: var(--widget-gap);
     }
 
     .stat-percent {
-      min-width: 30px;
+      min-width: var(--metric-width);
+      max-width: var(--metric-width);
       text-align: right;
     }
 
+    .stat-unit {
+      min-width: 6px;
+      text-align: left;
+    }
+
     .stat-arrow.up {
-      color: #ff6b9d;
+      color: #f07dac;
     }
 
     .stat-arrow.down {
-      color: #00d4ff;
+      color: #63d6ff;
     }
 
     .cpu-label,
-    .cpu-value {
-      color: #ffb74d;
+    .cpu-value,
+    .cpu-unit {
+      color: #f3b64a;
     }
 
     .mem-label,
-    .mem-value {
-      color: #66bb6a;
+    .mem-value,
+    .mem-unit {
+      color: #86d96c;
     }
 
-    body[data-mode="network-only"] #cpuMemGroup {
+    body[data-taskbar-theme="light"] .taskbar-widget {
+      background: rgba(255, 255, 255, 0.01) !important;
+    }
+
+    body[data-taskbar-theme="light"] .stat-arrow,
+    body[data-taskbar-theme="light"] .stat-label,
+    body[data-taskbar-theme="light"] .stat-value,
+    body[data-taskbar-theme="light"] .stat-percent,
+    body[data-taskbar-theme="light"] .stat-unit {
+      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.8), 0 0 2px rgba(255, 255, 255, 0.7);
+    }
+
+    body[data-taskbar-theme="light"] .stat-value {
+      color: #26313a;
+    }
+
+    body[data-taskbar-theme="light"] .stat-arrow.up {
+      color: #d13f83;
+    }
+
+    body[data-taskbar-theme="light"] .stat-arrow.down {
+      color: #0078d4;
+    }
+
+    body[data-taskbar-theme="light"] .cpu-label,
+    body[data-taskbar-theme="light"] .cpu-value,
+    body[data-taskbar-theme="light"] .cpu-unit {
+      color: #a45f00;
+    }
+
+    body[data-taskbar-theme="light"] .mem-label,
+    body[data-taskbar-theme="light"] .mem-value,
+    body[data-taskbar-theme="light"] .mem-unit {
+      color: #167a38;
+    }
+
+    body[data-mode="network-only"] .system-part,
+    body[data-mode="network-only"] .stat-divider {
       display: none !important;
     }
 
-    @keyframes dataPulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.84; }
+    .taskbar-widget .active-data .stat-value {
+      color: #ffffff;
     }
 
-    .active-data {
-      animation: dataPulse 1.5s ease-in-out infinite;
+    body[data-taskbar-theme="light"] .taskbar-widget .active-data .stat-value {
+      color: #26313a;
+    }
+
+    body[data-edge="left"] .taskbar-widget,
+    body[data-edge="right"] .taskbar-widget {
+      flex-direction: column;
+      align-items: flex-start;
+      justify-content: flex-start;
+      padding: 2px 0;
+    }
+
+    body[data-edge="left"] .stat-row,
+    body[data-edge="right"] .stat-row {
+      width: 100%;
+      justify-content: flex-start;
     }
   </style>
 </head>
-<body data-mode="full">
+<body data-mode="full" data-taskbar-theme="dark">
   <div class="taskbar-widget" id="taskbarWidget">
-    <div class="stat-group" id="networkGroup">
-      <div class="stat-row" id="uploadRow">
-        <span class="stat-arrow up">&#8593;</span>
-        <span class="stat-value" id="uploadSpeed">0.0 KB/s</span>
-      </div>
-      <div class="stat-row" id="downloadRow">
-        <span class="stat-arrow down">&#8595;</span>
-        <span class="stat-value" id="downloadSpeed">0.0 KB/s</span>
-      </div>
+    <div class="stat-row" id="uploadRow">
+      <span class="stat-arrow up">&#8593;</span>
+      <span class="stat-value" id="uploadSpeed">0.0 KB/s</span>
+      <span class="stat-divider"></span>
+      <span class="stat-label cpu-label system-part">CPU</span>
+      <span class="stat-percent cpu-value system-part" id="cpuValue">0</span>
+      <span class="stat-unit cpu-unit system-part">%</span>
     </div>
-
-    <div class="stat-group" id="cpuMemGroup">
-      <div class="stat-row" id="cpuRow">
-        <span class="stat-label cpu-label">CPU</span>
-        <span class="stat-percent cpu-value" id="cpuValue">0%</span>
-      </div>
-      <div class="stat-row" id="memRow">
-        <span class="stat-label mem-label">MEM</span>
-        <span class="stat-percent mem-value" id="memValue">0%</span>
-      </div>
+    <div class="stat-row" id="downloadRow">
+      <span class="stat-arrow down">&#8595;</span>
+      <span class="stat-value" id="downloadSpeed">0.0 KB/s</span>
+      <span class="stat-divider"></span>
+      <span class="stat-label mem-label system-part">MEM</span>
+      <span class="stat-percent mem-value system-part" id="memValue">0</span>
+      <span class="stat-unit mem-unit system-part">%</span>
     </div>
   </div>
 
-  <script>
-    (function () {
-      'use strict';
-
-      function waitForTauri(callback) {
-        if (window.__TAURI__) {
-          callback();
-        } else {
-          setTimeout(() => waitForTauri(callback), 50);
-        }
-      }
-
-      document.body.style.webkitAppRegion = 'no-drag';
-
-      waitForTauri(() => {
-        const { listen } = window.__TAURI__.event;
-        const { invoke } = window.__TAURI__.core;
-
-        const dom = {
-          widget: document.getElementById('taskbarWidget'),
-          uploadRow: document.getElementById('uploadRow'),
-          downloadRow: document.getElementById('downloadRow'),
-          cpuMemGroup: document.getElementById('cpuMemGroup'),
-          uploadSpeed: document.getElementById('uploadSpeed'),
-          downloadSpeed: document.getElementById('downloadSpeed'),
-          cpuValue: document.getElementById('cpuValue'),
-          memValue: document.getElementById('memValue')
-        };
-
-        function formatSpeed(bytesPerSec) {
-          if (!bytesPerSec || bytesPerSec < 1024 * 1024) {
-            return `${((bytesPerSec || 0) / 1024).toFixed(1)} KB/s`;
-          }
-          if (bytesPerSec < 1024 * 1024 * 1024) {
-            return `${(bytesPerSec / (1024 * 1024)).toFixed(2)} MB/s`;
-          }
-          return `${(bytesPerSec / (1024 * 1024 * 1024)).toFixed(2)} GB/s`;
-        }
-
-        function markActive(row, bytesPerSec) {
-          if (!row) return;
-          row.classList.toggle('active-data', Number(bytesPerSec || 0) > 0);
-        }
-
-        function applyWidgetDisplayMode(payload) {
-          const networkOnly = !!(payload && payload.networkOnly);
-          document.body.dataset.mode = networkOnly ? 'network-only' : 'full';
-        }
-
-        listen('taskbar-placement', (event) => {
-          const placement = event.payload || {};
-          document.body.dataset.edge = placement.edge || 'bottom';
-        });
-
-        listen('widget-display-mode-changed', (event) => {
-          applyWidgetDisplayMode(event.payload || {});
-        });
-
-        listen('metrics', (event) => {
-          try {
-            const payload = event.payload || {};
-            const network = payload.network || {};
-            const cpu = payload.cpu || {};
-            const memory = payload.memory || {};
-
-            dom.uploadSpeed.textContent = formatSpeed(network.uploadSpeed);
-            dom.downloadSpeed.textContent = formatSpeed(network.downloadSpeed);
-            dom.cpuValue.textContent = `${Math.round(cpu.overall || 0)}%`;
-            dom.memValue.textContent = `${Math.round(memory.percentUsed || 0)}%`;
-
-            markActive(dom.uploadRow, network.uploadSpeed);
-            markActive(dom.downloadRow, network.downloadSpeed);
-          } catch (_) {}
-        });
-
-        invoke('cmd_get_widget_display_mode')
-          .then((payload) => {
-            applyWidgetDisplayMode(payload || {});
-          })
-          .catch(() => {});
-
-        dom.widget.addEventListener('dblclick', () => {
-          invoke('cmd_show_history_window').catch(() => {});
-        });
-
-        dom.widget.addEventListener('contextmenu', (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          invoke('cmd_show_widget_context_menu').catch(() => {});
-        });
-      });
-    })();
-  </script>
+  <script type="module" src="./taskbar.js"></script>
 </body>
 </html>

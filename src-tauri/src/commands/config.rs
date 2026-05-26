@@ -4,6 +4,8 @@ use std::fs;
 use std::sync::Mutex;
 use tauri::Emitter;
 
+const APP_CONFIG_DIR_NAME: &str = "Watchman";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(rename = "startOnBoot", default = "default_true")]
@@ -274,7 +276,7 @@ impl ConfigState {
 
 fn get_config_dir() -> std::path::PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let dir = base.join("traffic-monitor");
+    let dir = base.join(APP_CONFIG_DIR_NAME);
     let _ = fs::create_dir_all(&dir);
     dir
 }
@@ -386,16 +388,6 @@ pub fn undo_settings(state: tauri::State<'_, Mutex<ConfigState>>) -> serde_json:
     } else {
         serde_json::json!({ "success": false, "reason": "Nothing to undo" })
     }
-}
-
-#[tauri::command]
-pub fn get_undo_history(state: tauri::State<'_, Mutex<ConfigState>>) -> Vec<serde_json::Value> {
-    let s = state.lock().unwrap();
-    s.undo_history
-        .iter()
-        .enumerate()
-        .map(|(i, _)| serde_json::json!({ "index": i, "timestamp": "saved" }))
-        .collect()
 }
 
 #[tauri::command]

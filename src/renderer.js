@@ -1,4 +1,4 @@
-// renderer.js — Frontend logic for Electron
+// renderer.js - Frontend logic for Watchman
 (function () {
   'use strict';
 
@@ -42,7 +42,8 @@
       years: [],
       monthSet: new Set(),
       yearSet: new Set()
-    }
+    },
+    startupWarnings: []
   };
 
   // ====== DOM References ======
@@ -56,6 +57,10 @@
     uploadUnit: document.getElementById('uploadUnit'),
     totalDownloaded: document.getElementById('totalDownloaded'),
     totalUploaded: document.getElementById('totalUploaded'),
+    sessionDownload: document.getElementById('sessionDownload'),
+    sessionUpload: document.getElementById('sessionUpload'),
+    sessionTotal: document.getElementById('sessionTotal'),
+    sessionResetBtn: document.getElementById('sessionResetBtn'),
 
     // Gauges
     cpuValue: document.getElementById('cpuValue'),
@@ -102,7 +107,7 @@
     cfgHideGauges: document.getElementById('cfgHideGauges'),
     gaugesSection: document.querySelector('.gauges-section'),
 
-    // Traffic Graph (Task 16)
+    // Traffic graph
     trafficChart: document.getElementById('trafficChart'),
     trafficLight: document.getElementById('trafficLight'),
     tlDot: document.getElementById('tlDot'),
@@ -112,7 +117,7 @@
     // Tabs
     tabBar: document.getElementById('tabBar'),
 
-    // Data Usage (Task 12)
+    // Data usage
     duTotalUsage: document.getElementById('duTotalUsage'),
     duDownload: document.getElementById('duDownload'),
     duUpload: document.getElementById('duUpload'),
@@ -133,12 +138,13 @@
     dashDownload: document.getElementById('dashDownload'),
     dashUpload: document.getElementById('dashUpload'),
 
-    // Applications (Task 14)
+    // Applications
     appHeaderSubtitle: document.getElementById('appHeaderSubtitle'),
+    appDataUsageSettingsBtn: document.getElementById('appDataUsageSettingsBtn'),
     appCountBadge: document.getElementById('appCountBadge'),
     appTableBody: document.getElementById('appTableBody'),
 
-    // Network Health (Task 13)
+    // Network health
     nhQualityCard: document.getElementById('nhQualityCard'),
     nhQualityDot: document.getElementById('nhQualityDot'),
     nhQualityLevel: document.getElementById('nhQualityLevel'),
@@ -164,7 +170,7 @@
     nhStServer: document.getElementById('nhStServer'),
     nhStTime: document.getElementById('nhStTime'),
 
-    // Tools (Task 18 + 19)
+    // Tools
     toolsTroubleshootBtn: document.getElementById('toolsTroubleshootBtn'),
     toolsTroubleshootProgress: document.getElementById('toolsTroubleshootProgress'),
     toolsTroubleshootResults: document.getElementById('toolsTroubleshootResults'),
@@ -213,7 +219,7 @@
 
 
 
-    // Enhanced Settings (Task 20)
+    // Settings
     cfgDataLimit: document.getElementById('cfgDataLimit'),
     cfgWarnTrafficEnabled: document.getElementById('cfgWarnTrafficEnabled'),
     cfgWarnTrafficThreshold: document.getElementById('cfgWarnTrafficThreshold'),
@@ -246,7 +252,41 @@
     toastContainer: document.getElementById('toastContainer')
   };
 
-  let localConfig = {};
+  const DEFAULT_CONFIG = {
+    startOnBoot: true,
+    unitModeBits: false,
+    hideGauges: false,
+    theme: 'system',
+    dataLimit: 0,
+    dataLimitEnabled: false,
+    memoryWarningEnabled: true,
+    memoryWarningThreshold: 80,
+    notifications: {
+      enabled: true,
+      dataUsageAlerts: false,
+      slowInternetAlerts: false,
+      connectionDropAlerts: false,
+      highUsageWarnings: true,
+      soundEnabled: true,
+      warningSettings: {
+        trafficEnabled: false,
+        trafficThreshold: 500,
+        trafficUnit: 'MB',
+        memoryEnabled: true,
+        memoryThreshold: 80,
+        cpuTempEnabled: true,
+        cpuTempThreshold: 80,
+        gpuTempEnabled: true,
+        gpuTempThreshold: 80,
+        diskTempEnabled: true,
+        diskTempThreshold: 80,
+        mainboardTempEnabled: true,
+        mainboardTempThreshold: 80
+      }
+    }
+  };
+
+  let localConfig = cloneConfig(DEFAULT_CONFIG);
   let settingsBaselineConfig = null;
   let widgetSettingsBaseline = null;
 
@@ -254,6 +294,51 @@
 
   function cloneConfig(config) {
     return JSON.parse(JSON.stringify(config || {}));
+  }
+
+  function withDefaultConfig(config) {
+    return {
+      ...cloneConfig(DEFAULT_CONFIG),
+      ...(config || {}),
+      notifications: {
+        ...cloneConfig(DEFAULT_CONFIG.notifications),
+        ...((config && config.notifications) || {}),
+        warningSettings: {
+          ...cloneConfig(DEFAULT_CONFIG.notifications.warningSettings),
+          ...((config && config.notifications && config.notifications.warningSettings) || {})
+        }
+      }
+    };
+  }
+
+  function addDomListener(element, eventName, handler, options) {
+    if (!element || typeof element.addEventListener !== 'function') return;
+    element.addEventListener(eventName, handler, options);
+  }
+
+  function listenTauriEvent(eventName, handler) {
+    try {
+      const listener = window.__TAURI__?.event?.listen?.(eventName, handler);
+      if (listener && typeof listener.catch === 'function') {
+        listener.catch((error) => console.error(`Failed to listen for ${eventName}:`, error));
+      }
+    } catch (error) {
+      console.error(`Failed to listen for ${eventName}:`, error);
+    }
+  }
+
+  function recordStartupWarning(label, error) {
+    state.startupWarnings.push(label);
+    console.error(`[startup] ${label}`, error);
+  }
+
+  async function safeBootStep(label, action, fallback = undefined) {
+    try {
+      return await action();
+    } catch (error) {
+      recordStartupWarning(label, error);
+      return fallback;
+    }
   }
 
   function formatSpeed(bytesPerSec) {
@@ -373,10 +458,10 @@
   }
 
   async function openSettingsModal() {
-    dom.settingsModal.classList.add('show');
+    dom.settingsModal?.classList.add('show');
     await updateUndoState();
     try {
-      localConfig = await window.systemAPI.getConfig();
+      localConfig = withDefaultConfig(await window.systemAPI.getConfig());
       applyConfigToDOM();
       settingsBaselineConfig = cloneConfig(localConfig);
       applySettingsModalToDOM(settingsBaselineConfig);
@@ -387,10 +472,10 @@
   }
 
   function applySettingsModalToDOM(sourceConfig = localConfig) {
-    dom.cfgStartOnBoot.checked = !!sourceConfig.startOnBoot;
-    dom.cfgUnitMode.checked = !!sourceConfig.unitModeBits;
-    dom.cfgHideGauges.checked = !!sourceConfig.hideGauges;
-    dom.cfgDataLimit.value = sourceConfig.dataLimit
+    if (dom.cfgStartOnBoot) dom.cfgStartOnBoot.checked = !!sourceConfig.startOnBoot;
+    if (dom.cfgUnitMode) dom.cfgUnitMode.checked = !!sourceConfig.unitModeBits;
+    if (dom.cfgHideGauges) dom.cfgHideGauges.checked = !!sourceConfig.hideGauges;
+    if (dom.cfgDataLimit) dom.cfgDataLimit.value = sourceConfig.dataLimit
       ? (sourceConfig.dataLimit / (1024 * 1024 * 1024)).toFixed(0)
       : '';
     applyWarningSettingsToDOM(sourceConfig);
@@ -409,9 +494,9 @@
     const limitGb = parseFloat(dom.cfgDataLimit?.value || '0') || 0;
     const limitBytes = Math.round(limitGb * 1024 * 1024 * 1024);
 
-    nextConfig.startOnBoot = !!dom.cfgStartOnBoot.checked;
-    nextConfig.unitModeBits = !!dom.cfgUnitMode.checked;
-    nextConfig.hideGauges = !!dom.cfgHideGauges.checked;
+    nextConfig.startOnBoot = !!dom.cfgStartOnBoot?.checked;
+    nextConfig.unitModeBits = !!dom.cfgUnitMode?.checked;
+    nextConfig.hideGauges = !!dom.cfgHideGauges?.checked;
     nextConfig.dataLimit = limitBytes;
     nextConfig.dataLimitEnabled = limitBytes > 0;
     nextConfig.notifications = {
@@ -692,10 +777,7 @@
     const nextConfig = buildWidgetConfig(localConfig);
     localConfig = nextConfig;
     await saveLocalConfig();
-    if (window.systemAPI.setWidgetDisplayMode) {
-      await window.systemAPI.setWidgetDisplayMode(nextConfig.widgetSettings.mode);
-    }
-    localConfig = await window.systemAPI.getConfig();
+    localConfig = withDefaultConfig(await window.systemAPI.getConfig());
     applyWidgetSettingsToDOM(localConfig);
     showToast('Widget settings saved', 'info');
   }
@@ -779,6 +861,10 @@
   }
 
   function showToast(message, type = 'info') {
+    if (!dom.toastContainer) {
+      console[type === 'error' ? 'error' : 'log'](message);
+      return;
+    }
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
     toast.textContent = message;
@@ -864,7 +950,7 @@
     }
   }
 
-  // ====== Traffic Graph (Task 16) - DISABLED ======
+  // ====== Traffic Graph - Disabled ======
   // function initTrafficGraph() {
   //   if (state.trafficChart || !dom.trafficChart) return;
 
@@ -977,7 +1063,7 @@
     if (dom.tlDetail) dom.tlDetail.textContent = detail;
   }
 
-  // ====== Data Usage (Task 12) ======
+  // ====== Data Usage ======
   function initDataUsage() {
     // Period selector
     document.querySelectorAll('.du-period-btn').forEach(btn => {
@@ -1053,17 +1139,27 @@
 
   async function loadDataUsage(period) {
     try {
-      const [usage, thresholds, comparison, historyData] = await Promise.all([
+      const [usageResult, thresholdsResult, comparisonResult, historyResult] = await Promise.allSettled([
         window.systemAPI.getUsage(period),
         window.systemAPI.getDataThresholds(),
         window.systemAPI.compareUsage(period),
         window.systemAPI.getTrafficHistory(period)
       ]);
+      const usage = usageResult.status === 'fulfilled' ? usageResult.value : { upload: 0, download: 0, total: 0 };
+      const thresholds = thresholdsResult.status === 'fulfilled' ? thresholdsResult.value : { percentage: 0, level: 'normal', remaining: 0 };
+      const comparison = comparisonResult.status === 'fulfilled' ? comparisonResult.value : { current: 0, previous: 0, percentageChange: 0, trend: 'stable' };
+      const historyData = historyResult.status === 'fulfilled' && Array.isArray(historyResult.value) ? historyResult.value : [];
+
+      [usageResult, thresholdsResult, comparisonResult, historyResult].forEach((result, index) => {
+        if (result.status === 'rejected') {
+          console.error(`[data] ${['usage', 'thresholds', 'comparison', 'history'][index]} load failed`, result.reason);
+        }
+      });
 
       // Summary
-      dom.duTotalUsage.textContent = formatBytes(usage.total);
-      dom.duDownload.textContent = formatBytes(usage.download);
-      dom.duUpload.textContent = formatBytes(usage.upload);
+      if (dom.duTotalUsage) dom.duTotalUsage.textContent = formatBytes(usage.total || 0);
+      if (dom.duDownload) dom.duDownload.textContent = formatBytes(usage.download || 0);
+      if (dom.duUpload) dom.duUpload.textContent = formatBytes(usage.upload || 0);
 
       // Comparison
       if (comparison.percentageChange !== 0) {
@@ -1071,7 +1167,7 @@
         const cls = comparison.trend === 'up' ? 'trend-up' : comparison.trend === 'down' ? 'trend-down' : 'trend-stable';
         dom.duComparisonValue.textContent = `${arrow} ${Math.abs(comparison.percentageChange)}%`;
         dom.duComparisonValue.className = `du-comparison-value ${cls}`;
-        dom.duComparisonTrend.textContent = `Current: ${formatBytes(comparison.current)} / Previous: ${formatBytes(comparison.previous)}`;
+        dom.duComparisonTrend.textContent = `Current: ${formatBytes(comparison.current || 0)} / Previous: ${formatBytes(comparison.previous || 0)}`;
       } else {
         dom.duComparisonValue.textContent = 'No comparison available';
         dom.duComparisonValue.className = 'du-comparison-value';
@@ -1080,9 +1176,9 @@
 
       // Limit
       if (thresholds.level !== 'normal' || thresholds.percentage > 0) {
-        dom.duLimitFill.style.width = `${Math.min(100, thresholds.percentage)}%`;
-        dom.duLimitPct.textContent = `${thresholds.percentage}%`;
-        dom.duLimitRemaining.textContent = `${formatBytes(thresholds.remaining)} remaining`;
+        dom.duLimitFill.style.width = `${Math.min(100, thresholds.percentage || 0)}%`;
+        dom.duLimitPct.textContent = `${thresholds.percentage || 0}%`;
+        dom.duLimitRemaining.textContent = `${formatBytes(thresholds.remaining || 0)} remaining`;
         
         dom.duLimitFill.className = 'du-limit-fill';
         if (thresholds.level === 'warning') dom.duLimitFill.classList.add('du-fill-warning');
@@ -1098,8 +1194,8 @@
       if (state.dataUsageChart && historyData) {
         const recent = historyData.slice(0, 10).reverse();
         state.dataUsageChart.data.labels = recent.map(d => d.date);
-        state.dataUsageChart.data.datasets[0].data = recent.map(d => d.download);
-        state.dataUsageChart.data.datasets[1].data = recent.map(d => d.upload);
+        state.dataUsageChart.data.datasets[0].data = recent.map(d => d.download || 0);
+        state.dataUsageChart.data.datasets[1].data = recent.map(d => d.upload || 0);
         state.dataUsageChart.update();
       }
     } catch (e) {
@@ -1111,17 +1207,21 @@
   async function loadDashUsage(period) {
     try {
       const usage = await window.systemAPI.getUsage(period);
-      if (dom.dashTotalUsage) dom.dashTotalUsage.textContent = formatBytes(usage.total);
-      if (dom.dashDownload) dom.dashDownload.textContent = formatBytes(usage.download);
-      if (dom.dashUpload) dom.dashUpload.textContent = formatBytes(usage.upload);
+      if (dom.dashTotalUsage) dom.dashTotalUsage.textContent = formatBytes(usage.total || 0);
+      if (dom.dashDownload) dom.dashDownload.textContent = formatBytes(usage.download || 0);
+      if (dom.dashUpload) dom.dashUpload.textContent = formatBytes(usage.upload || 0);
       if (dom.dashUsagePeriodChip) dom.dashUsagePeriodChip.textContent = getDashPeriodChipLabel(period);
       if (dom.dashUsageMeta) dom.dashUsageMeta.textContent = 'Updated just now';
     } catch (e) {
       console.error('Failed to load dashboard usage:', e);
+      if (dom.dashTotalUsage) dom.dashTotalUsage.textContent = '0 B';
+      if (dom.dashDownload) dom.dashDownload.textContent = '0 B';
+      if (dom.dashUpload) dom.dashUpload.textContent = '0 B';
+      if (dom.dashUsageMeta) dom.dashUsageMeta.textContent = 'Usage data unavailable';
     }
   }
 
-  // ====== Application Monitor (Task 14) ======
+  // ====== Application Monitor ======
 
   function initAppMonitor() {
     loadApplications();
@@ -1160,6 +1260,36 @@
     }
   }
 
+  function renderConnectionVisual(connection = {}) {
+    const type = connection.connectionType || 'unknown';
+    const bars = Math.max(0, Math.min(4, Number(connection.bars || 0)));
+    dom.nhSignalBars.className = `nh-signal-bars signal-${type}`;
+
+    if (type === 'wifi') {
+      dom.nhSignalBars.innerHTML = `
+        <svg class="wifi-signal-icon" viewBox="0 0 44 32" aria-hidden="true">
+          <path class="wifi-arc ${bars >= 4 ? 'signal-active' : ''}" d="M5 13c9.5-8.5 24.5-8.5 34 0" />
+          <path class="wifi-arc ${bars >= 3 ? 'signal-active' : ''}" d="M12 19c5.7-5 14.3-5 20 0" />
+          <path class="wifi-arc ${bars >= 2 ? 'signal-active' : ''}" d="M18 24c2.5-2 5.5-2 8 0" />
+          <circle class="wifi-dot ${bars >= 1 ? 'signal-active' : ''}" cx="22" cy="28" r="2.8" />
+        </svg>
+      `;
+      return;
+    }
+
+    if (type === 'cellular') {
+      dom.nhSignalBars.innerHTML = [1, 2, 3, 4]
+        .map((bar) => `<div class="signal-bar ${bar <= bars ? 'signal-active' : ''}" data-bar="${bar}"></div>`)
+        .join('');
+      return;
+    }
+
+    dom.nhSignalBars.innerHTML = `
+      <div class="wired-signal-dot"></div>
+      <div class="wired-signal-line"></div>
+    `;
+  }
+
   function updateAppMonitorStatus(statusInfo = {}) {
     if (!dom.appHeaderSubtitle) return;
 
@@ -1174,6 +1304,27 @@
     }
 
     dom.appHeaderSubtitle.textContent = 'Live now and recent background traffic stay listed here for this session.';
+  }
+
+  async function openWindowsDataUsageSettings() {
+    if (!dom.appDataUsageSettingsBtn) return;
+
+    const wasDisabled = dom.appDataUsageSettingsBtn.disabled;
+    dom.appDataUsageSettingsBtn.disabled = true;
+
+    try {
+      if (!window.systemAPI?.openWindowsDataUsageSettings) {
+        throw new Error('openWindowsDataUsageSettings is unavailable');
+      }
+
+      await window.systemAPI.openWindowsDataUsageSettings();
+      showToast('Opening Windows Data Usage', 'info');
+    } catch (e) {
+      console.error('Failed to open Windows Data Usage settings:', e);
+      showToast('Could not open Windows Data Usage settings', 'error');
+    } finally {
+      dom.appDataUsageSettingsBtn.disabled = wasDisabled;
+    }
   }
 
   async function loadApplications() {
@@ -1267,7 +1418,7 @@
     }).join('');
   }
 
-  // ====== Network Health (Task 13) ======
+  // ====== Network Health ======
   function initNetworkHealth() {
     // Speed test button handler is attached in init() to work immediately
     // No need to attach it again here
@@ -1301,13 +1452,8 @@
         : (connection.adapterName || connection.adapterDescription || 'Unavailable');
       dom.nhConnLink.textContent = connection.linkSpeed || 'Unavailable';
       dom.nhConnIp.textContent = connection.localIp || 'Unavailable';
-      const bars = connection.bars || 0;
-      dom.nhSignalBars.querySelectorAll('.signal-bar').forEach(bar => {
-        const barNum = parseInt(bar.dataset.bar, 10);
-        bar.classList.toggle('signal-active', barNum <= bars);
-      });
-      const isWireless = connection.connectionType === 'wifi' || connection.connectionType === 'cellular';
-      dom.nhSignalBars.style.opacity = isWireless ? '1' : '0.35';
+      renderConnectionVisual(connection);
+      dom.nhSignalBars.style.opacity = connection.connectionType === 'unknown' ? '0.35' : '1';
       const qualityLabel = connection.quality
         ? connection.quality.charAt(0).toUpperCase() + connection.quality.slice(1)
         : '';
@@ -1333,13 +1479,23 @@
   }
 
   function formatSpeedTestServer(serverLabel, server) {
-    const raw = (serverLabel || server || '').toLowerCase();
-    if (!raw) return '--';
-    if (raw.includes('traffic-monitor-speedtest') || raw.includes('railway.app') || raw.includes('onrender.com') || raw === 'usa') {
-      return 'USA · more coming soon';
-    }
-    if (raw.includes('more coming soon')) return serverLabel || server || '--';
-    return serverLabel || server || 'USA · more coming soon';
+    return serverLabel || server || '--';
+  }
+
+  function getSpeedTestMbps(result, key) {
+    const direct = Number(result?.[`${key}Mbps`]);
+    if (Number.isFinite(direct) && direct > 0) return direct;
+
+    const legacyMbPerSecond = Number(result?.[`${key}Speed`]);
+    return Number.isFinite(legacyMbPerSecond) && legacyMbPerSecond > 0
+      ? legacyMbPerSecond * 8
+      : 0;
+  }
+
+  function formatSpeedTestRate(mbps) {
+    if (!Number.isFinite(mbps) || mbps <= 0) return 'Error';
+    const precision = mbps >= 100 ? 0 : mbps >= 10 ? 1 : 2;
+    return `${mbps.toFixed(precision)} Mbps (${(mbps / 8).toFixed(2)} MB/s)`;
   }
 
 
@@ -1347,20 +1503,15 @@
 
 
   async function runSpeedTest() {
-    console.log('Speed test button clicked');
     dom.nhSpeedTestBtn.disabled = true;
     dom.nhSpeedTestProgress.style.display = 'flex';
     dom.nhSpeedTestBtn.textContent = 'Running...';
 
     try {
-      console.log('Calling window.systemAPI.runSpeedTest()');
       const result = await window.systemAPI.runSpeedTest();
-      console.log('Speed test result:', result);
 
-      dom.nhStDownload.textContent = result.downloadSpeed > 0 
-        ? `${result.downloadSpeed.toFixed(2)} MB/s` : 'Error';
-      dom.nhStUpload.textContent = result.uploadSpeed > 0 
-        ? `${result.uploadSpeed.toFixed(2)} MB/s` : 'Error';
+      dom.nhStDownload.textContent = formatSpeedTestRate(getSpeedTestMbps(result, 'download'));
+      dom.nhStUpload.textContent = formatSpeedTestRate(getSpeedTestMbps(result, 'upload'));
       dom.nhStPing.textContent = result.ping > 0 ? `${result.ping}ms` : '—';
       dom.nhStServer.textContent = formatSpeedTestServer(result.serverLabel, result.server);
       dom.nhStTime.textContent = new Date(result.timestamp).toLocaleString();
@@ -1379,7 +1530,7 @@
     }
   }
 
-  // ====== Troubleshooter (Task 18) ======
+  // ====== Troubleshooter ======
   async function runTroubleshoot() {
     dom.toolsTroubleshootBtn.disabled = true;
     dom.toolsTroubleshootProgress.style.display = 'flex';
@@ -1428,7 +1579,7 @@
     }
   }
 
-  // ====== Export (Task 19) ======
+  // ====== Export ======
   function formatExportMonthLabel(monthValue) {
     if (!monthValue || !/^\d{4}-\d{2}$/.test(monthValue)) {
       return monthValue || 'Unknown';
@@ -1617,7 +1768,7 @@
 
 
 
-  // ====== Enhanced Settings (Task 20) ======
+  // ====== Settings ======
   function setupTooltips() {
     document.querySelectorAll('[data-tooltip]').forEach(el => {
       let timeoutId = null;
@@ -1652,6 +1803,8 @@
 
   // ====== History Table ======
   async function loadTrafficHistory() {
+    // historyViewType and historyTableBody are legacy elements; skip if not present
+    if (!dom.historyViewType || !dom.historyTableBody) return;
     try {
       const viewType = dom.historyViewType.value;
       const historyData = await window.systemAPI.getTrafficHistory(viewType);
@@ -1711,6 +1864,11 @@
     // Update network totals
     if (dom.totalDownloaded) dom.totalDownloaded.textContent = formatBytes(stats.totalDownloaded);
     if (dom.totalUploaded) dom.totalUploaded.textContent = formatBytes(stats.totalUploaded);
+    const sessionDownloaded = Number(stats.totalDownloaded) || 0;
+    const sessionUploaded = Number(stats.totalUploaded) || 0;
+    if (dom.sessionDownload) dom.sessionDownload.textContent = formatBytes(sessionDownloaded);
+    if (dom.sessionUpload) dom.sessionUpload.textContent = formatBytes(sessionUploaded);
+    if (dom.sessionTotal) dom.sessionTotal.textContent = formatBytes(sessionDownloaded + sessionUploaded);
 
     // Update connection status
     state.isConnected = stats.downloadSpeed > 0 || stats.uploadSpeed > 0 || stats.totalDownloaded > 0;
@@ -1740,7 +1898,7 @@
     // Store current speed for Network Health tab quality assessment
     state.currentDownloadSpeed = stats.downloadSpeed;
 
-    // Update traffic graph (Task 16)
+    // Update traffic graph
     updateTrafficGraph(stats.downloadSpeed, stats.uploadSpeed);
     updateTrafficLight(stats.downloadSpeed, stats.uploadSpeed);
   }
@@ -1874,13 +2032,60 @@
     }
   }
 
+  function setupReleaseContextMenuPolicy() {
+    const devHosts = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+    const isDevServer =
+      (window.location.protocol === 'http:' || window.location.protocol === 'https:') &&
+      devHosts.has(window.location.hostname) &&
+      window.location.port === '1420';
+
+    if (isDevServer) {
+      return;
+    }
+
+    document.addEventListener('contextmenu', (event) => {
+      const target = event.target;
+      if (target?.closest?.('input, textarea, select, [contenteditable="true"], [contenteditable=""]')) {
+        return;
+      }
+
+      event.preventDefault();
+    }, true);
+  }
+
   // ====== Event Listeners ======
   function setupEventListeners() {
-    // Window controls
-    dom.minimizeBtn.addEventListener('click', () => window.systemAPI.minimizeWindow());
-    dom.closeBtn.addEventListener('click', () => window.systemAPI.closeWindow());
+    setupReleaseContextMenuPolicy();
 
-    window.__TAURI__.event.listen('widget-menu-action', async (event) => {
+    // Window controls
+    addDomListener(dom.minimizeBtn, 'click', () => window.systemAPI?.minimizeWindow?.());
+    addDomListener(dom.closeBtn, 'click', () => window.systemAPI?.closeWindow?.());
+    addDomListener(dom.appDataUsageSettingsBtn, 'click', openWindowsDataUsageSettings);
+
+    if (dom.sessionResetBtn) {
+      dom.sessionResetBtn.addEventListener('click', async () => {
+        const originalLabel = dom.sessionResetBtn.textContent;
+        dom.sessionResetBtn.disabled = true;
+        dom.sessionResetBtn.textContent = 'Resetting';
+        try {
+          const result = await window.systemAPI.resetSessionCounters();
+          if (result?.success !== false) {
+            if (dom.sessionDownload) dom.sessionDownload.textContent = '0 B';
+            if (dom.sessionUpload) dom.sessionUpload.textContent = '0 B';
+            if (dom.sessionTotal) dom.sessionTotal.textContent = '0 B';
+          }
+          showToast(result?.message || 'Current session reset', result?.success === false ? 'error' : 'info');
+        } catch (e) {
+          console.error('Failed to reset session counters:', e);
+          showToast('Could not reset current session', 'error');
+        } finally {
+          dom.sessionResetBtn.disabled = false;
+          dom.sessionResetBtn.textContent = originalLabel;
+        }
+      });
+    }
+
+    listenTauriEvent('widget-menu-action', async (event) => {
       try {
         await handleWidgetMenuAction(event.payload || {});
       } catch (e) {
@@ -1888,14 +2093,14 @@
       }
     });
 
-    window.__TAURI__.event.listen('widget-feedback', (event) => {
+    listenTauriEvent('widget-feedback', (event) => {
       const payload = event.payload || {};
       if (payload.message) {
         showToast(payload.message, payload.level || 'info');
       }
     });
 
-    window.__TAURI__.event.listen('tray-menu-action', async (event) => {
+    listenTauriEvent('tray-menu-action', async (event) => {
       const payload = event.payload || {};
       if (payload.action === 'open-preferences') {
         await openSettingsModal();
@@ -1903,7 +2108,7 @@
     });
 
     // Tab navigation
-    dom.tabBar.addEventListener('click', (e) => {
+    addDomListener(dom.tabBar, 'click', (e) => {
       const btn = e.target.closest('.tab-item');
       if (btn && btn.dataset.tab) {
         switchTab(btn.dataset.tab);
@@ -1911,20 +2116,20 @@
     });
 
     // Details panel toggles
-    dom.networkDetailsToggle.addEventListener('click', async () => {
+    addDomListener(dom.networkDetailsToggle, 'click', async () => {
       await toggleDetailsPanel(dom.networkDetailsPanel, loadNetworkDetails);
     });
 
-    dom.systemInfoToggle.addEventListener('click', async () => {
+    addDomListener(dom.systemInfoToggle, 'click', async () => {
       await toggleDetailsPanel(dom.systemInfoPanel, loadSystemInfo);
     });
 
     if (dom.historyViewType) {
-      dom.historyViewType.addEventListener('change', loadTrafficHistory);
+      addDomListener(dom.historyViewType, 'change', loadTrafficHistory);
     }
     
     if (dom.themeToggleBtn) {
-      dom.themeToggleBtn.addEventListener('click', () => {
+      addDomListener(dom.themeToggleBtn, 'click', () => {
         document.body.classList.toggle('dark-mode');
         const isDark = document.body.classList.contains('dark-mode');
         localConfig.theme = isDark ? 'dark' : 'light';
@@ -1934,20 +2139,20 @@
     }
 
       // Settings Modal
-      dom.settingsBtn.addEventListener('click', openSettingsModal);
+    addDomListener(dom.settingsBtn, 'click', openSettingsModal);
     
-    dom.settingsCloseBtn.addEventListener('click', () => {
+    addDomListener(dom.settingsCloseBtn, 'click', () => {
       settingsBaselineConfig = null;
-      dom.settingsModal.classList.remove('show');
+      dom.settingsModal?.classList.remove('show');
     });
 
     const markSettingsDirty = () => {
       updateSettingsSaveState();
     };
 
-    dom.cfgStartOnBoot.addEventListener('change', markSettingsDirty);
-    dom.cfgUnitMode.addEventListener('change', markSettingsDirty);
-    dom.cfgHideGauges.addEventListener('change', markSettingsDirty);
+    addDomListener(dom.cfgStartOnBoot, 'change', markSettingsDirty);
+    addDomListener(dom.cfgUnitMode, 'change', markSettingsDirty);
+    addDomListener(dom.cfgHideGauges, 'change', markSettingsDirty);
 
     [
       dom.cfgWarnTrafficEnabled,
@@ -1966,18 +2171,18 @@
       dom.cfgDataLimit
     ].forEach((el) => {
       if (!el) return;
-      el.addEventListener('change', markSettingsDirty);
+      addDomListener(el, 'change', markSettingsDirty);
       if (el.tagName === 'INPUT') {
-        el.addEventListener('input', markSettingsDirty);
+        addDomListener(el, 'input', markSettingsDirty);
       }
     });
 
-    dom.cfgSaveBtn.addEventListener('click', async () => {
+    addDomListener(dom.cfgSaveBtn, 'click', async () => {
       try {
         const pendingConfig = collectSettingsConfigFromDOM(settingsBaselineConfig || localConfig);
         localConfig = pendingConfig;
         await saveLocalConfig();
-        localConfig = await window.systemAPI.getConfig();
+        localConfig = withDefaultConfig(await window.systemAPI.getConfig());
         settingsBaselineConfig = cloneConfig(localConfig);
         applyConfigToDOM();
         applySettingsModalToDOM(localConfig);
@@ -1991,11 +2196,11 @@
     });
 
     // Recommended settings
-    dom.cfgRecommendedBtn.addEventListener('click', async () => {
+    addDomListener(dom.cfgRecommendedBtn, 'click', async () => {
       try {
         const result = await window.systemAPI.applyRecommendedSettings();
         if (result.success) {
-          localConfig = await window.systemAPI.getConfig();
+          localConfig = withDefaultConfig(await window.systemAPI.getConfig());
           applyConfigToDOM();
           settingsBaselineConfig = cloneConfig(localConfig);
           applySettingsModalToDOM(localConfig);
@@ -2009,11 +2214,11 @@
     });
 
     // Undo settings
-    dom.cfgUndoBtn.addEventListener('click', async () => {
+    addDomListener(dom.cfgUndoBtn, 'click', async () => {
       try {
         const result = await window.systemAPI.undoSettings();
         if (result.success) {
-          localConfig = await window.systemAPI.getConfig();
+          localConfig = withDefaultConfig(await window.systemAPI.getConfig());
           applyConfigToDOM();
           settingsBaselineConfig = cloneConfig(localConfig);
           applySettingsModalToDOM(localConfig);
@@ -2029,24 +2234,26 @@
 
 
     // Troubleshooter
-    dom.toolsTroubleshootBtn.addEventListener('click', runTroubleshoot);
+    addDomListener(dom.toolsTroubleshootBtn, 'click', runTroubleshoot);
 
-    dom.exportPeriodSelect.addEventListener('change', () => {
+    addDomListener(dom.exportPeriodSelect, 'change', () => {
       setExportStatus('');
       refreshExportControls();
     });
-    dom.exportMonthSelect.addEventListener('change', () => {
+    addDomListener(dom.exportMonthSelect, 'change', () => {
       setExportStatus('');
       refreshExportControls();
     });
-    dom.exportYearSelect.addEventListener('change', () => {
+    addDomListener(dom.exportYearSelect, 'change', () => {
       setExportStatus('');
       refreshExportControls();
     });
-    dom.exportBtn.addEventListener('click', handleExport);
+    addDomListener(dom.exportBtn, 'click', handleExport);
   }
 
   function applyConfigToDOM() {
+    if (!dom.gaugesSection) return;
+
     if (localConfig.hideGauges) {
       dom.gaugesSection.style.display = 'none';
     } else {
@@ -2064,6 +2271,9 @@
   }
 
   async function saveLocalConfig() {
+    if (!window.systemAPI?.saveConfig) {
+      throw new Error('Settings backend is unavailable');
+    }
     return window.systemAPI.saveConfig(localConfig);
   }
 
@@ -2076,7 +2286,7 @@
     }
   }
 
-  // ====== In-App Notifications (Task 22.2) ======
+  // ====== In-App Notifications ======
   const notificationQueue = [];
   const MAX_VISIBLE_NOTIFICATIONS = 3;
   let notificationCounter = 0;
@@ -2240,9 +2450,11 @@
    */
   function setupNotificationListeners() {
     // Listen for in-app notifications
-    window.systemAPI.onNotification((notification) => {
-      displayInAppNotification(notification);
-    });
+    if (window.systemAPI?.onNotification) {
+      window.systemAPI.onNotification((notification) => {
+        displayInAppNotification(notification);
+      });
+    }
 
     // Listen for tab switch requests from main process
     window.addEventListener('message', (event) => {
@@ -2252,7 +2464,7 @@
     });
   }
 
-  // ====== Traffic History Chart (Task 31) ======
+  // ====== Traffic History Chart ======
   
   /**
    * Initialize Dashboard History Chart
@@ -2951,9 +3163,13 @@
 
         // Filter data based on selected filter
         let filteredData = this.filterData(historyData, filter, dateRange);
+        if (!filteredData || filteredData.length === 0) {
+          this.showEmptyState();
+          return;
+        }
 
         // Update chart
-        if (this.chart && filteredData.length > 0) {
+        if (this.chart) {
           // Format labels based on filter type
           this.chart.data.labels = filteredData.map(d => this.formatChartLabel(d.date, filter));
           this.chart.data.datasets[0].data = filteredData.map(d => d.download);
@@ -2992,7 +3208,7 @@
         });
 
         const completeData = [];
-        for (let offset = 0; offset <= 7; offset++) {
+        for (let offset = 0; offset < 7; offset++) {
           const date = new Date(now);
           date.setHours(0, 0, 0, 0);
           date.setDate(date.getDate() - offset);
@@ -3227,13 +3443,21 @@
 
   // ====== Initialize ======
   async function init() {
-    localConfig = await window.systemAPI.getConfig();
-    applyConfigToDOM();
-    setupEventListeners();
-    setupTooltips();
-    setupNotificationListeners();
+    const backendConfig = await safeBootStep(
+      'load initial config',
+      () => window.systemAPI?.getConfig
+        ? window.systemAPI.getConfig()
+        : Promise.reject(new Error('systemAPI.getConfig is unavailable')),
+      DEFAULT_CONFIG
+    );
+    localConfig = withDefaultConfig(backendConfig);
+
+    await safeBootStep('apply initial config', () => applyConfigToDOM());
+    await safeBootStep('wire UI events', () => setupEventListeners());
+    await safeBootStep('wire tooltips', () => setupTooltips());
+    await safeBootStep('wire notifications', () => setupNotificationListeners());
     loadTrafficHistory();
-    await loadExportAvailability();
+    await safeBootStep('load export availability', () => loadExportAvailability());
 
     // Mark dashboard as initialized and init its features
     state.tabsInitialized.add('dashboard');
@@ -3249,20 +3473,27 @@
     loadDashUsage(state.dashCurrentPeriod);
 
     // Hook onto unified metrics pipeline
-    window.systemAPI.onMetrics(processMetrics);
+    await safeBootStep('wire metrics listener', () => {
+      if (!window.systemAPI?.onMetrics) {
+        throw new Error('systemAPI.onMetrics is unavailable');
+      }
+      window.systemAPI.onMetrics(processMetrics);
+    });
 
     // Listen for ETW network stats (if available on Windows)
-    if (window.systemAPI.onETWNetworkStats) {
-      window.systemAPI.onETWNetworkStats(handleETWStats);
-    }
+    await safeBootStep('wire app network listener', () => {
+      if (window.systemAPI?.onETWNetworkStats) {
+        window.systemAPI.onETWNetworkStats(handleETWStats);
+      }
+    });
 
     // Load last speed test result
     try {
       const history = await window.systemAPI.getSpeedTestHistory();
       if (history && history.length > 0) {
         const last = history[history.length - 1];
-        if (dom.nhStDownload) dom.nhStDownload.textContent = last.downloadSpeed > 0 ? `${last.downloadSpeed.toFixed(2)} MB/s` : '—';
-        if (dom.nhStUpload) dom.nhStUpload.textContent = last.uploadSpeed > 0 ? `${last.uploadSpeed.toFixed(2)} MB/s` : '—';
+        if (dom.nhStDownload) dom.nhStDownload.textContent = formatSpeedTestRate(getSpeedTestMbps(last, 'download'));
+        if (dom.nhStUpload) dom.nhStUpload.textContent = formatSpeedTestRate(getSpeedTestMbps(last, 'upload'));
         if (dom.nhStPing) dom.nhStPing.textContent = last.ping > 0 ? `${last.ping}ms` : '—';
         if (dom.nhStServer) dom.nhStServer.textContent = formatSpeedTestServer(last.serverLabel, last.server);
         if (dom.nhStTime) dom.nhStTime.textContent = new Date(last.timestamp).toLocaleString();
@@ -3272,6 +3503,17 @@
     // Attach speed test button handler early so it works even before tab switch
     if (dom.nhSpeedTestBtn) {
       dom.nhSpeedTestBtn.addEventListener('click', runSpeedTest);
+    }
+
+    if (state.startupWarnings.length > 0) {
+      const warningCount = state.startupWarnings.length;
+      if (dom.connectionStatus) {
+        dom.connectionStatus.textContent = 'Started with limited data';
+      }
+      showToast(
+        `Watchman started with ${warningCount} recoverable startup issue${warningCount === 1 ? '' : 's'}`,
+        'error'
+      );
     }
 
     // Update uptime every 30 seconds
@@ -3285,11 +3527,26 @@
     }, 30000);
   }
 
+  function handleFatalStartupError(error) {
+    console.error('[startup] fatal renderer startup failure', error);
+    if (dom.connectionStatus) {
+      dom.connectionStatus.textContent = 'Startup recovered';
+    }
+    if (dom.statusDot) {
+      dom.statusDot.className = 'status-dot disconnected';
+    }
+    showToast('Watchman recovered from a startup error', 'error');
+  }
+
+  function startApp() {
+    init().catch(handleFatalStartupError);
+  }
+
   // Start when DOM is ready
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', startApp);
   } else {
-    init();
+    startApp();
   }
 
 })();

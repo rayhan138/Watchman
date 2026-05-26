@@ -1,5 +1,5 @@
 /* ========================================
-   Electron — Light Pastel Grid Theme
+   Watchman - Light Pastel Grid Theme
    ======================================== */
 
 :root {
@@ -370,6 +370,109 @@ button:not(.titlebar-btn):active {
   color: var(--text-muted);
 }
 
+/* ---------- Current Session ---------- */
+.session-section {
+  width: 100%;
+}
+
+.session-card {
+  background: linear-gradient(135deg, rgba(255, 247, 237, 0.78), rgba(255, 255, 255, 0.9));
+  border: var(--border-thickness) solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: 14px 18px 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.session-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.session-header > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.session-title {
+  font-size: 13px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--text-dark);
+}
+
+.session-subtitle {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.session-reset-btn {
+  border: var(--border-thickness) solid var(--border-color);
+  border-radius: var(--radius-pill);
+  background: var(--text-dark);
+  color: var(--bg-white);
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 9px 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.session-reset-btn:hover {
+  background: var(--accent);
+  color: #ffffff;
+  border-color: var(--accent);
+  box-shadow: 0 10px 18px rgba(59, 130, 246, 0.16);
+}
+
+.session-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.session-stat {
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--row-border-color);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.session-stat-label {
+  font-size: 9px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-muted);
+}
+
+.session-stat-value {
+  font-family: 'Nunito Sans', var(--font-sans);
+  font-size: clamp(18px, 4.4vw, 24px);
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: -0.6px;
+  color: var(--text-dark);
+  white-space: nowrap;
+}
+
+.session-stat-total .session-stat-value {
+  color: var(--accent);
+}
+
 /* ---------- Chart Section ---------- */
 .chart-section {
   width: 100%;
@@ -651,6 +754,18 @@ button:not(.titlebar-btn):active {
   background: var(--gauge-bg);
   height: 0%;
   transition: height 0.3s ease;
+}
+
+#cpuGauge .gauge-fill {
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.02) 0%, rgba(0, 0, 0, 0.10) 100%);
+}
+
+#ramGauge .gauge-fill {
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.03) 0%, rgba(0, 0, 0, 0.15) 100%);
+}
+
+#gpuGaugeCard .gauge-fill {
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.04) 0%, rgba(0, 0, 0, 0.20) 100%);
 }
 
 .gauge-center {
@@ -1485,6 +1600,74 @@ svg { stroke: var(--text-dark); }
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
+}
+
+.app-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+
+.app-data-usage-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 5px 10px;
+  border: var(--border-thickness) solid var(--border-color);
+  border-radius: var(--radius-pill);
+  background: var(--surface-bg);
+  color: var(--text-dark);
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+
+.app-data-usage-btn svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.app-data-usage-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.app-data-usage-btn:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+@media (max-width: 560px) {
+  .app-header-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .app-header-actions {
+    justify-content: space-between;
+  }
+
+  .app-data-usage-btn {
+    flex: 1 1 auto;
+  }
 }
 
 .app-header-subtitle {
@@ -1876,8 +2059,41 @@ svg { stroke: var(--text-dark); }
 .nh-signal-bars {
   display: flex;
   align-items: flex-end;
+  justify-content: center;
   gap: 3px;
+  width: 48px;
   height: 28px;
+}
+
+.nh-signal-bars.signal-wifi {
+  align-items: center;
+}
+
+.wifi-signal-icon {
+  width: 44px;
+  height: 32px;
+  overflow: visible;
+}
+
+.wifi-arc {
+  fill: none;
+  stroke: var(--gauge-bg);
+  stroke-width: 3.2;
+  stroke-linecap: round;
+  transition: stroke 0.3s;
+}
+
+.wifi-dot {
+  fill: var(--gauge-bg);
+  transition: fill 0.3s;
+}
+
+.wifi-arc.signal-active {
+  stroke: var(--success);
+}
+
+.wifi-dot.signal-active {
+  fill: var(--success);
 }
 
 .signal-bar {
@@ -1893,6 +2109,25 @@ svg { stroke: var(--text-dark); }
 .signal-bar[data-bar="4"] { height: 100%; }
 
 .signal-bar.signal-active {
+  background: var(--success);
+}
+
+.wired-signal-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.wired-signal-line {
+  width: 28px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--text-muted);
+}
+
+.nh-signal-bars.signal-ethernet .wired-signal-dot,
+.nh-signal-bars.signal-ethernet .wired-signal-line {
   background: var(--success);
 }
 
@@ -1914,6 +2149,14 @@ svg { stroke: var(--text-dark); }
   padding: 12px 0;
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.nh-speedtest-note {
+  margin: -2px 0 2px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 .nh-speedtest-results {
@@ -2691,7 +2934,7 @@ svg { stroke: var(--text-dark); }
   color: #fff;
 }
 
-/* ---------- In-App Notifications (Task 22.2) ---------- */
+/* ---------- In-App Notifications ---------- */
 .notification {
   display: flex;
   align-items: flex-start;
@@ -2817,7 +3060,7 @@ svg { stroke: var(--text-dark); }
 }
 
 
-/* ---------- Traffic History Chart (Task 31) ---------- */
+/* ---------- Traffic History Chart ---------- */
 .traffic-history-panel {
   background: var(--surface-bg);
   border: var(--border-thickness) solid var(--border-color);
@@ -2890,6 +3133,19 @@ svg { stroke: var(--text-dark); }
 
   .speed-unit {
     font-size: 12px;
+  }
+
+  .session-card {
+    padding: 14px 16px;
+  }
+
+  .session-header {
+    align-items: flex-start;
+  }
+
+  .session-reset-btn {
+    padding: 8px 11px;
+    font-size: 9px;
   }
 
   .dash-snapshot-card {
@@ -3301,6 +3557,18 @@ body.dark-mode .export-fmt-btn:hover {
   background: rgba(255, 255, 255, 0.06);
 }
 
+body.dark-mode .tab-item.active:hover,
+body.dark-mode .tab-item.active:focus-visible,
+body.dark-mode .du-period-btn.active:hover,
+body.dark-mode .du-period-btn.active:focus-visible,
+body.dark-mode .th-filter-btn.active:hover,
+body.dark-mode .th-filter-btn.active:focus-visible,
+body.dark-mode .export-fmt-btn.active:hover,
+body.dark-mode .export-fmt-btn.active:focus-visible {
+  background: linear-gradient(135deg, #f7f2ea, #ebe2d4);
+  color: #101215;
+}
+
 body.dark-mode .th-year-picker-popover {
   background: #111317;
   border-color: rgba(247, 242, 234, 0.14);
@@ -3348,6 +3616,7 @@ body.dark-mode .th-year-picker-month.active {
 }
 
 body.dark-mode .speed-card,
+body.dark-mode .session-card,
 body.dark-mode .traffic-light-card,
 body.dark-mode .gauge-card,
 body.dark-mode .du-card,
@@ -3367,6 +3636,22 @@ body.dark-mode .confirm-content,
 body.dark-mode .test-result {
   background: linear-gradient(180deg, rgba(14, 15, 21, 0.94), rgba(10, 11, 16, 0.98));
   box-shadow: 0 18px 36px rgba(0, 0, 0, 0.18);
+}
+
+body.dark-mode .session-card {
+  border-color: rgba(247, 242, 234, 0.12);
+}
+
+body.dark-mode .session-reset-btn {
+  background: linear-gradient(135deg, #f7f2ea, #ebe2d4);
+  color: #101215;
+  border-color: transparent;
+}
+
+body.dark-mode .session-reset-btn:hover {
+  background: linear-gradient(135deg, #1fd29b, #18bc8a);
+  color: #06110d;
+  box-shadow: 0 12px 20px rgba(31, 210, 155, 0.18);
 }
 
 body.dark-mode .dash-snapshot-card {
@@ -3400,6 +3685,22 @@ body.dark-mode .dash-snapshot-chip:hover {
 
 body.dark-mode .minimal-gauge {
   border-color: rgba(247, 242, 234, 0.14);
+  background: radial-gradient(circle at 35% 28%, rgba(247, 242, 234, 0.04), rgba(247, 242, 234, 0.015) 58%, rgba(247, 242, 234, 0.01) 100%);
+  box-shadow: inset 0 1px 0 rgba(247, 242, 234, 0.06);
+}
+
+body.dark-mode #cpuGauge .gauge-fill {
+  background: linear-gradient(180deg, rgba(247, 242, 234, 0.06) 0%, rgba(247, 242, 234, 0.18) 100%);
+}
+
+body.dark-mode #ramGauge .gauge-fill {
+  background: linear-gradient(180deg, rgba(247, 242, 234, 0.12) 0%, rgba(247, 242, 234, 0.30) 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+body.dark-mode #gpuGaugeCard .gauge-fill {
+  background: linear-gradient(180deg, rgba(247, 242, 234, 0.14) 0%, rgba(247, 242, 234, 0.34) 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
 }
 
 body.dark-mode .app-row-alt {
@@ -3413,6 +3714,18 @@ body.dark-mode .history-table th {
 
 body.dark-mode .app-name-icon {
   background: rgba(255, 255, 255, 0.08);
+}
+
+body.dark-mode .app-data-usage-btn {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(247, 242, 234, 0.14);
+  color: #f7f2ea;
+}
+
+body.dark-mode .app-data-usage-btn:hover:not(:disabled) {
+  background: rgba(31, 210, 155, 0.14);
+  border-color: rgba(31, 210, 155, 0.28);
+  color: #86efcf;
 }
 
 body.dark-mode .app-status-live {

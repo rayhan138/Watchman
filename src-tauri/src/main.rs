@@ -10,7 +10,7 @@ use commands::history::HistoryState;
 use commands::monitor::MonitorState;
 use serde::Serialize;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
@@ -21,20 +21,27 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(target_os = "windows")]
-use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+use std::{
+    ffi::OsStr,
+    os::windows::{ffi::OsStrExt, process::CommandExt},
+};
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{
-    Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, POINT, WPARAM},
+    Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM},
     System::Threading::CreateMutexW,
+    UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON},
     UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, MessageBoxW, PostMessageW,
-        SetForegroundWindow, ShowWindow, TrackPopupMenu, MB_ICONINFORMATION, MB_OK, MF_CHECKED,
-        MF_POPUP, MF_SEPARATOR, MF_STRING, SW_RESTORE, TPM_LEFTALIGN, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_NULL,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, GetWindowRect,
+        MessageBoxW, PostMessageW, SendMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
+        MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_RESTORE,
+        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_CANCELMODE, WM_NULL,
     },
 };
 
@@ -66,6 +73,13 @@ struct WidgetDisplayModePayload {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct TaskbarThemePayload {
+    is_light: bool,
+    source: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WidgetMenuActionPayload {
     tab: Option<String>,
     history_filter: Option<String>,
@@ -84,9 +98,9 @@ struct AlertRuntimeState {
     traffic_day: String,
 }
 
-const WIDGET_FULL_WIDTH: f64 = 160.0;
-const WIDGET_NETWORK_ONLY_WIDTH: f64 = 104.0;
-const WIDGET_HEIGHT: f64 = 30.0;
+const WIDGET_FULL_WIDTH: f64 = 136.0;
+const WIDGET_NETWORK_ONLY_WIDTH: f64 = 84.0;
+const WIDGET_HEIGHT: f64 = 32.0;
 
 fn current_day_string() -> String {
     Local::now().format("%Y-%m-%d").to_string()
@@ -123,7 +137,11 @@ fn format_bytes_for_alert(bytes: u64) -> String {
     }
 
     let precision = if unit_index == 0 { 0 } else { 2 };
-    format!("{value:.precision$} {}", units[unit_index], precision = precision)
+    format!(
+        "{value:.precision$} {}",
+        units[unit_index],
+        precision = precision
+    )
 }
 
 fn format_temperature_for_alert(value: f64) -> String {
@@ -385,7 +403,7 @@ struct HistoryWriterLock {
 
 #[cfg(target_os = "windows")]
 fn create_history_writer_state() -> HistoryWriterState {
-    let mut name: Vec<u16> = std::ffi::OsStr::new("Local\\TrafficMonitorHistoryWriter")
+    let mut name: Vec<u16> = std::ffi::OsStr::new("Local\\WatchmanHistoryWriter")
         .encode_wide()
         .collect();
     name.push(0);
@@ -497,7 +515,10 @@ fn main() {
             cmd_show_history_window,
             cmd_toggle_widget_lock,
             cmd_show_widget_context_menu,
+            cmd_reset_session_counters,
             cmd_get_widget_display_mode,
+            cmd_get_taskbar_theme,
+            cmd_open_windows_data_usage_settings,
         ])
         .setup(move |app| {
             if start_minimized {
@@ -524,7 +545,7 @@ fn main() {
                 "taskbar",
                 tauri::WebviewUrl::App("taskbar.html".into()),
             )
-                .title("Watchman Widget")
+            .title("Watchman Widget")
             .inner_size(WIDGET_FULL_WIDTH, WIDGET_HEIGHT)
             .resizable(false)
             .decorations(false)
@@ -542,7 +563,7 @@ fn main() {
                     let raw = hwnd_val.0 as isize;
                     crate::taskbar_embed::apply_widget_styles(raw);
                     let (preferred_width, preferred_height) =
-                        crate::taskbar_embed::get_window_size(raw).unwrap_or((160, 30));
+                        crate::taskbar_embed::get_window_size(raw).unwrap_or((136, 32));
                     let _ = crate::taskbar_embed::enforce_widget(
                         raw,
                         preferred_width,
@@ -558,6 +579,184 @@ fn main() {
 
             #[cfg(not(target_os = "windows"))]
             let widget_hwnd: Option<isize> = None;
+
+            #[cfg(target_os = "windows")]
+            if let Some(raw_widget_hwnd) = widget_hwnd {
+                let startup_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let widget_hwnd = HWND(raw_widget_hwnd);
+                    let mut right_button_was_down = false;
+                    let mut context_menu_armed = false;
+                    let mut left_button_was_down = false;
+                    let mut left_click_armed = false;
+                    let mut last_left_click_at: Option<Instant> = None;
+                    let mut last_left_click_pos: Option<(i32, i32)> = None;
+                    let mut last_context_menu_at: Option<Instant> = None;
+                    let mut last_history_at: Option<Instant> = None;
+
+                    loop {
+                        std::thread::sleep(Duration::from_millis(35));
+
+                        if crate::taskbar_embed::take_widget_double_click_request() {
+                            let now = Instant::now();
+                            let can_open = last_history_at
+                                .map(|last| now.duration_since(last) > Duration::from_millis(450))
+                                .unwrap_or(true);
+
+                            if can_open {
+                                last_history_at = Some(now);
+                                let history_handle = startup_handle.clone();
+                                let _ = startup_handle.run_on_main_thread(move || {
+                                    cmd_show_history_window(history_handle);
+                                });
+                            }
+                            continue;
+                        }
+
+                        if crate::taskbar_embed::take_widget_context_menu_request() {
+                            let now = Instant::now();
+                            let can_open = last_context_menu_at
+                                .map(|last| now.duration_since(last) > Duration::from_millis(350))
+                                .unwrap_or(true);
+
+                            if can_open {
+                                last_context_menu_at = Some(now);
+                                let menu_handle = startup_handle.clone();
+                                let _ = startup_handle.run_on_main_thread(move || {
+                                    let _ = show_widget_context_menu_for_app(&menu_handle);
+                                });
+                            }
+                            continue;
+                        }
+
+                        let right_button_down =
+                            unsafe { (GetAsyncKeyState(VK_RBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+                        let left_button_down =
+                            unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+
+                        if left_button_down {
+                            if !left_button_was_down {
+                                left_button_was_down = true;
+
+                                let mut rect = RECT::default();
+                                let mut cursor = POINT::default();
+                                left_click_armed = unsafe { GetWindowRect(widget_hwnd, &mut rect) }
+                                    .is_ok()
+                                    && unsafe { GetCursorPos(&mut cursor) }.is_ok()
+                                    && cursor.x >= rect.left
+                                    && cursor.x < rect.right
+                                    && cursor.y >= rect.top
+                                    && cursor.y < rect.bottom;
+                            }
+                        } else if left_button_was_down {
+                            left_button_was_down = false;
+
+                            let mut rect = RECT::default();
+                            let mut cursor = POINT::default();
+                            let released_inside = unsafe { GetWindowRect(widget_hwnd, &mut rect) }
+                                .is_ok()
+                                && unsafe { GetCursorPos(&mut cursor) }.is_ok()
+                                && cursor.x >= rect.left
+                                && cursor.x < rect.right
+                                && cursor.y >= rect.top
+                                && cursor.y < rect.bottom;
+
+                            if left_click_armed && released_inside {
+                                let now = Instant::now();
+                                let previous_click_matches = last_left_click_at
+                                    .zip(last_left_click_pos)
+                                    .map(|(last, (x, y))| {
+                                        now.duration_since(last) <= Duration::from_millis(420)
+                                            && (cursor.x - x).abs() <= 8
+                                            && (cursor.y - y).abs() <= 8
+                                    })
+                                    .unwrap_or(false);
+
+                                if previous_click_matches {
+                                    last_left_click_at = None;
+                                    last_left_click_pos = None;
+
+                                    let can_open = last_history_at
+                                        .map(|last| {
+                                            now.duration_since(last) > Duration::from_millis(450)
+                                        })
+                                        .unwrap_or(true);
+
+                                    if can_open {
+                                        last_history_at = Some(now);
+                                        let history_handle = startup_handle.clone();
+                                        let _ = startup_handle.run_on_main_thread(move || {
+                                            cmd_show_history_window(history_handle);
+                                        });
+                                    }
+                                } else {
+                                    last_left_click_at = Some(now);
+                                    last_left_click_pos = Some((cursor.x, cursor.y));
+                                }
+                            }
+
+                            left_click_armed = false;
+                        }
+
+                        if right_button_down {
+                            if right_button_was_down {
+                                if context_menu_armed {
+                                    cancel_shell_taskbar_menu();
+                                }
+                                continue;
+                            }
+
+                            right_button_was_down = true;
+
+                            let mut rect = RECT::default();
+                            if unsafe { GetWindowRect(widget_hwnd, &mut rect) }.is_err() {
+                                context_menu_armed = false;
+                                continue;
+                            }
+
+                            let mut cursor = POINT::default();
+                            if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+                                context_menu_armed = false;
+                                continue;
+                            }
+
+                            context_menu_armed = cursor.x >= rect.left
+                                && cursor.x < rect.right
+                                && cursor.y >= rect.top
+                                && cursor.y < rect.bottom;
+
+                            if context_menu_armed {
+                                cancel_shell_taskbar_menu();
+                            }
+
+                            continue;
+                        }
+
+                        if right_button_was_down && context_menu_armed {
+                            context_menu_armed = false;
+                            right_button_was_down = false;
+                            cancel_shell_taskbar_menu();
+
+                            let now = Instant::now();
+                            let can_open = last_context_menu_at
+                                .map(|last| now.duration_since(last) > Duration::from_millis(350))
+                                .unwrap_or(true);
+
+                            if can_open {
+                                last_context_menu_at = Some(now);
+                                let menu_handle = startup_handle.clone();
+                                let _ = startup_handle.run_on_main_thread(move || {
+                                    let _ = show_widget_context_menu_for_app(&menu_handle);
+                                });
+                            }
+                            continue;
+                        }
+
+                        right_button_was_down = false;
+                        context_menu_armed = false;
+                    }
+                });
+            }
 
             // System tray
             setup_tray(app)?;
@@ -583,7 +782,12 @@ fn main() {
                 let _ = autostart_mgr.disable();
             }
 
-            commands::app_monitor::start_tracker();
+            // App-level network tracking can be slow when Watchman is elevated.
+            // Start it after the UI is already responsive instead of blocking launch.
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(8));
+                commands::app_monitor::start_tracker();
+            });
 
             // Start metrics polling loop
             let app_handle = app.handle().clone();
@@ -641,7 +845,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     TrayIconBuilder::new()
         .icon(icon)
-                    .tooltip("Watchman")
+        .tooltip("Watchman")
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
@@ -1058,6 +1262,7 @@ async fn metrics_loop(app_handle: tauri::AppHandle) {
     let resource_dir = app_handle.path().resource_dir().ok();
     let temperature_probe_paths =
         commands::monitor::resolve_temperature_probe_paths(resource_dir.as_deref());
+    let temperature_probe_ready_at = Instant::now() + Duration::from_secs(12);
 
     loop {
         // Get metrics
@@ -1068,10 +1273,14 @@ async fn metrics_loop(app_handle: tauri::AppHandle) {
             let cpu = commands::monitor::get_cpu_usage(&mut ms);
             let memory = commands::monitor::get_memory_usage(&mut ms);
             let gpu = commands::monitor::get_gpu_usage(&mut ms);
-            let temperatures = commands::monitor::get_temperature_readings(
-                &mut ms,
-                temperature_probe_paths.as_ref(),
-            );
+            let temperatures = if Instant::now() >= temperature_probe_ready_at {
+                commands::monitor::get_temperature_readings(
+                    &mut ms,
+                    temperature_probe_paths.as_ref(),
+                )
+            } else {
+                ms.temperatures.clone()
+            };
             let network = commands::monitor::get_network_stats(&mut ms);
 
             let up = network.uploaded_bytes;
@@ -1175,7 +1384,7 @@ async fn keep_widget_on_top_loop(app_handle: tauri::AppHandle, hwnd_raw: Option<
             }
 
             let (preferred_width, preferred_height) =
-                crate::taskbar_embed::get_window_size(raw).unwrap_or((160, 30));
+                crate::taskbar_embed::get_window_size(raw).unwrap_or((136, 32));
             if let Some(placement) =
                 crate::taskbar_embed::enforce_widget(raw, preferred_width, preferred_height)
             {
@@ -1224,6 +1433,170 @@ fn cmd_show_history_window(app_handle: tauri::AppHandle) {
 }
 
 #[tauri::command]
+fn cmd_open_windows_data_usage_settings() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        open_windows_data_usage_page()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Windows Data Usage settings are only available on Windows.".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_data_usage_page() -> Result<(), String> {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$code = 'using System; using System.Runtime.InteropServices; public static class WatchmanSettingsWindow { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); }'
+Add-Type -TypeDefinition $code
+
+function Open-WatchmanSettingsUri($uri) {
+  Start-Process $uri
+  Start-Sleep -Milliseconds 1200
+}
+
+function Get-WatchmanSettingsRoot {
+  $proc = Get-Process ApplicationFrameHost -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowTitle -like '*Settings*' -and $_.MainWindowHandle -ne 0 } |
+    Select-Object -First 1
+  if (-not $proc) { return $null }
+  [WatchmanSettingsWindow]::ShowWindow([intptr]$proc.MainWindowHandle, 9) | Out-Null
+  [WatchmanSettingsWindow]::SetForegroundWindow([intptr]$proc.MainWindowHandle) | Out-Null
+  return [System.Windows.Automation.AutomationElement]::FromHandle([intptr]$proc.MainWindowHandle)
+}
+
+function Find-WatchmanElementByName($root, $name) {
+  $nameCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $name)
+  $buttonCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+  $exactButtonCond = New-Object System.Windows.Automation.AndCondition($nameCond, $buttonCond)
+  $exactButton = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $exactButtonCond)
+  if ($exactButton) { return $exactButton }
+
+  $exact = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $nameCond)
+  if ($exact) { return $exact }
+
+  $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+  foreach ($element in $all) {
+    if ($element.Current.Name -like "$name*" -and $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button) {
+      return $element
+    }
+  }
+
+  return $null
+}
+
+function Invoke-WatchmanPattern($element) {
+  if (-not $element) { return $false }
+
+  try {
+    $scrollPattern = $element.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern)
+    if ($scrollPattern) {
+      $scrollPattern.ScrollIntoView()
+      Start-Sleep -Milliseconds 120
+    }
+  } catch {}
+
+  try {
+    $invokePattern = $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    if ($invokePattern) {
+      $invokePattern.Invoke()
+      Start-Sleep -Milliseconds 700
+      return $true
+    }
+  } catch {}
+
+  try {
+    $selectionPattern = $element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+    if ($selectionPattern) {
+      $selectionPattern.Select()
+      Start-Sleep -Milliseconds 700
+      return $true
+    }
+  } catch {}
+
+  try {
+    $legacyPattern = $element.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
+    if ($legacyPattern) {
+      $legacyPattern.DoDefaultAction()
+      Start-Sleep -Milliseconds 700
+      return $true
+    }
+  } catch {}
+
+  return $false
+}
+
+function Invoke-WatchmanElement($element) {
+  if (-not $element) { return $false }
+
+  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+  $candidate = $element
+
+  for ($i = 0; $i -lt 8; $i++) {
+    if (Invoke-WatchmanPattern $candidate) {
+      return $true
+    }
+
+    $candidate = $walker.GetParent($candidate)
+    if (-not $candidate) {
+      break
+    }
+  }
+
+  return $false
+}
+
+function Try-OpenDataUsageFromCurrentSettings {
+  for ($i = 0; $i -lt 8; $i++) {
+    $root = Get-WatchmanSettingsRoot
+    if ($root) {
+      $target = Find-WatchmanElementByName $root 'Data usage'
+      if (Invoke-WatchmanElement $target) {
+        return $true
+      }
+    }
+    Start-Sleep -Milliseconds 250
+  }
+  return $false
+}
+
+Open-WatchmanSettingsUri 'ms-settings:network-advancedsettings'
+if (Try-OpenDataUsageFromCurrentSettings) { exit 0 }
+
+Open-WatchmanSettingsUri 'ms-settings:datausage'
+if (Try-OpenDataUsageFromCurrentSettings) { exit 0 }
+
+exit 1
+"#;
+
+    let mut command = std::process::Command::new("powershell.exe");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let status = command
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            script,
+        ])
+        .status()
+        .map_err(|err| format!("Failed to start Windows Settings navigation: {err}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        open::that("ms-settings:datausage")
+            .map_err(|err| format!("Failed to open Windows Data Usage settings: {err}"))
+    }
+}
+
+#[tauri::command]
 fn cmd_toggle_widget_lock(app_handle: tauri::AppHandle, locked: bool) -> bool {
     if let Some(taskbar) = app_handle.get_webview_window("taskbar") {
         // When locked: no drag. When unlocked: allow drag via CSS -webkit-app-region
@@ -1245,6 +1618,161 @@ fn cmd_get_widget_display_mode(
     WidgetDisplayModePayload { network_only }
 }
 
+#[cfg(target_os = "windows")]
+fn read_windows_taskbar_light_theme() -> Option<bool> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let personalize = hkcu
+        .open_subkey_with_flags(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            KEY_READ,
+        )
+        .ok()?;
+    let value: u32 = personalize.get_value("SystemUsesLightTheme").ok()?;
+    Some(value != 0)
+}
+
+#[tauri::command]
+fn cmd_get_taskbar_theme() -> TaskbarThemePayload {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(is_light) = read_windows_taskbar_light_theme() {
+            return TaskbarThemePayload {
+                is_light,
+                source: "windows-system-theme".to_string(),
+            };
+        }
+    }
+
+    TaskbarThemePayload {
+        is_light: false,
+        source: "fallback-dark".to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn handle_widget_menu_action(
+    app_handle: &tauri::AppHandle,
+    widget_state: &Mutex<WidgetDisplayState>,
+    monitor_state: &Mutex<MonitorState>,
+    action: WidgetMenuCommand,
+) {
+    match action {
+        WidgetMenuCommand::OpenDashboard => {
+            show_main_window(app_handle);
+            emit_widget_menu_action(app_handle, Some("dashboard"), None);
+        }
+        WidgetMenuCommand::OpenHistory => {
+            show_main_window(app_handle);
+            emit_widget_menu_action(app_handle, Some("data-usage"), Some("last7days"));
+        }
+        WidgetMenuCommand::ViewToday => {
+            show_main_window(app_handle);
+            emit_widget_menu_action(app_handle, Some("data-usage"), Some("today"));
+        }
+        WidgetMenuCommand::ViewLast7Days => {
+            show_main_window(app_handle);
+            emit_widget_menu_action(app_handle, Some("data-usage"), Some("last7days"));
+        }
+        WidgetMenuCommand::ViewMonthly => {
+            show_main_window(app_handle);
+            emit_widget_menu_action(app_handle, Some("data-usage"), Some("monthly"));
+        }
+        WidgetMenuCommand::ShowNetworkOnly => {
+            if let Ok(mut state) = widget_state.lock() {
+                state.network_only = true;
+            }
+            apply_widget_display_mode(app_handle, true);
+        }
+        WidgetMenuCommand::ShowCpuMem => {
+            if let Ok(mut state) = widget_state.lock() {
+                state.network_only = false;
+            }
+            apply_widget_display_mode(app_handle, false);
+        }
+        WidgetMenuCommand::ResetSessionCounters => {
+            if let Ok(mut state) = monitor_state.lock() {
+                commands::monitor::reset_session_counters(&mut state);
+            }
+            emit_widget_feedback(app_handle, "Session counters reset", "info");
+        }
+        WidgetMenuCommand::Exit => {
+            quit_application(app_handle);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_widget_context_menu_for_app(app_handle: &tauri::AppHandle) -> bool {
+    let taskbar = match app_handle.get_webview_window("taskbar") {
+        Some(window) => window,
+        None => return false,
+    };
+
+    let _widget_hwnd = match taskbar.hwnd() {
+        Ok(hwnd) => HWND(hwnd.0 as isize),
+        Err(_) => return false,
+    };
+
+    let owner_hwnd = if let Some(main_window) = app_handle.get_webview_window("main") {
+        match main_window.hwnd() {
+            Ok(hwnd) => HWND(hwnd.0 as isize),
+            Err(_) => return false,
+        }
+    } else {
+        return false;
+    };
+
+    let Some(widget_state) = app_handle.try_state::<Mutex<WidgetDisplayState>>() else {
+        return false;
+    };
+    let Some(monitor_state) = app_handle.try_state::<Mutex<MonitorState>>() else {
+        return false;
+    };
+
+    let network_only = widget_state
+        .lock()
+        .map(|state| state.network_only)
+        .unwrap_or(false);
+
+    cancel_shell_taskbar_menu();
+    cancel_shell_taskbar_menu_soon();
+
+    let Some(action) = show_widget_context_menu_native(owner_hwnd, network_only) else {
+        cancel_shell_taskbar_menu();
+        cancel_shell_taskbar_menu_soon();
+        return true;
+    };
+
+    cancel_shell_taskbar_menu();
+    cancel_shell_taskbar_menu_soon();
+    handle_widget_menu_action(app_handle, &widget_state, &monitor_state, action);
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn cancel_shell_taskbar_menu() {
+    let class_name = wide_string("Shell_TrayWnd");
+    let shell = unsafe { FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null()) };
+    if shell.0 != 0 {
+        unsafe {
+            let _ = SendMessageW(shell, WM_CANCELMODE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cancel_shell_taskbar_menu_soon() {
+    std::thread::spawn(|| {
+        for delay_ms in [30_u64, 90, 180] {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            cancel_shell_taskbar_menu();
+        }
+    });
+}
+
 #[tauri::command]
 fn cmd_show_widget_context_menu(
     app_handle: tauri::AppHandle,
@@ -1253,69 +1781,9 @@ fn cmd_show_widget_context_menu(
 ) -> bool {
     #[cfg(target_os = "windows")]
     {
-        let taskbar = match app_handle.get_webview_window("taskbar") {
-            Some(window) => window,
-            None => return false,
-        };
-
-        let owner_hwnd = match taskbar.hwnd() {
-            Ok(hwnd) => HWND(hwnd.0 as isize),
-            Err(_) => return false,
-        };
-
-        let network_only = widget_state
-            .lock()
-            .map(|state| state.network_only)
-            .unwrap_or(false);
-
-        let Some(action) = show_widget_context_menu_native(owner_hwnd, network_only) else {
-            return true;
-        };
-
-        match action {
-            WidgetMenuCommand::OpenDashboard => {
-                show_main_window(&app_handle);
-                emit_widget_menu_action(&app_handle, Some("dashboard"), None);
-            }
-            WidgetMenuCommand::OpenHistory => {
-                cmd_show_history_window(app_handle.clone());
-            }
-            WidgetMenuCommand::ViewToday => {
-                show_main_window(&app_handle);
-                emit_widget_menu_action(&app_handle, Some("data-usage"), Some("today"));
-            }
-            WidgetMenuCommand::ViewLast7Days => {
-                show_main_window(&app_handle);
-                emit_widget_menu_action(&app_handle, Some("data-usage"), Some("last7days"));
-            }
-            WidgetMenuCommand::ViewMonthly => {
-                show_main_window(&app_handle);
-                emit_widget_menu_action(&app_handle, Some("data-usage"), Some("monthly"));
-            }
-            WidgetMenuCommand::ShowNetworkOnly => {
-                if let Ok(mut state) = widget_state.lock() {
-                    state.network_only = true;
-                }
-                apply_widget_display_mode(&app_handle, true);
-            }
-            WidgetMenuCommand::ShowCpuMem => {
-                if let Ok(mut state) = widget_state.lock() {
-                    state.network_only = false;
-                }
-                apply_widget_display_mode(&app_handle, false);
-            }
-            WidgetMenuCommand::ResetSessionCounters => {
-                if let Ok(mut state) = monitor_state.lock() {
-                    commands::monitor::reset_session_counters(&mut state);
-                }
-                emit_widget_feedback(&app_handle, "Session counters reset", "info");
-            }
-            WidgetMenuCommand::Exit => {
-                quit_application(&app_handle);
-            }
-        }
-
-        true
+        let _ = widget_state;
+        let _ = monitor_state;
+        show_widget_context_menu_for_app(&app_handle)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1324,5 +1792,25 @@ fn cmd_show_widget_context_menu(
         let _ = widget_state;
         let _ = monitor_state;
         false
+    }
+}
+
+#[tauri::command]
+fn cmd_reset_session_counters(
+    _app_handle: tauri::AppHandle,
+    monitor_state: tauri::State<'_, Mutex<MonitorState>>,
+) -> serde_json::Value {
+    match monitor_state.lock() {
+        Ok(mut state) => {
+            commands::monitor::reset_session_counters(&mut state);
+            serde_json::json!({
+                "success": true,
+                "message": "Current session reset"
+            })
+        }
+        Err(_) => serde_json::json!({
+            "success": false,
+            "message": "Could not reset current session"
+        }),
     }
 }

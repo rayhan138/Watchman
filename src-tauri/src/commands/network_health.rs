@@ -1,8 +1,14 @@
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::task::JoinSet;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, protocol::Message},
+};
 
 use super::config::{save_config_to_path_pub, ConfigState};
 
@@ -15,11 +21,14 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const DEFAULT_LATENCY_TARGET: &str = "8.8.8.8";
 const LATENCY_SAMPLE_COUNT: u32 = 5;
 const LATENCY_TIMEOUT_MS: u64 = 1000;
-const FRIENDLY_SPEED_TEST_SERVER_LABEL: &str = "USA · more coming soon";
-const SPEED_TEST_SERVERS: [&str; 2] = [
-    "https://traffic-monitor-speedtest-production.up.railway.app",
-    "https://traffic-monitor-speedtest.onrender.com",
-];
+const MLAB_LOCATE_URL: &str = "https://locate.measurementlab.net/v2/nearest/ndt/ndt7";
+const MLAB_SOURCE_LABEL: &str = "M-Lab NDT7";
+const NDT7_WEBSOCKET_PROTOCOL: &str = "net.measurementlab.ndt.v7";
+const NDT7_DOWNLOAD_WINDOW: Duration = Duration::from_secs(10);
+const NDT7_UPLOAD_WINDOW: Duration = Duration::from_secs(10);
+const NDT7_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const NDT7_MESSAGE_TIMEOUT: Duration = Duration::from_secs(18);
+const NDT7_UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
 
 fn hidden_cmd(program: &str) -> Command {
     let mut cmd = Command::new(program);
@@ -99,11 +108,22 @@ pub struct SpeedTestResult {
     pub download_speed: f64,
     #[serde(rename = "uploadSpeed")]
     pub upload_speed: f64,
+    #[serde(rename = "downloadMbps")]
+    pub download_mbps: f64,
+    #[serde(rename = "uploadMbps")]
+    pub upload_mbps: f64,
     pub ping: u64,
     pub timestamp: u64,
     pub server: String,
     #[serde(rename = "serverLabel")]
     pub server_label: String,
+    pub source: String,
+    #[serde(rename = "serverCity")]
+    pub server_city: String,
+    #[serde(rename = "serverCountry")]
+    pub server_country: String,
+    #[serde(rename = "dataUsedMb")]
+    pub data_used_mb: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -113,6 +133,8 @@ pub struct SpeedTestResult {
 struct AdapterSnapshot {
     name: String,
     description: String,
+    #[serde(default)]
+    physical_medium: String,
     link_speed: String,
     local_ip: String,
 }
@@ -126,6 +148,64 @@ struct PingStats {
     sent: u32,
     received: u32,
     packet_loss: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MlabLocateResponse {
+    results: Vec<MlabLocateResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MlabLocateResult {
+    machine: String,
+    #[serde(default)]
+    hostname: String,
+    location: MlabLocation,
+    urls: HashMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MlabLocation {
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    country: String,
+}
+
+#[derive(Debug, Clone)]
+struct MlabServer {
+    machine: String,
+    hostname: String,
+    city: String,
+    country: String,
+    download_url: String,
+    upload_url: String,
+}
+
+impl MlabServer {
+    fn host_label(&self) -> String {
+        if self.hostname.is_empty() {
+            self.machine.clone()
+        } else {
+            self.hostname.clone()
+        }
+    }
+
+    fn label(&self) -> String {
+        match (self.city.is_empty(), self.country.is_empty()) {
+            (false, false) => format!("{}, {} · {}", self.city, self.country, MLAB_SOURCE_LABEL),
+            (false, true) => format!("{} · {}", self.city, MLAB_SOURCE_LABEL),
+            (true, false) => format!("{} · {}", self.country, MLAB_SOURCE_LABEL),
+            (true, true) => MLAB_SOURCE_LABEL.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MlabTransferStats {
+    mbps: f64,
+    bytes: u64,
+    min_rtt_ms: Option<u64>,
 }
 
 #[tauri::command]
@@ -194,40 +274,76 @@ pub async fn get_network_overview(
 pub async fn run_speed_test(
     config_state: tauri::State<'_, Mutex<ConfigState>>,
 ) -> Result<SpeedTestResult, String> {
-    let selected_server = match select_speed_test_server().await {
+    let selected_server = match locate_mlab_server().await {
         Ok(server) => server,
         Err(error) => {
             return Ok(SpeedTestResult {
                 download_speed: 0.0,
                 upload_speed: 0.0,
+                download_mbps: 0.0,
+                upload_mbps: 0.0,
                 ping: 0,
                 timestamp: now_ms(),
                 server: String::new(),
-                server_label: "Unavailable".to_string(),
+                server_label: "M-Lab unavailable".to_string(),
+                source: MLAB_SOURCE_LABEL.to_string(),
+                server_city: String::new(),
+                server_country: String::new(),
+                data_used_mb: 0.0,
                 error: Some(error),
             });
         }
     };
 
-    let (server_index, server, ping) = selected_server;
+    let download_result = measure_mlab_download(&selected_server.download_url).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let upload_result = measure_mlab_upload(&selected_server.upload_url).await;
 
-    // Give the chosen server a tiny pause before the sustained transfer tests.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let download_speed = measure_download(&server).await.unwrap_or(0.0);
-    let upload_speed = measure_upload(&server).await.unwrap_or(0.0);
-
-    let result = SpeedTestResult {
-        download_speed,
-        upload_speed,
-        ping,
-        timestamp: now_ms(),
-        server: server.clone(),
-        server_label: speed_test_server_label(&server),
-        error: None,
+    let mut errors = Vec::new();
+    let download = match download_result {
+        Ok(stats) => stats,
+        Err(error) => {
+            errors.push(format!("download: {error}"));
+            MlabTransferStats::default()
+        }
+    };
+    let upload = match upload_result {
+        Ok(stats) => stats,
+        Err(error) => {
+            errors.push(format!("upload: {error}"));
+            MlabTransferStats::default()
+        }
     };
 
-    persist_speed_test_result(&config_state, server_index, &result);
+    let ping = download
+        .min_rtt_ms
+        .or(upload.min_rtt_ms)
+        .unwrap_or_default();
+    let data_used_mb = (download.bytes + upload.bytes) as f64 / (1024.0 * 1024.0);
+
+    let result = SpeedTestResult {
+        // Keep the legacy fields in MB/s so older saved results and frontend
+        // fallbacks remain readable while Mbps becomes the primary display.
+        download_speed: download.mbps / 8.0,
+        upload_speed: upload.mbps / 8.0,
+        download_mbps: download.mbps,
+        upload_mbps: upload.mbps,
+        ping,
+        timestamp: now_ms(),
+        server: selected_server.host_label(),
+        server_label: selected_server.label(),
+        source: MLAB_SOURCE_LABEL.to_string(),
+        server_city: selected_server.city.clone(),
+        server_country: selected_server.country.clone(),
+        data_used_mb,
+        error: if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        },
+    };
+
+    persist_speed_test_result(&config_state, &result);
     Ok(result)
 }
 
@@ -296,52 +412,24 @@ fn collect_connection_details() -> SignalStrength {
     let adapter = fetch_primary_adapter().unwrap_or_else(|_| AdapterSnapshot {
         name: String::new(),
         description: String::new(),
+        physical_medium: String::new(),
         link_speed: String::new(),
         local_ip: String::new(),
     });
 
-    let connection_type = classify_connection_type(&adapter.name, &adapter.description);
+    let connection_type = classify_connection_type(
+        &adapter.name,
+        &adapter.description,
+        &adapter.physical_medium,
+    );
     let wifi_details = fetch_wifi_details().unwrap_or_default();
 
-    if connection_type == "wifi" {
-        if let Some((ssid, percentage, adapter_name, adapter_description, link_speed)) = wifi_details {
-            let quality = classify_signal_quality(percentage);
-            return SignalStrength {
-                percentage,
-                bars: signal_bars(percentage),
-                quality: quality.to_string(),
-                connection_type: "wifi".to_string(),
-                adapter_name: if adapter_name.is_empty() {
-                    adapter.name
-                } else {
-                    adapter_name
-                },
-                adapter_description: if adapter_description.is_empty() {
-                    adapter.description
-                } else {
-                    adapter_description
-                },
-                ssid,
-                link_speed: if link_speed.is_empty() {
-                    adapter.link_speed
-                } else {
-                    link_speed
-                },
-                local_ip: adapter.local_ip,
-            };
+    // Only let Wi-Fi details override when the primary adapter is not clearly
+    // wired. Ethernet machines can keep Wi-Fi connected in the background.
+    if connection_type != "ethernet" {
+        if let Some(wifi) = wifi_details {
+            return build_wifi_signal(adapter, wifi);
         }
-
-        return SignalStrength {
-            percentage: 0,
-            bars: 0,
-            quality: "unknown".to_string(),
-            connection_type: "wifi".to_string(),
-            adapter_name: adapter.name,
-            adapter_description: adapter.description,
-            ssid: String::new(),
-            link_speed: adapter.link_speed,
-            local_ip: adapter.local_ip,
-        };
     }
 
     if connection_type == "cellular" {
@@ -365,33 +453,6 @@ fn collect_connection_details() -> SignalStrength {
         }
     }
 
-    if let Some((ssid, percentage, adapter_name, adapter_description, link_speed)) = wifi_details {
-        let quality = classify_signal_quality(percentage);
-        return SignalStrength {
-            percentage,
-            bars: signal_bars(percentage),
-            quality: quality.to_string(),
-            connection_type: "wifi".to_string(),
-            adapter_name: if adapter_name.is_empty() {
-                adapter.name
-            } else {
-                adapter_name
-            },
-            adapter_description: if adapter_description.is_empty() {
-                adapter.description
-            } else {
-                adapter_description
-            },
-            ssid,
-            link_speed: if link_speed.is_empty() {
-                adapter.link_speed
-            } else {
-                link_speed
-            },
-            local_ip: adapter.local_ip,
-        };
-    }
-
     SignalStrength {
         percentage: 0,
         bars: 0,
@@ -411,7 +472,42 @@ fn collect_connection_details() -> SignalStrength {
     }
 }
 
-fn build_health_summary(latency: &LatencyResult, connection: &SignalStrength) -> NetworkHealthSummary {
+fn build_wifi_signal(
+    adapter: AdapterSnapshot,
+    wifi: (String, u32, String, String, String),
+) -> SignalStrength {
+    let (ssid, percentage, adapter_name, adapter_description, link_speed) = wifi;
+    let quality = classify_signal_quality(percentage);
+
+    SignalStrength {
+        percentage,
+        bars: signal_bars(percentage),
+        quality: quality.to_string(),
+        connection_type: "wifi".to_string(),
+        adapter_name: if adapter_name.is_empty() {
+            adapter.name
+        } else {
+            adapter_name
+        },
+        adapter_description: if adapter_description.is_empty() {
+            adapter.description
+        } else {
+            adapter_description
+        },
+        ssid,
+        link_speed: if link_speed.is_empty() {
+            adapter.link_speed
+        } else {
+            link_speed
+        },
+        local_ip: adapter.local_ip,
+    }
+}
+
+fn build_health_summary(
+    latency: &LatencyResult,
+    connection: &SignalStrength,
+) -> NetworkHealthSummary {
     let (level, color) = if latency.samples_received == 0 {
         ("Offline", "#ef4444")
     } else if latency.packet_loss >= 20.0 || latency.latency >= 180 || latency.jitter >= 50 {
@@ -644,7 +740,7 @@ $adapter = $null
 if ($route) {
   $adapter = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue |
     Where-Object Status -eq 'Up' |
-    Select-Object -First 1 Name, InterfaceDescription, LinkSpeed, ifIndex
+    Select-Object -First 1 Name, InterfaceDescription, LinkSpeed, ifIndex, NdisPhysicalMedium, MediaType
 }
 
 if (-not $adapter) {
@@ -656,7 +752,7 @@ if (-not $adapter) {
     } |
     Sort-Object InterfaceMetric |
     Select-Object -First 1 -ExpandProperty NetAdapter |
-    Select-Object -First 1 Name, InterfaceDescription, LinkSpeed, ifIndex
+    Select-Object -First 1 Name, InterfaceDescription, LinkSpeed, ifIndex, NdisPhysicalMedium, MediaType
 }
 
 if ($adapter) {
@@ -667,6 +763,7 @@ if ($adapter) {
   [pscustomobject]@{
     name = $adapter.Name
     description = $adapter.InterfaceDescription
+    physicalMedium = if ($adapter.NdisPhysicalMedium) { [string]$adapter.NdisPhysicalMedium } elseif ($adapter.MediaType) { [string]$adapter.MediaType } else { '' }
     linkSpeed = [string]$adapter.LinkSpeed
     localIp = if ($ip) { $ip } else { '' }
   } | ConvertTo-Json -Compress
@@ -687,33 +784,60 @@ if ($adapter) {
     serde_json::from_str::<AdapterSnapshot>(json).map_err(|e| e.to_string())
 }
 
-fn classify_connection_type(name: &str, description: &str) -> &'static str {
-    let combined = format!("{} {}", name, description).to_lowercase();
-    if combined.contains("wi-fi")
-        || combined.contains("wifi")
-        || combined.contains("wireless")
-        || combined.contains("wlan")
-        || combined.contains("802.11")
-    {
+fn classify_connection_type(name: &str, description: &str, physical_medium: &str) -> &'static str {
+    let combined = format!("{name} {description} {physical_medium}").to_ascii_lowercase();
+
+    if has_wifi_indicator(&combined) {
         "wifi"
-    } else if combined.contains("wwan")
-        || combined.contains("cellular")
-        || combined.contains("mobile")
-        || combined.contains("mobile broadband")
-        || combined.contains("lte")
-        || combined.contains("5g")
-        || combined.contains("4g")
-    {
+    } else if has_strong_cellular_indicator(&combined) {
         "cellular"
-    } else if combined.contains("ethernet")
-        || combined.contains("gbe")
-        || combined.contains("lan")
-        || combined.contains("pcie")
-    {
+    } else if has_ethernet_indicator(&combined) {
         "ethernet"
+    } else if has_cellular_indicator(&combined) {
+        "cellular"
     } else {
         "unknown"
     }
+}
+
+fn has_wifi_indicator(value: &str) -> bool {
+    value.contains("wi-fi")
+        || value.contains("wifi")
+        || value.contains("wireless lan")
+        || value.contains("wlan")
+        || value.contains("802.11")
+}
+
+fn has_ethernet_indicator(value: &str) -> bool {
+    value.contains("ethernet")
+        || value.contains("802.3")
+        || value.contains("gbe")
+        || value.contains("gigabit")
+        || value.contains("realtek pcie")
+        || value.contains("intel ethernet")
+        || value.contains("killer e")
+        || has_token(value, "lan")
+}
+
+fn has_cellular_indicator(value: &str) -> bool {
+    has_strong_cellular_indicator(value) || has_token(value, "5g") || has_token(value, "4g")
+}
+
+fn has_strong_cellular_indicator(value: &str) -> bool {
+    value.contains("wwan")
+        || value.contains("wireless wan")
+        || value.contains("cellular")
+        || value.contains("mobile broadband")
+        || value.contains("mbim")
+        || value.contains("modem")
+        || value.contains("sim")
+        || has_token(value, "lte")
+}
+
+fn has_token(value: &str, token: &str) -> bool {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == token)
 }
 
 fn connection_label(connection: &SignalStrength) -> String {
@@ -731,158 +855,309 @@ fn connection_label(connection: &SignalStrength) -> String {
     }
 }
 
-async fn select_speed_test_server() -> Result<(usize, String, u64), String> {
-    let mut best: Option<(usize, String, u64)> = None;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    for (index, server) in SPEED_TEST_SERVERS.iter().enumerate() {
-        if let Ok(ping) = measure_http_ping(server, 3).await {
-            match &best {
-                Some((_, _, best_ping)) if *best_ping <= ping => {}
-                _ => best = Some((index, (*server).to_string(), ping)),
-            }
-        }
+    #[test]
+    fn classifies_gbe_adapters_as_ethernet_not_cellular() {
+        assert_eq!(
+            classify_connection_type("Ethernet", "Realtek PCIe 2.5GbE Family Controller", "802.3"),
+            "ethernet"
+        );
+        assert_eq!(
+            classify_connection_type("Ethernet", "Intel(R) Ethernet Controller I225-V", "802.3"),
+            "ethernet"
+        );
     }
 
-    best.ok_or_else(|| "No speed test server responded".to_string())
+    #[test]
+    fn classifies_real_mobile_broadband_as_cellular() {
+        assert_eq!(
+            classify_connection_type(
+                "Cellular",
+                "Fibocom LTE Mobile Broadband Adapter",
+                "Wireless WAN"
+            ),
+            "cellular"
+        );
+    }
+
+    #[test]
+    fn classifies_wifi_adapters_as_wifi() {
+        assert_eq!(
+            classify_connection_type("Wi-Fi", "Intel(R) Wi-Fi 6 AX201 160MHz", "Native 802.11"),
+            "wifi"
+        );
+    }
 }
 
-async fn measure_http_ping(server: &str, samples: usize) -> Result<u64, String> {
+async fn locate_mlab_server() -> Result<MlabServer, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let mut values = Vec::new();
-    for _ in 0..samples {
-        let start = Instant::now();
-        let response = client
-            .get(format!("{}/ping", server))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if response.status().is_success() {
-            values.push(start.elapsed().as_millis() as u64);
+    let response = client
+        .get(MLAB_LOCATE_URL)
+        .send()
+        .await
+        .map_err(|e| format!("M-Lab locate request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("M-Lab locate returned an error: {e}"))?
+        .json::<MlabLocateResponse>()
+        .await
+        .map_err(|e| format!("M-Lab locate response was unreadable: {e}"))?;
+
+    for result in response.results {
+        let download_url = result
+            .urls
+            .get("wss:///ndt/v7/download")
+            .or_else(|| result.urls.get("ws:///ndt/v7/download"))
+            .cloned();
+        let upload_url = result
+            .urls
+            .get("wss:///ndt/v7/upload")
+            .or_else(|| result.urls.get("ws:///ndt/v7/upload"))
+            .cloned();
+
+        if let (Some(download_url), Some(upload_url)) = (download_url, upload_url) {
+            return Ok(MlabServer {
+                machine: result.machine,
+                hostname: result.hostname,
+                city: result.location.city,
+                country: result.location.country,
+                download_url,
+                upload_url,
+            });
         }
     }
 
-    if values.is_empty() {
-        return Err("Server ping failed".to_string());
-    }
-
-    values.sort_unstable();
-    Ok(values[values.len() / 2])
+    Err("M-Lab did not return a usable NDT7 server".to_string())
 }
 
-async fn measure_download(server: &str) -> Result<f64, String> {
-    const WORKERS: usize = 2;
-    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
-    const TEST_WINDOW: Duration = Duration::from_secs(6);
+async fn connect_ndt7(
+    url: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| format!("Invalid M-Lab WebSocket URL: {e}"))?;
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        NDT7_WEBSOCKET_PROTOCOL
+            .parse()
+            .map_err(|e| format!("Invalid NDT7 protocol header: {e}"))?,
+    );
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(25))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let url = format!("{}/download?size={}", server, CHUNK_SIZE);
+    let (socket, _) = tokio::time::timeout(NDT7_CONNECT_TIMEOUT, connect_async(request))
+        .await
+        .map_err(|_| "M-Lab WebSocket connection timed out".to_string())?
+        .map_err(|e| format!("M-Lab WebSocket connection failed: {e}"))?;
+
+    Ok(socket)
+}
+
+async fn measure_mlab_download(url: &str) -> Result<MlabTransferStats, String> {
+    let mut socket = connect_ndt7(url).await?;
     let started = Instant::now();
-    let mut tasks = JoinSet::new();
+    let mut total_bytes = 0u64;
+    let mut server_mbps = None;
+    let mut min_rtt_ms = None;
 
-    for _ in 0..WORKERS {
-        let client = client.clone();
-        let url = url.clone();
-        tasks.spawn(async move {
-            let worker_start = Instant::now();
-            let mut total_bytes = 0u64;
-
-            while worker_start.elapsed() < TEST_WINDOW {
-                let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
-                let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    while started.elapsed() < NDT7_DOWNLOAD_WINDOW {
+        match tokio::time::timeout(NDT7_MESSAGE_TIMEOUT, socket.next()).await {
+            Ok(Some(Ok(Message::Binary(bytes)))) => {
                 total_bytes += bytes.len() as u64;
             }
-
-            Ok::<u64, String>(total_bytes)
-        });
-    }
-
-    let mut total_bytes = 0u64;
-    while let Some(result) = tasks.join_next().await {
-        match result.map_err(|e| e.to_string())? {
-            Ok(bytes) => total_bytes += bytes,
-            Err(error) if total_bytes == 0 => return Err(error),
-            Err(_) => {}
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let measurement = parse_ndt7_measurement(&text);
+                server_mbps = measurement.mbps.or(server_mbps);
+                min_rtt_ms = measurement.min_rtt_ms.or(min_rtt_ms);
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => {
+                if total_bytes == 0 {
+                    return Err(error.to_string());
+                }
+                break;
+            }
+            Err(_) => break,
         }
     }
 
     let elapsed = started.elapsed().as_secs_f64();
     if elapsed <= 0.0 || total_bytes == 0 {
-        return Err("Download measurement did not transfer data".to_string());
+        return Err("M-Lab download did not transfer data".to_string());
     }
 
-    Ok(total_bytes as f64 / (1024.0 * 1024.0) / elapsed)
+    let _ = socket.close(None).await;
+    Ok(MlabTransferStats {
+        mbps: server_mbps.unwrap_or_else(|| bytes_to_mbps(total_bytes, elapsed)),
+        bytes: total_bytes,
+        min_rtt_ms,
+    })
 }
 
-async fn measure_upload(server: &str) -> Result<f64, String> {
-    const WORKERS: usize = 2;
-    const CHUNK_SIZE: usize = 3 * 1024 * 1024;
-    const TEST_WINDOW: Duration = Duration::from_secs(5);
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(25))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let payload = vec![0u8; CHUNK_SIZE];
-    let url = format!("{}/upload", server);
+async fn measure_mlab_upload(url: &str) -> Result<MlabTransferStats, String> {
+    let socket = connect_ndt7(url).await?;
+    let (mut write, mut read) = socket.split();
+    let payload = vec![0u8; NDT7_UPLOAD_CHUNK_SIZE];
     let started = Instant::now();
-    let mut tasks = JoinSet::new();
-
-    for _ in 0..WORKERS {
-        let client = client.clone();
-        let url = url.clone();
-        let payload = payload.clone();
-        tasks.spawn(async move {
-            let worker_start = Instant::now();
-            let mut total_bytes = 0u64;
-
-            while worker_start.elapsed() < TEST_WINDOW {
-                client
-                    .post(&url)
-                    .header("Content-Type", "application/octet-stream")
-                    .body(payload.clone())
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                total_bytes += CHUNK_SIZE as u64;
-            }
-
-            Ok::<u64, String>(total_bytes)
-        });
-    }
-
     let mut total_bytes = 0u64;
-    while let Some(result) = tasks.join_next().await {
-        match result.map_err(|e| e.to_string())? {
-            Ok(bytes) => total_bytes += bytes,
-            Err(error) if total_bytes == 0 => return Err(error),
-            Err(_) => {}
+    let mut server_mbps = None;
+    let mut min_rtt_ms = None;
+
+    while started.elapsed() < NDT7_UPLOAD_WINDOW {
+        tokio::select! {
+            send_result = write.send(Message::Binary(payload.clone().into())) => {
+                send_result.map_err(|e| format!("M-Lab upload send failed: {e}"))?;
+                total_bytes += payload.len() as u64;
+            }
+            message = read.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        let measurement = parse_ndt7_measurement(&text);
+                        server_mbps = measurement.mbps.or(server_mbps);
+                        min_rtt_ms = measurement.min_rtt_ms.or(min_rtt_ms);
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        if total_bytes == 0 {
+                            return Err(error.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    let elapsed = started.elapsed().as_secs_f64();
-    if elapsed <= 0.0 || total_bytes == 0 {
-        return Err("Upload measurement did not transfer data".to_string());
+    let _ = write.close().await;
+    let drain_started = Instant::now();
+    while drain_started.elapsed() < Duration::from_millis(900) {
+        match tokio::time::timeout(Duration::from_millis(200), read.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let measurement = parse_ndt7_measurement(&text);
+                server_mbps = measurement.mbps.or(server_mbps);
+                min_rtt_ms = measurement.min_rtt_ms.or(min_rtt_ms);
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
     }
 
-    Ok(total_bytes as f64 / (1024.0 * 1024.0) / elapsed)
+    let elapsed = started
+        .elapsed()
+        .as_secs_f64()
+        .min(NDT7_UPLOAD_WINDOW.as_secs_f64());
+    if elapsed <= 0.0 || total_bytes == 0 {
+        return Err("M-Lab upload did not transfer data".to_string());
+    }
+
+    Ok(MlabTransferStats {
+        mbps: server_mbps.unwrap_or_else(|| bytes_to_mbps(total_bytes, elapsed)),
+        bytes: total_bytes,
+        min_rtt_ms,
+    })
+}
+
+#[derive(Default)]
+struct ParsedNdt7Measurement {
+    mbps: Option<f64>,
+    min_rtt_ms: Option<u64>,
+}
+
+fn parse_ndt7_measurement(text: &str) -> ParsedNdt7Measurement {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return ParsedNdt7Measurement::default();
+    };
+
+    ParsedNdt7Measurement {
+        mbps: find_app_info_rate_mbps(&value),
+        min_rtt_ms: find_number_by_key(&value, "MinRTT")
+            .or_else(|| find_number_by_key(&value, "RTT"))
+            .and_then(normalize_rtt_ms),
+    }
+}
+
+fn find_app_info_rate_mbps(value: &Value) -> Option<f64> {
+    if let Some(app_info) = find_object_by_key(value, "AppInfo") {
+        let bytes = find_number_by_key(app_info, "NumBytes")?;
+        let elapsed = find_number_by_key(app_info, "ElapsedTime")?;
+        if bytes > 0.0 && elapsed > 0.0 {
+            return Some(bytes_to_mbps(bytes as u64, elapsed / 1_000_000.0));
+        }
+    }
+    None
+}
+
+fn find_object_by_key<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => {
+            if let Some(found) = map.get(key) {
+                return Some(found);
+            }
+            map.values()
+                .find_map(|child| find_object_by_key(child, key))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_object_by_key(child, key)),
+        _ => None,
+    }
+}
+
+fn find_number_by_key(value: &Value, key: &str) -> Option<f64> {
+    match value {
+        Value::Object(map) => {
+            if let Some(found) = map.get(key).and_then(Value::as_f64) {
+                return Some(found);
+            }
+            map.values()
+                .find_map(|child| find_number_by_key(child, key))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_number_by_key(child, key)),
+        _ => None,
+    }
+}
+
+fn bytes_to_mbps(bytes: u64, elapsed_seconds: f64) -> f64 {
+    if elapsed_seconds <= 0.0 {
+        0.0
+    } else {
+        (bytes as f64 * 8.0) / elapsed_seconds / 1_000_000.0
+    }
+}
+
+fn normalize_rtt_ms(raw: f64) -> Option<u64> {
+    let rtt = if raw > 1000.0 {
+        (raw / 1000.0).round()
+    } else {
+        raw.round()
+    };
+
+    if rtt > 0.0 {
+        Some(rtt as u64)
+    } else {
+        None
+    }
 }
 
 fn persist_speed_test_result(
     config_state: &tauri::State<'_, Mutex<ConfigState>>,
-    server_index: usize,
     result: &SpeedTestResult,
 ) {
     if let Ok(mut s) = config_state.lock() {
         if let Ok(serialized) = serde_json::to_value(result) {
             s.config.speed_test.last_run = result.timestamp;
-            s.config.speed_test.last_server_index = server_index;
+            s.config.speed_test.last_server_index = 0;
             s.config.speed_test.results.push(serialized);
             if s.config.speed_test.results.len() > 20 {
                 let excess = s.config.speed_test.results.len() - 20;
@@ -893,30 +1168,27 @@ fn persist_speed_test_result(
     }
 }
 
-fn speed_test_server_label(server: &str) -> String {
-    let _ = server;
-    FRIENDLY_SPEED_TEST_SERVER_LABEL.to_string()
-}
-
 fn sanitize_speed_test_result(mut value: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "serverLabel".to_string(),
-            serde_json::Value::String(FRIENDLY_SPEED_TEST_SERVER_LABEL.to_string()),
-        );
-
-        if let Some(raw_server) = obj.get("server").and_then(|value| value.as_str()) {
-            let normalized = raw_server.to_lowercase();
-            if normalized.contains("traffic-monitor-speedtest")
-                || normalized.contains("railway.app")
-                || normalized.contains("onrender.com")
-            {
-                obj.insert(
-                    "server".to_string(),
-                    serde_json::Value::String(FRIENDLY_SPEED_TEST_SERVER_LABEL.to_string()),
-                );
-            }
+        let is_previous_watchman_test =
+            !obj.contains_key("source") || !obj.contains_key("downloadMbps");
+        if is_previous_watchman_test {
+            obj.insert(
+                "server".to_string(),
+                serde_json::Value::String(String::new()),
+            );
+            obj.insert(
+                "serverLabel".to_string(),
+                serde_json::Value::String("Previous Watchman test".to_string()),
+            );
+            obj.insert(
+                "source".to_string(),
+                serde_json::Value::String("Previous Watchman test".to_string()),
+            );
         }
+
+        obj.entry("source")
+            .or_insert_with(|| serde_json::Value::String(MLAB_SOURCE_LABEL.to_string()));
     }
     value
 }

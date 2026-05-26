@@ -1,8 +1,6 @@
 /**
- * Tauri Bridge — Compatibility shim that maps the old Electron `window.systemAPI`
- * interface to Tauri's `invoke()` and `listen()` APIs.
- * 
- * This means renderer.js needs ZERO changes — it continues using window.systemAPI.
+ * Tauri Bridge - exposes the renderer `window.systemAPI` interface through
+ * Tauri's `invoke()` and `listen()` APIs.
  */
 
 (function() {
@@ -12,12 +10,13 @@
   const { listen } = window.__TAURI__.event;
   const { getCurrentWindow } = window.__TAURI__.window;
 
-  // Build the systemAPI object that mirrors the Electron preload bridge
+  // Build the systemAPI object used by the renderer.
   window.systemAPI = {
     // ====== System Monitoring ======
     getCpuUsage: () => invoke('cmd_get_cpu_usage'),
     getMemoryUsage: () => invoke('cmd_get_memory_usage'),
     getNetworkStats: () => invoke('cmd_get_network_stats'),
+    resetSessionCounters: () => invoke('cmd_reset_session_counters'),
     getDiskUsage: () => invoke('cmd_get_disk_usage'),
     getTemperatureReadings: () => invoke('cmd_get_temperature_readings'),
     getNetworkInterfaces: () => invoke('cmd_get_network_interfaces'),
@@ -52,6 +51,7 @@
     getRemainingAllowance: () => invoke('get_remaining_allowance'),
     getDataThresholds: () => invoke('get_data_thresholds'),
     compareUsage: (period) => invoke('compare_usage', { period }),
+    openWindowsDataUsageSettings: () => invoke('cmd_open_windows_data_usage_settings'),
 
     // ====== Profiles ======
     getProfiles: () => invoke('get_profiles'),
@@ -103,6 +103,4 @@
       });
     }
   });
-
-  console.log('[Tauri Bridge] window.systemAPI initialized');
 })();

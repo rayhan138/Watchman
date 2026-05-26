@@ -212,6 +212,7 @@ mod windows_network {
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     const NO_ERROR: u32 = 0;
     const OCTET_COUNTER_RANGE: u64 = u32::MAX as u64 + 1;
+    const BEST_ROUTE_PROBES: [[u8; 4]; 2] = [[8, 8, 4, 4], [1, 0, 0, 1]];
 
     pub const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
     pub const IF_TYPE_TUNNEL: u32 = 131;
@@ -255,6 +256,7 @@ mod windows_network {
     #[link(name = "iphlpapi")]
     unsafe extern "system" {
         fn GetIfTable(table: *mut MibIfTable, size: *mut u32, order: i32) -> u32;
+        fn GetBestInterface(dest_addr: u32, best_if_index: *mut u32) -> u32;
     }
 
     #[derive(Clone, Debug)]
@@ -298,6 +300,19 @@ mod windows_network {
                 tx_bytes: row.dw_out_octets as u64,
             })
             .collect())
+    }
+
+    pub fn get_best_interface_index() -> Option<u32> {
+        for probe in BEST_ROUTE_PROBES {
+            let mut best_if_index = 0u32;
+            let dest_addr = u32::from_be_bytes(probe);
+            let status = unsafe { GetBestInterface(dest_addr, &mut best_if_index) };
+            if status == NO_ERROR && best_if_index != 0 {
+                return Some(best_if_index);
+            }
+        }
+
+        None
     }
 
     fn is_active_interface(row: &MibIfRow) -> bool {
@@ -505,10 +520,7 @@ mod windows_gpu {
                 }
             }
 
-            let overall = per_gpu_overall
-                .values()
-                .copied()
-                .fold(0.0, f64::max);
+            let overall = per_gpu_overall.values().copied().fold(0.0, f64::max);
 
             Ok(Some(GpuUsageSnapshot {
                 overall: round_percent(overall),
@@ -531,8 +543,11 @@ mod windows_gpu {
             };
             refreshed_paths.sort();
 
-            let mut current_paths: Vec<String> =
-                self.counters.iter().map(|counter| counter.path.clone()).collect();
+            let mut current_paths: Vec<String> = self
+                .counters
+                .iter()
+                .map(|counter| counter.path.clone())
+                .collect();
             current_paths.sort();
 
             if refreshed_paths == current_paths {
@@ -821,11 +836,15 @@ pub struct NetworkInterface {
     #[serde(rename = "ifaceName")]
     pub iface_name: String,
     pub ip4: String,
+    #[serde(rename = "ip4subnet")]
+    pub ip4subnet: String,
+    pub ip6: String,
     pub mac: String,
     #[serde(rename = "type")]
     pub iface_type: String,
     pub speed: u64,
     pub operstate: String,
+    pub dhcp: bool,
     pub internal: bool,
 }
 
@@ -870,7 +889,6 @@ pub struct MonitorState {
     pub initial_rx: Option<u64>,
     pub initial_tx: Option<u64>,
     pub prev_time: Instant,
-    pub is_connected: bool,
     pub prev_interfaces: HashMap<u32, CounterSnapshot>,
     pub runtime_downloaded: u64,
     pub runtime_uploaded: u64,
@@ -896,7 +914,6 @@ impl MonitorState {
             initial_rx: None,
             initial_tx: None,
             prev_time: Instant::now(),
-            is_connected: true,
             prev_interfaces: HashMap::new(),
             runtime_downloaded: 0,
             runtime_uploaded: 0,
@@ -912,7 +929,9 @@ impl MonitorState {
     }
 }
 
-pub fn resolve_temperature_probe_paths(resource_dir: Option<&Path>) -> Option<TemperatureProbePaths> {
+pub fn resolve_temperature_probe_paths(
+    resource_dir: Option<&Path>,
+) -> Option<TemperatureProbePaths> {
     let dev_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let script_candidates = [
         resource_dir.map(|dir| dir.join("scripts").join("temperature_probe.ps1")),
@@ -925,8 +944,14 @@ pub fn resolve_temperature_probe_paths(resource_dir: Option<&Path>) -> Option<Te
         Some(dev_root.join("vendor").join("libre-hardware-monitor")),
     ];
 
-    let script_path = script_candidates.into_iter().flatten().find(|path| path.exists())?;
-    let sensor_root = root_candidates.into_iter().flatten().find(|path| path.exists())?;
+    let script_path = script_candidates
+        .into_iter()
+        .flatten()
+        .find(|path| path.exists())?;
+    let sensor_root = root_candidates
+        .into_iter()
+        .flatten()
+        .find(|path| path.exists())?;
 
     Some(TemperatureProbePaths {
         script_path,
@@ -960,7 +985,9 @@ pub fn get_temperature_readings(
     }
 }
 
-fn query_temperature_readings(paths: &TemperatureProbePaths) -> Result<TemperatureReadings, String> {
+fn query_temperature_readings(
+    paths: &TemperatureProbePaths,
+) -> Result<TemperatureReadings, String> {
     if !paths.script_path.exists() {
         return Err(format!(
             "Temperature probe script missing: {}",
@@ -1005,8 +1032,8 @@ fn query_temperature_readings(paths: &TemperatureProbePaths) -> Result<Temperatu
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut readings: TemperatureReadings =
-        serde_json::from_str(stdout.trim()).map_err(|err| format!("Invalid temperature JSON: {err}"))?;
+    let mut readings: TemperatureReadings = serde_json::from_str(stdout.trim())
+        .map_err(|err| format!("Invalid temperature JSON: {err}"))?;
 
     readings.cpu = normalize_temperature(readings.cpu);
     readings.gpu = normalize_temperature(readings.gpu);
@@ -1259,12 +1286,14 @@ pub fn get_network_stats(state: &mut MonitorState) -> NetworkStats {
 
 #[cfg(target_os = "windows")]
 fn get_windows_network_stats(state: &mut MonitorState) -> Option<NetworkStats> {
-    use windows_network::{diff_counter, get_interfaces};
+    use windows_network::{diff_counter, get_best_interface_index, get_interfaces};
 
     let samples = match get_interfaces() {
         Ok(samples) => samples,
         Err(_) => return None,
     };
+    let preferred_index = get_best_interface_index()
+        .filter(|preferred| samples.iter().any(|sample| sample.index == *preferred));
 
     let now = Instant::now();
     let elapsed_ms = now.duration_since(state.prev_time).as_millis() as f64;
@@ -1275,17 +1304,25 @@ fn get_windows_network_stats(state: &mut MonitorState) -> Option<NetworkStats> {
     let mut interfaces = Vec::with_capacity(samples.len());
 
     for sample in samples {
-        if let Some(previous) = state.prev_interfaces.get(&sample.index) {
-            downloaded_bytes += diff_counter(sample.rx_bytes, previous.rx_bytes);
-            uploaded_bytes += diff_counter(sample.tx_bytes, previous.tx_bytes);
+        let use_for_bandwidth = preferred_index
+            .map(|preferred| preferred == sample.index)
+            .unwrap_or(true);
+
+        if use_for_bandwidth {
+            if let Some(previous) = state.prev_interfaces.get(&sample.index) {
+                downloaded_bytes += diff_counter(sample.rx_bytes, previous.rx_bytes);
+                uploaded_bytes += diff_counter(sample.tx_bytes, previous.tx_bytes);
+            }
         }
 
+        let display_name = if sample.description.is_empty() {
+            sample.name.clone()
+        } else {
+            sample.description.clone()
+        };
+
         interfaces.push(InterfaceStat {
-            iface: if sample.description.is_empty() {
-                sample.name.clone()
-            } else {
-                sample.description.clone()
-            },
+            iface: display_name,
             rx_bytes: sample.rx_bytes,
             tx_bytes: sample.tx_bytes,
         });
@@ -1324,6 +1361,294 @@ fn get_windows_network_stats(state: &mut MonitorState) -> Option<NetworkStats> {
     })
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Debug, Deserialize)]
+struct PowerShellNetworkInterface {
+    alias: String,
+    description: String,
+    #[serde(default, rename = "type")]
+    iface_type: String,
+    #[serde(default)]
+    mac: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default, rename = "linkSpeed")]
+    link_speed: String,
+    #[serde(default)]
+    ipv4: String,
+    #[serde(default, rename = "ipv4Prefix")]
+    ipv4_prefix: Option<u8>,
+    #[serde(default)]
+    ipv6: String,
+    #[serde(default)]
+    dhcp: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_network_interfaces() -> Result<Vec<NetworkInterface>, String> {
+    let script = r#"
+$adapters = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | ForEach-Object {
+  $adapter = $_
+  $cfg = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue
+  [pscustomobject]@{
+    alias = $adapter.Name
+    description = $adapter.InterfaceDescription
+    type = if ($adapter.NdisPhysicalMedium) { [string]$adapter.NdisPhysicalMedium } elseif ($adapter.MediaType) { [string]$adapter.MediaType } else { '' }
+    mac = [string]$adapter.MacAddress
+    status = [string]$adapter.Status
+    linkSpeed = [string]$adapter.LinkSpeed
+    ipv4 = if ($cfg -and $cfg.IPv4Address) { ($cfg.IPv4Address | Select-Object -ExpandProperty IPAddress -First 1) } else { '' }
+    ipv4Prefix = if ($cfg -and $cfg.IPv4Address) { ($cfg.IPv4Address | Select-Object -ExpandProperty PrefixLength -First 1) } else { $null }
+    ipv6 = if ($cfg -and $cfg.IPv6Address) { ($cfg.IPv6Address | Select-Object -ExpandProperty IPAddress -First 1) } else { '' }
+    dhcp = if ($cfg -and $cfg.NetIPv4Interface) { [bool]$cfg.NetIPv4Interface.Dhcp } else { $false }
+  }
+}
+$adapters | ConvertTo-Json -Compress
+"#;
+
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script);
+
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = command
+        .output()
+        .map_err(|err| format!("Failed to query network adapters: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Network adapter query exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw = stdout.trim();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let entries: Vec<PowerShellNetworkInterface> = if raw.starts_with('[') {
+        serde_json::from_str(raw).map_err(|err| format!("Invalid adapter JSON: {err}"))?
+    } else {
+        vec![serde_json::from_str(raw).map_err(|err| format!("Invalid adapter JSON: {err}"))?]
+    };
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let iface_name = if entry.alias.trim().is_empty() {
+                entry.description.clone()
+            } else {
+                entry.alias.clone()
+            };
+            let iface_type =
+                normalize_interface_type(&entry.iface_type, &entry.alias, &entry.description);
+
+            NetworkInterface {
+                iface: entry.alias.clone(),
+                iface_name,
+                ip4: entry.ipv4.trim().to_string(),
+                ip4subnet: entry
+                    .ipv4_prefix
+                    .map(prefix_length_to_mask)
+                    .unwrap_or_default(),
+                ip6: entry.ipv6.trim().to_string(),
+                mac: entry.mac.trim().to_string(),
+                iface_type: iface_type.clone(),
+                speed: parse_link_speed_mbps(&entry.link_speed),
+                operstate: normalize_operstate(&entry.status),
+                dhcp: entry.dhcp,
+                internal: is_internal_interface(&entry.alias, &entry.description, &iface_type),
+            }
+        })
+        .collect())
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_operstate(status: &str) -> String {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "up" | "connected" => "up".to_string(),
+        "down" | "disconnected" => "down".to_string(),
+        "disabled" => "disabled".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_interface_type(raw_type: &str, alias: &str, description: &str) -> String {
+    let joined = format!("{raw_type} {alias} {description}").to_ascii_lowercase();
+
+    if has_strong_cellular_interface_indicator(&joined) {
+        "Cellular".to_string()
+    } else if has_wifi_interface_indicator(&joined) {
+        "Wi-Fi".to_string()
+    } else if has_ethernet_interface_indicator(&joined) {
+        "Ethernet".to_string()
+    } else if has_cellular_interface_indicator(&joined) {
+        "Cellular".to_string()
+    } else if joined.contains("loopback") {
+        "Loopback".to_string()
+    } else if !raw_type.trim().is_empty() {
+        raw_type.trim().to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn has_wifi_interface_indicator(value: &str) -> bool {
+    value.contains("wi-fi")
+        || value.contains("wifi")
+        || value.contains("wireless lan")
+        || value.contains("wlan")
+        || value.contains("802.11")
+        || value.contains("native 802.11")
+}
+
+#[cfg(target_os = "windows")]
+fn has_ethernet_interface_indicator(value: &str) -> bool {
+    value.contains("ethernet")
+        || value.contains("802.3")
+        || value.contains("gbe")
+        || value.contains("gigabit")
+        || value.contains("realtek pcie")
+        || value.contains("intel ethernet")
+        || value.contains("killer e")
+        || has_interface_token(value, "lan")
+}
+
+#[cfg(target_os = "windows")]
+fn has_cellular_interface_indicator(value: &str) -> bool {
+    has_strong_cellular_interface_indicator(value)
+        || has_interface_token(value, "5g")
+        || has_interface_token(value, "4g")
+}
+
+#[cfg(target_os = "windows")]
+fn has_strong_cellular_interface_indicator(value: &str) -> bool {
+    value.contains("wwan")
+        || value.contains("wireless wan")
+        || value.contains("cellular")
+        || value.contains("mobile broadband")
+        || value.contains("mbim")
+        || value.contains("modem")
+        || value.contains("sim")
+        || has_interface_token(value, "lte")
+}
+
+#[cfg(target_os = "windows")]
+fn has_interface_token(value: &str, token: &str) -> bool {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == token)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_gbe_adapters_as_ethernet_not_cellular() {
+        assert_eq!(
+            normalize_interface_type("802.3", "Ethernet", "Realtek PCIe 2.5GbE Family Controller"),
+            "Ethernet"
+        );
+    }
+
+    #[test]
+    fn normalizes_mobile_broadband_as_cellular() {
+        assert_eq!(
+            normalize_interface_type(
+                "Wireless WAN",
+                "Cellular",
+                "Fibocom LTE Mobile Broadband Adapter"
+            ),
+            "Cellular"
+        );
+    }
+
+    #[test]
+    fn normalizes_wifi_adapters_as_wifi() {
+        assert_eq!(
+            normalize_interface_type("Native 802.11", "Wi-Fi", "Intel(R) Wi-Fi 6 AX201 160MHz"),
+            "Wi-Fi"
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_internal_interface(alias: &str, description: &str, iface_type: &str) -> bool {
+    let joined = format!("{alias} {description} {iface_type}").to_ascii_lowercase();
+    joined.contains("loopback")
+        || joined.contains("virtualbox")
+        || joined.contains("hyper-v")
+        || joined.contains("vmware")
+        || joined.contains("npcap")
+        || joined.contains("tunnel")
+}
+
+#[cfg(target_os = "windows")]
+fn parse_link_speed_mbps(raw: &str) -> u64 {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let Some(number_part) = parts.next() else {
+        return 0;
+    };
+    let Some(unit_part) = parts.next() else {
+        return 0;
+    };
+
+    let value = number_part.parse::<f64>().unwrap_or(0.0);
+    if value <= 0.0 {
+        return 0;
+    }
+
+    let mbps = match unit_part {
+        "gbps" => value * 1000.0,
+        "mbps" => value,
+        "kbps" => value / 1000.0,
+        "bps" => value / 1_000_000.0,
+        _ => value,
+    };
+
+    mbps.round() as u64
+}
+
+#[cfg(target_os = "windows")]
+fn prefix_length_to_mask(prefix: u8) -> String {
+    if prefix > 32 {
+        return String::new();
+    }
+
+    let mask = if prefix == 0 {
+        0u32
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+
+    format!(
+        "{}.{}.{}.{}",
+        (mask >> 24) & 0xff,
+        (mask >> 16) & 0xff,
+        (mask >> 8) & 0xff,
+        mask & 0xff
+    )
+}
+
 pub fn get_disk_usage() -> Vec<DiskInfo> {
     let disks = Disks::new_with_refreshed_list();
     disks
@@ -1351,6 +1676,22 @@ pub fn get_disk_usage() -> Vec<DiskInfo> {
 }
 
 pub fn get_network_interfaces() -> Vec<NetworkInterface> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(mut interfaces) = query_windows_network_interfaces() {
+            if !interfaces.is_empty() {
+                interfaces.sort_by_key(|iface| {
+                    (
+                        iface.internal,
+                        iface.operstate != "up",
+                        iface.iface_name.to_lowercase(),
+                    )
+                });
+                return interfaces;
+            }
+        }
+    }
+
     let networks = Networks::new_with_refreshed_list();
     networks
         .iter()
@@ -1358,10 +1699,13 @@ pub fn get_network_interfaces() -> Vec<NetworkInterface> {
             iface: name.clone(),
             iface_name: name.clone(),
             ip4: String::new(),
+            ip4subnet: String::new(),
+            ip6: String::new(),
             mac: String::new(),
             iface_type: "unknown".to_string(),
             speed: 0,
             operstate: "up".to_string(),
+            dhcp: false,
             internal: name.to_lowercase().contains("loopback") || name.to_lowercase() == "lo",
         })
         .collect()

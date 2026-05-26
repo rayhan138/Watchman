@@ -16,6 +16,7 @@ Desktop.ini
 .env.*
 *.log
 logs
+.run-logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -40,6 +41,8 @@ src-tauri/gen/
 
 # Generated app builds
 builds/
+.build-tmp*/
+build-tmp*/
 target-appfix*/
 src-tauri/target-appfix*/
 target-release-fresh*/
@@ -61,3 +64,8 @@ src-tauri/app_monitor_debug.log
 # Personal local notes / conversations
 my conversation with ai*.txt
 my conversion with ai*.txt
+
+# Non-build project notes and presentation assets
+docs/
+design/
+brand/

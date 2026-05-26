@@ -22,9 +22,9 @@ use windows::{
     core::{GUID, PCWSTR, PWSTR},
     Win32::System::Diagnostics::Etw::{
         CloseTrace, ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW, EVENT_RECORD,
-        EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_NETWORK_TCPIP, EVENT_TRACE_FLAG_NO_SYSCONFIG,
-        EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
-        EVENT_TRACE_SYSTEM_LOGGER_MODE, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_UPDATE,
+        EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_CONTROL_UPDATE,
+        EVENT_TRACE_FLAG_NETWORK_TCPIP, EVENT_TRACE_FLAG_NO_SYSCONFIG, EVENT_TRACE_LOGFILEW,
+        EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE,
         PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
     },
 };
@@ -52,7 +52,7 @@ const TCPIP_SEND_IPV6_EVENT: u16 = 26;
 #[cfg(windows)]
 const TCPIP_RECV_IPV6_EVENT: u16 = 27;
 #[cfg(windows)]
-const TRACE_SESSION_NAME: &str = "TrafficMonitor App Network Session";
+const TRACE_SESSION_NAME: &str = "Watchman App Network Session";
 #[cfg(windows)]
 const TRACE_SESSION_GUID: GUID = GUID::from_u128(0x9d1d28f2_8d75_4b16_b6f7_87e5f9b87af7);
 #[cfg(windows)]
@@ -331,9 +331,7 @@ unsafe fn configure_properties(
     (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE;
     (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
 
-    let name_ptr = buffer
-        .as_mut_ptr()
-        .add((*props).LoggerNameOffset as usize) as *mut u16;
+    let name_ptr = buffer.as_mut_ptr().add((*props).LoggerNameOffset as usize) as *mut u16;
     std::ptr::copy_nonoverlapping(session_name.as_ptr(), name_ptr, session_name.len());
 
     props
@@ -394,8 +392,13 @@ fn ensure_trace_session() -> TraceSessionState {
     let mut start_buffer = properties_buffer(&session_name);
     let start_props = unsafe { configure_properties(&mut start_buffer, &session_name) };
     let mut session_handle = Default::default();
-    let start_status =
-        unsafe { StartTraceW(&mut session_handle, PCWSTR(session_name.as_ptr()), start_props) };
+    let start_status = unsafe {
+        StartTraceW(
+            &mut session_handle,
+            PCWSTR(session_name.as_ptr()),
+            start_props,
+        )
+    };
 
     if start_status.0 == 0 {
         return TraceSessionState::Started;
@@ -478,15 +481,16 @@ fn spawn_tracker_maintenance(state: Arc<Mutex<TrackerState>>, stop: Arc<AtomicBo
 
             if let Ok(mut tracker_state) = state.lock() {
                 for (pid, connections) in &connection_counts {
-                    let entry = tracker_state
-                        .processes
-                        .entry(*pid)
-                        .or_insert_with(|| TrackedProcess {
-                            pid: *pid,
-                            name: format!("Process {}", pid),
-                            last_active_ms: current_timestamp_millis(),
-                            ..TrackedProcess::default()
-                        });
+                    let entry =
+                        tracker_state
+                            .processes
+                            .entry(*pid)
+                            .or_insert_with(|| TrackedProcess {
+                                pid: *pid,
+                                name: format!("Process {}", pid),
+                                last_active_ms: current_timestamp_millis(),
+                                ..TrackedProcess::default()
+                            });
 
                     entry.connections = *connections;
 
@@ -809,7 +813,8 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
         return;
     }
 
-    let payload = std::slice::from_raw_parts(record.UserData as *const u8, record.UserDataLength as usize);
+    let payload =
+        std::slice::from_raw_parts(record.UserData as *const u8, record.UserDataLength as usize);
     let pid = u32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let size = u32::from_ne_bytes([payload[4], payload[5], payload[6], payload[7]]) as u64;
 
@@ -820,12 +825,15 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
     let tracker_state = &*(record.UserContext as *const Mutex<TrackerState>);
     if let Ok(mut state) = tracker_state.lock() {
         let now_ms = current_timestamp_millis();
-        let entry = state.processes.entry(pid).or_insert_with(|| TrackedProcess {
-            pid,
-            name: format!("Process {}", pid),
-            last_active_ms: now_ms,
-            ..TrackedProcess::default()
-        });
+        let entry = state
+            .processes
+            .entry(pid)
+            .or_insert_with(|| TrackedProcess {
+                pid,
+                name: format!("Process {}", pid),
+                last_active_ms: now_ms,
+                ..TrackedProcess::default()
+            });
 
         if is_send {
             entry.total_upload = entry.total_upload.saturating_add(size);
@@ -851,8 +859,7 @@ fn monitor_status_from_state(session_state: TraceSessionState) -> AppMonitorStat
             bandwidth_available: false,
             requires_admin: true,
             message: Some(
-                "Run Watchman as administrator to show per-app bandwidth on Windows."
-                    .to_string(),
+                "Run Watchman as administrator to show per-app bandwidth on Windows.".to_string(),
             ),
         },
         TraceSessionState::Unavailable => AppMonitorStatus {
