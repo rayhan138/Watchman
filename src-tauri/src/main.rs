@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+
+#[cfg(target_os = "windows")]
 mod taskbar_embed;
 
 use chrono::{Datelike, Local};
@@ -101,6 +103,7 @@ struct AlertRuntimeState {
 const WIDGET_FULL_WIDTH: f64 = 136.0;
 const WIDGET_NETWORK_ONLY_WIDTH: f64 = 84.0;
 const WIDGET_HEIGHT: f64 = 32.0;
+const TRAY_ICON_ID: &str = "watchman-tray";
 
 fn current_day_string() -> String {
     Local::now().format("%Y-%m-%d").to_string()
@@ -146,6 +149,51 @@ fn format_bytes_for_alert(bytes: u64) -> String {
 
 fn format_temperature_for_alert(value: f64) -> String {
     format!("{value:.1}°C")
+}
+
+fn format_speed_compact(bytes_per_second: f64) -> String {
+    if !bytes_per_second.is_finite() || bytes_per_second <= 0.0 {
+        return "0 B/s".to_string();
+    }
+
+    let units = ["B/s", "KB/s", "MB/s", "GB/s"];
+    let mut value = bytes_per_second;
+    let mut idx = 0usize;
+
+    while value >= 1024.0 && idx < units.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+
+    if idx == 0 {
+        format!("{value:.0} {}", units[idx])
+    } else {
+        format!("{value:.1} {}", units[idx])
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn update_macos_menu_bar_speeds(app_handle: &tauri::AppHandle, down_bps: f64, up_bps: f64) {
+    let hidden = app_handle
+        .try_state::<Mutex<WidgetDisplayState>>()
+        .and_then(|state| state.lock().ok().map(|s| s.hidden))
+        .unwrap_or(false);
+
+    let Some(tray) = app_handle.tray_by_id(TRAY_ICON_ID) else {
+        return;
+    };
+
+    if hidden {
+        let _ = tray.set_title(None::<&str>);
+        return;
+    }
+
+    let title = format!(
+        "↓ {}  ↑ {}",
+        format_speed_compact(down_bps),
+        format_speed_compact(up_bps)
+    );
+    let _ = tray.set_title(Some(title));
 }
 
 fn emit_high_usage_notification(
@@ -518,6 +566,7 @@ fn main() {
             cmd_reset_session_counters,
             cmd_get_widget_display_mode,
             cmd_get_taskbar_theme,
+            cmd_open_network_settings,
             cmd_open_windows_data_usage_settings,
         ])
         .setup(move |app| {
@@ -540,6 +589,7 @@ fn main() {
             }
 
             // Create taskbar widget window
+            #[cfg(not(target_os = "macos"))]
             let taskbar_result = tauri::WebviewWindowBuilder::new(
                 app,
                 "taskbar",
@@ -556,7 +606,6 @@ fn main() {
             .visible(false)
             .build();
 
-            // Apply initial Windows-specific hardening + grab the raw HWND for the keep-on-top loop
             #[cfg(target_os = "windows")]
             let widget_hwnd: Option<isize> = if let Ok(ref taskbar_win) = taskbar_result {
                 if let Ok(hwnd_val) = taskbar_win.hwnd() {
@@ -577,7 +626,10 @@ fn main() {
                 None
             };
 
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "macos")]
+            let widget_hwnd: Option<isize> = None;
+
+            #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
             let widget_hwnd: Option<isize> = None;
 
             #[cfg(target_os = "windows")]
@@ -761,6 +813,60 @@ fn main() {
             // System tray
             setup_tray(app)?;
 
+            // Register popup menu event handler for macOS widget context menu
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                handle.on_menu_event(move |app, event| {
+                    let app = app.clone();
+                    match event.id().as_ref() {
+                        "dashboard" => {
+                            show_main_window(&app);
+                            emit_widget_menu_action(&app, Some("dashboard"), None);
+                        }
+                        "history" => {
+                            show_main_window(&app);
+                            emit_widget_menu_action(&app, Some("data-usage"), Some("last7days"));
+                        }
+                        "view_today" => {
+                            show_main_window(&app);
+                            emit_widget_menu_action(&app, Some("data-usage"), Some("today"));
+                        }
+                        "view_last7" => {
+                            show_main_window(&app);
+                            emit_widget_menu_action(&app, Some("data-usage"), Some("last7days"));
+                        }
+                        "view_monthly" => {
+                            show_main_window(&app);
+                            emit_widget_menu_action(&app, Some("data-usage"), Some("monthly"));
+                        }
+                        "widget_network" => {
+                            let state = app.state::<Mutex<WidgetDisplayState>>();
+                            if let Ok(mut s) = state.lock() {
+                                s.network_only = true;
+                            }
+                            apply_widget_display_mode(&app, true);
+                        }
+                        "widget_cpumem" => {
+                            let state = app.state::<Mutex<WidgetDisplayState>>();
+                            if let Ok(mut s) = state.lock() {
+                                s.network_only = false;
+                            }
+                            apply_widget_display_mode(&app, false);
+                        }
+                        "reset_counters" => {
+                            if let Some(monitor) = app.try_state::<Mutex<MonitorState>>() {
+                                if let Ok(mut state) = monitor.lock() {
+                                    commands::monitor::reset_session_counters(&mut state);
+                                }
+                            }
+                            emit_widget_feedback(&app, "Session counters reset", "info");
+                        }
+                        _ => {}
+                    }
+                });
+            }
+
             // Setup autostart based on saved config
             let do_autostart = {
                 if let Some(state) = app.try_state::<Mutex<crate::commands::config::ConfigState>>()
@@ -823,27 +929,40 @@ fn main() {
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show_item = MenuItemBuilder::with_id("show", "Open Watchman").build(app)?;
     let preferences_item = MenuItemBuilder::with_id("preferences", "Preferences").build(app)?;
+    #[cfg(target_os = "macos")]
+    let toggle_widget_item =
+        MenuItemBuilder::with_id("toggle_widget", "Show/Hide Menu Bar Speeds").build(app)?;
+    #[cfg(not(target_os = "macos"))]
     let toggle_widget_item =
         MenuItemBuilder::with_id("toggle_widget", "Show/Hide Widget").build(app)?;
-    let run_as_admin_item =
-        MenuItemBuilder::with_id("run_as_admin", "Run as Administrator").build(app)?;
     let restart_item = MenuItemBuilder::with_id("restart", "Restart Watchman").build(app)?;
     let help_about_item = MenuItemBuilder::with_id("help_about", "Help & About").build(app)?;
     let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
-    let menu = MenuBuilder::new(app)
-        .item(&show_item)
-        .item(&preferences_item)
-        .item(&toggle_widget_item)
-        .item(&run_as_admin_item)
-        .item(&restart_item)
-        .item(&help_about_item)
-        .separator()
-        .item(&quit_item)
-        .build()?;
+
+    let menu = {
+        let builder = MenuBuilder::new(app)
+            .item(&show_item)
+            .item(&preferences_item)
+            .item(&toggle_widget_item);
+
+        #[cfg(target_os = "windows")]
+        let builder = {
+            let run_as_admin_item =
+                MenuItemBuilder::with_id("run_as_admin", "Run as Administrator").build(app)?;
+            builder.item(&run_as_admin_item)
+        };
+
+        builder
+            .item(&restart_item)
+            .item(&help_about_item)
+            .separator()
+            .item(&quit_item)
+            .build()?
+    };
 
     let icon = Image::from_bytes(include_bytes!("../icons/icon.png")).expect("Failed to load icon");
 
-    TrayIconBuilder::new()
+    TrayIconBuilder::with_id(TRAY_ICON_ID)
         .icon(icon)
         .tooltip("Watchman")
         .menu(&menu)
@@ -851,6 +970,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "show" => show_main_window(app),
             "preferences" => open_preferences(app),
             "toggle_widget" => toggle_widget_visibility(app),
+            #[cfg(target_os = "windows")]
             "run_as_admin" => relaunch_watchman_as_admin(app),
             "restart" => restart_watchman(app),
             "help_about" => show_help_about(app),
@@ -947,6 +1067,19 @@ fn toggle_widget_visibility<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
         result
     };
 
+    #[cfg(target_os = "macos")]
+    {
+        if hidden {
+            if let Some(tray) = app_handle.tray_by_id(TRAY_ICON_ID) {
+                let _ = tray.set_title(None::<&str>);
+            }
+            emit_widget_feedback(&app_handle, "Menu bar speeds hidden", "info");
+        } else {
+            emit_widget_feedback(&app_handle, "Menu bar speeds shown", "info");
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     if let Some(taskbar) = app_handle.get_webview_window("taskbar") {
         if hidden {
             #[cfg(target_os = "windows")]
@@ -1009,6 +1142,7 @@ fn relaunch_watchman_as_admin<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 fn relaunch_watchman_as_admin<R: tauri::Runtime, M: Manager<R>>(manager: &M) {
     emit_widget_feedback(
         &manager.app_handle(),
@@ -1321,6 +1455,12 @@ async fn metrics_loop(app_handle: tauri::AppHandle) {
         // Emit to all windows
         let _ = app_handle.emit("metrics", &payload);
         evaluate_high_usage_warnings(&app_handle, &payload, todays_total_bytes);
+        #[cfg(target_os = "macos")]
+        update_macos_menu_bar_speeds(
+            &app_handle,
+            payload.network.download_speed,
+            payload.network.upload_speed,
+        );
 
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -1339,10 +1479,10 @@ async fn history_save_loop(app_handle: tauri::AppHandle) {
 /// Keeps the taskbar widget pinned over the taskbar by periodically re-applying
 /// native placement and style flags. Windows can reshuffle taskbar child
 /// geometry whenever icons, flyouts, or full-screen apps change state.
+#[cfg(target_os = "windows")]
 async fn keep_widget_on_top_loop(app_handle: tauri::AppHandle, hwnd_raw: Option<isize>) {
     // Wait a bit for things to settle on startup
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    #[cfg(target_os = "windows")]
     let mut last_placement: Option<crate::taskbar_embed::WidgetPlacement> = None;
 
     loop {
@@ -1357,7 +1497,6 @@ async fn keep_widget_on_top_loop(app_handle: tauri::AppHandle, hwnd_raw: Option<
             .unwrap_or(false);
 
         if widget_hidden {
-            #[cfg(target_os = "windows")]
             crate::taskbar_embed::restore_taskbar_layout();
             if let Some(win) = taskbar_window.as_ref() {
                 let _ = win.hide();
@@ -1365,7 +1504,6 @@ async fn keep_widget_on_top_loop(app_handle: tauri::AppHandle, hwnd_raw: Option<
             continue;
         }
 
-        #[cfg(target_os = "windows")]
         if let Some(raw) = hwnd_raw {
             let main_hwnd_raw = main_window
                 .as_ref()
@@ -1394,8 +1532,26 @@ async fn keep_widget_on_top_loop(app_handle: tauri::AppHandle, hwnd_raw: Option<
                 }
             }
         }
+    }
+}
 
-        #[cfg(not(target_os = "windows"))]
+#[cfg(not(target_os = "windows"))]
+async fn keep_widget_on_top_loop(app_handle: tauri::AppHandle, _hwnd_raw: Option<isize>) {
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let taskbar_window = app_handle.get_webview_window("taskbar");
+        let widget_hidden = app_handle
+            .state::<Mutex<WidgetDisplayState>>()
+            .lock()
+            .map(|state| state.hidden)
+            .unwrap_or(false);
+        if widget_hidden {
+            if let Some(win) = taskbar_window.as_ref() {
+                let _ = win.hide();
+            }
+            continue;
+        }
         if let Some(win) = taskbar_window.as_ref() {
             let _ = win.show();
         }
@@ -1433,16 +1589,27 @@ fn cmd_show_history_window(app_handle: tauri::AppHandle) {
 }
 
 #[tauri::command]
-fn cmd_open_windows_data_usage_settings() -> Result<(), String> {
+fn cmd_open_network_settings() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         open_windows_data_usage_page()
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        Err("Windows Data Usage settings are only available on Windows.".to_string())
+        open::that("x-apple.systempreferences:com.apple.preference.network")
+            .map_err(|e| format!("Failed to open Network preferences: {e}"))
     }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Err("Network settings are only available on Windows and macOS.".to_string())
+    }
+}
+
+#[tauri::command]
+fn cmd_open_windows_data_usage_settings() -> Result<(), String> {
+    cmd_open_network_settings()
 }
 
 #[cfg(target_os = "windows")]
@@ -1634,6 +1801,22 @@ fn read_windows_taskbar_light_theme() -> Option<bool> {
     Some(value != 0)
 }
 
+#[cfg(target_os = "macos")]
+fn read_macos_appearance() -> Option<bool> {
+    let output = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .ok()?;
+    // If the value is "Dark", return false (dark mode). If it's not set, it's light.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() || trimmed == "Light" {
+        Some(true)
+    } else {
+        Some(false)
+    }
+}
+
 #[tauri::command]
 fn cmd_get_taskbar_theme() -> TaskbarThemePayload {
     #[cfg(target_os = "windows")]
@@ -1642,6 +1825,16 @@ fn cmd_get_taskbar_theme() -> TaskbarThemePayload {
             return TaskbarThemePayload {
                 is_light,
                 source: "windows-system-theme".to_string(),
+            };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(is_light) = read_macos_appearance() {
+            return TaskbarThemePayload {
+                is_light,
+                source: "macos-appearance".to_string(),
             };
         }
     }
@@ -1786,13 +1979,77 @@ fn cmd_show_widget_context_menu(
         show_widget_context_menu_for_app(&app_handle)
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = monitor_state;
+        let network_only = widget_state
+            .lock()
+            .map(|state| state.network_only)
+            .unwrap_or(false);
+        show_widget_context_menu_macos(&app_handle, network_only)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = app_handle;
         let _ = widget_state;
         let _ = monitor_state;
         false
     }
+}
+
+#[cfg(target_os = "macos")]
+fn show_widget_context_menu_macos(app_handle: &tauri::AppHandle, _network_only: bool) -> bool {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder};
+
+    let Some(taskbar) = app_handle.get_webview_window("taskbar") else {
+        return false;
+    };
+
+    let Ok(dashboard) = MenuItemBuilder::with_id("dashboard", "Open Dashboard").build(app_handle) else {
+        return false;
+    };
+    let Ok(history) = MenuItemBuilder::with_id("history", "Open History").build(app_handle) else {
+        return false;
+    };
+    let Ok(today) = MenuItemBuilder::with_id("view_today", "Today").build(app_handle) else {
+        return false;
+    };
+    let Ok(last7) = MenuItemBuilder::with_id("view_last7", "Last 7 Days").build(app_handle) else {
+        return false;
+    };
+    let Ok(monthly) = MenuItemBuilder::with_id("view_monthly", "Monthly").build(app_handle) else {
+        return false;
+    };
+    let Ok(network_mode) = MenuItemBuilder::with_id("widget_network", "Show Network Only").build(app_handle) else {
+        return false;
+    };
+    let Ok(cpu_mem_mode) = MenuItemBuilder::with_id("widget_cpumem", "Show CPU/MEM").build(app_handle) else {
+        return false;
+    };
+    let Ok(reset_counters) = MenuItemBuilder::with_id("reset_counters", "Reset Session Counters").build(app_handle) else {
+        return false;
+    };
+
+    let Ok(menu) = MenuBuilder::new(app_handle)
+        .item(&dashboard)
+        .item(&history)
+        .separator()
+        .item(&today)
+        .item(&last7)
+        .item(&monthly)
+        .separator()
+        .item(&network_mode)
+        .item(&cpu_mem_mode)
+        .separator()
+        .item(&reset_counters)
+        .build()
+    else {
+        return false;
+    };
+
+    let _ = taskbar.popup_menu(&menu);
+    true
 }
 
 #[tauri::command]

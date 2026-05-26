@@ -8,7 +8,6 @@
 
   const { invoke } = window.__TAURI__.core;
   const { listen } = window.__TAURI__.event;
-  const { getCurrentWindow } = window.__TAURI__.window;
 
   // Build the systemAPI object used by the renderer.
   window.systemAPI = {
@@ -51,6 +50,7 @@
     getRemainingAllowance: () => invoke('get_remaining_allowance'),
     getDataThresholds: () => invoke('get_data_thresholds'),
     compareUsage: (period) => invoke('compare_usage', { period }),
+    openNetworkSettings: () => invoke('cmd_open_network_settings'),
     openWindowsDataUsageSettings: () => invoke('cmd_open_windows_data_usage_settings'),
 
     // ====== Profiles ======
@@ -93,14 +93,7 @@
     },
   };
 
-  // Window dragging support for frameless window
-  document.addEventListener('DOMContentLoaded', () => {
-    const titleBar = document.querySelector('.title-bar');
-    if (titleBar) {
-      titleBar.addEventListener('mousedown', (e) => {
-        if (e.target.closest('button') || e.target.closest('.tab-bar')) return;
-        getCurrentWindow().startDragging();
-      });
-    }
-  });
+  // Window dragging via data-tauri-drag-region attribute in HTML.
+  // The Tauri 2 runtime reads that attribute and enables native window dragging,
+  // so no manual mousedown wiring is needed.
 })();

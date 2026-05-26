@@ -1306,22 +1306,21 @@
     dom.appHeaderSubtitle.textContent = 'Live now and recent background traffic stay listed here for this session.';
   }
 
-  async function openWindowsDataUsageSettings() {
+  async function openNetworkSettings() {
     if (!dom.appDataUsageSettingsBtn) return;
 
     const wasDisabled = dom.appDataUsageSettingsBtn.disabled;
     dom.appDataUsageSettingsBtn.disabled = true;
 
     try {
-      if (!window.systemAPI?.openWindowsDataUsageSettings) {
-        throw new Error('openWindowsDataUsageSettings is unavailable');
-      }
-
-      await window.systemAPI.openWindowsDataUsageSettings();
-      showToast('Opening Windows Data Usage', 'info');
+      const openSettings = window.systemAPI?.openNetworkSettings
+        || window.systemAPI?.openWindowsDataUsageSettings;
+      if (!openSettings) throw new Error('openNetworkSettings is unavailable');
+      await openSettings();
+      showToast('Opening Network Settings', 'info');
     } catch (e) {
-      console.error('Failed to open Windows Data Usage settings:', e);
-      showToast('Could not open Windows Data Usage settings', 'error');
+      console.error('Failed to open network settings:', e);
+      showToast('Could not open network settings', 'error');
     } finally {
       dom.appDataUsageSettingsBtn.disabled = wasDisabled;
     }
@@ -1364,7 +1363,7 @@
 
     if (displayApps.length === 0) {
       if (statusInfo.requiresAdmin) {
-        dom.appTableBody.innerHTML = '<tr><td colspan="4" class="app-empty">Per-app bandwidth needs administrator rights on Windows. The list can still show apps and connections, but live download/upload by app is unavailable until the app is run as administrator.</td></tr>';
+        dom.appTableBody.innerHTML = '<tr><td colspan="4" class="app-empty">Per-app bandwidth tracking is only available on Windows with administrator rights. On macOS, the list shows active connections without bandwidth breakdown.</td></tr>';
       } else {
         dom.appTableBody.innerHTML = '<tr><td colspan="4" class="app-empty">No app network activity yet. Apps that touch the network will stay listed here for this session.</td></tr>';
       }
@@ -2060,7 +2059,7 @@
     // Window controls
     addDomListener(dom.minimizeBtn, 'click', () => window.systemAPI?.minimizeWindow?.());
     addDomListener(dom.closeBtn, 'click', () => window.systemAPI?.closeWindow?.());
-    addDomListener(dom.appDataUsageSettingsBtn, 'click', openWindowsDataUsageSettings);
+    addDomListener(dom.appDataUsageSettingsBtn, 'click', openNetworkSettings);
 
     if (dom.sessionResetBtn) {
       dom.sessionResetBtn.addEventListener('click', async () => {
@@ -3480,7 +3479,7 @@
       window.systemAPI.onMetrics(processMetrics);
     });
 
-    // Listen for ETW network stats (if available on Windows)
+    // Listen for network stats from the backend
     await safeBootStep('wire app network listener', () => {
       if (window.systemAPI?.onETWNetworkStats) {
         window.systemAPI.onETWNetworkStats(handleETWStats);

@@ -12,9 +12,9 @@
 
 
 
-Watchman is a Windows desktop app for live network monitoring, traffic history,
-per-app bandwidth, network health checks, system gauges, and a compact taskbar
-widget.
+Watchman is a cross-platform desktop app for Windows and macOS with live network
+monitoring, traffic history, network health checks, system gauges, and a compact
+widget view.
 
 The app is built with Tauri 2, Rust, and a plain HTML/CSS/JavaScript frontend.
 
@@ -78,13 +78,29 @@ Build the desktop app:
 bun run tauri:build
 ```
 
+## Platform Support
+
+- Windows:
+  - Full app monitoring with per-app bandwidth (requires administrator rights).
+  - Native taskbar widget embedding support.
+  - Opens Windows Data Usage settings from the Applications tab helper button.
+- macOS:
+  - App activity and connection visibility in the Applications tab.
+  - Opens macOS Network settings from the same Applications tab helper button.
+  - Uses a native menu bar item that shows live download/upload speeds.
+
 ## Runtime Data
 
-Watchman stores user data locally under the Windows roaming app data folder:
+Watchman stores user data locally in the OS app-data directory:
 
 ```text
+Windows:
 %APPDATA%\Watchman\settings.json
 %APPDATA%\Watchman\history.json
+
+macOS:
+~/Library/Application Support/Watchman/settings.json
+~/Library/Application Support/Watchman/history.json
 ```
 
 Older app-data paths are not used as active Watchman storage.
@@ -94,6 +110,6 @@ Older app-data paths are not used as active Watchman storage.
 - Keep product-facing names as `Watchman`.
 - Keep generated release artifacts out of source control.
 - Treat `src-tauri/vendor/libre-hardware-monitor/` as a bundled runtime
-  dependency for temperature readings.
+  dependency for Windows temperature readings.
 - The taskbar widget has a native Windows layer in `src-tauri/native/`; change
-  it only when specifically working on widget embedding behavior.
+  it only when specifically working on Windows widget embedding behavior.
