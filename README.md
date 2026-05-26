@@ -1,5 +1,8 @@
 # Watchman
 
+<img width="3000" height="3000" alt="watchman halftone 02" src="https://github.com/user-attachments/assets/d5a07297-07b3-46c4-bc2e-e79cb745ec96" />
+
+
 Watchman is a Windows desktop app for live network monitoring, traffic history,
 per-app bandwidth, network health checks, system gauges, and a compact taskbar
 widget.
