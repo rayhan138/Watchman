@@ -1,11 +1,11 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/tauri-v2.10.3/crates/tauri-config-schema/schema.json",
   "productName": "Watchman",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "identifier": "app.blinkeye.watchman",
   "build": {
     "beforeDevCommand": "bun run dev",
-    "beforeBuildCommand": "bun run build",
+    "beforeBuildCommand": "npm run build",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
   },
@@ -31,6 +31,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": [
       "nsis"
     ],
@@ -49,5 +50,15 @@
       }
     }
   },
-  "plugins": {}
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVCMDNDMzM5NkFBREE3NDIKUldSQ3A2MXFPY01ENjY4Sm5QWW5FYXRLZk5uVkRBS25ZWkd5MldocEIwbWc1LzV2SkN5UEw0cDEK",
+      "endpoints": [
+        "https://github.com/rayhan138/Watchman/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
 }

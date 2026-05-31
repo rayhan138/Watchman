@@ -1,0 +1,100 @@
+name: Release Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  release-windows:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y --no-progress
+          }
+
+          $nsisPath = "${env:ProgramFiles(x86)}\NSIS"
+          if (Test-Path $nsisPath) {
+            Add-Content -Path $env:GITHUB_PATH -Value $nsisPath
+          }
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build signed release
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri:build
+
+      - name: Create updater feed
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $tag = "v$version"
+          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_x64-setup.exe" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (-not $installer) {
+            throw "Windows installer was not found."
+          }
+
+          $signaturePath = "$($installer.FullName).sig"
+          if (-not (Test-Path $signaturePath)) {
+            throw "Updater signature was not found: $signaturePath"
+          }
+
+          $signature = (Get-Content -Raw $signaturePath).Trim()
+          $assetUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$($installer.Name)"
+          $feed = [ordered]@{
+            version = $version
+            notes = "Update level: optional`n`nSee the release notes for details."
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = $signature
+                url = $assetUrl
+              }
+            }
+          }
+
+          $feed | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 latest.json
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $tag = "v$version"
+          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_x64-setup.exe" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          $signaturePath = "$($installer.FullName).sig"
+          $notes = "Update level: optional`n`nSee the assets below to download and install Watchman."
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $installer.FullName $signaturePath latest.json --clobber
+          } else {
+            gh release create $tag $installer.FullName $signaturePath latest.json --target $env:GITHUB_SHA --title "Watchman $tag" --notes $notes
+          }

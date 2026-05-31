@@ -447,6 +447,8 @@ fn main() {
         ))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Mutex::new(MonitorState::new()))
         .manage(Mutex::new(ConfigState::new()))
         .manage(Mutex::new(HistoryState::new()))
@@ -519,6 +521,7 @@ fn main() {
             cmd_get_widget_display_mode,
             cmd_get_taskbar_theme,
             cmd_open_windows_data_usage_settings,
+            cmd_show_update_notification,
         ])
         .setup(move |app| {
             if start_minimized {
@@ -1443,6 +1446,21 @@ fn cmd_open_windows_data_usage_settings() -> Result<(), String> {
     {
         Err("Windows Data Usage settings are only available on Windows.".to_string())
     }
+}
+
+#[tauri::command]
+fn cmd_show_update_notification(
+    app_handle: tauri::AppHandle,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    app_handle
+        .notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show()
+        .map_err(|err| format!("Failed to show update notification: {err}"))
 }
 
 #[cfg(target_os = "windows")]

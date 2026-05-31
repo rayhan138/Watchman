@@ -3,6 +3,9 @@
  * Tauri's `invoke()` and `listen()` APIs.
  */
 
+import { check } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
+
 (function() {
   'use strict';
 
@@ -68,6 +71,36 @@
     // ====== Notifications ======
     dismissNotification: (id) => invoke('dismiss_notification', { notificationId: id }),
     handleNotificationAction: (id, action) => invoke('notification_action', { notificationId: id, action }),
+    showUpdateNotification: (title, body) => invoke('cmd_show_update_notification', { title, body }),
+
+    // ====== Updates ======
+    checkForAppUpdate: async () => {
+      const update = await check({ timeout: 15000 });
+      if (!update) {
+        return { available: false };
+      }
+
+      return {
+        available: true,
+        version: update.version || '',
+        currentVersion: update.currentVersion || '',
+        body: update.body || '',
+        date: update.date || ''
+      };
+    },
+
+    installAppUpdate: async () => {
+      const update = await check({ timeout: 30000 });
+      if (!update) {
+        return { available: false };
+      }
+
+      await update.downloadAndInstall((event) => {
+        window.dispatchEvent(new CustomEvent('watchman-update-progress', { detail: event }));
+      });
+      await relaunch();
+      return { available: true, installed: true };
+    },
 
     // ====== Window Management ======
     minimizeWindow: () => invoke('cmd_minimize_window'),

@@ -176,6 +176,11 @@
     toolsTroubleshootResults: document.getElementById('toolsTroubleshootResults'),
     toolsFixes: document.getElementById('toolsFixes'),
     toolsFixesList: document.getElementById('toolsFixesList'),
+    toolsUpdateCheckBtn: document.getElementById('toolsUpdateCheckBtn'),
+    toolsUpdateInstallBtn: document.getElementById('toolsUpdateInstallBtn'),
+    toolsUpdateCard: document.getElementById('toolsUpdateCard'),
+    toolsUpdateTitle: document.getElementById('toolsUpdateTitle'),
+    toolsUpdateMessage: document.getElementById('toolsUpdateMessage'),
     exportPeriodSelect: document.getElementById('exportPeriodSelect'),
     exportMonthRow: document.getElementById('exportMonthRow'),
     exportMonthSelect: document.getElementById('exportMonthSelect'),
@@ -289,6 +294,8 @@
   let localConfig = cloneConfig(DEFAULT_CONFIG);
   let settingsBaselineConfig = null;
   let widgetSettingsBaseline = null;
+  let pendingUpdateInfo = null;
+  let updateDownloadState = { downloaded: 0, total: 0 };
 
   // ====== Utility Functions ======
 
@@ -1579,6 +1586,193 @@
     }
   }
 
+  // ====== Updates ======
+  function getUpdateLevel(update) {
+    const body = String(update?.body || '');
+    if (/update\s*level\s*:\s*required/i.test(body) || /\[required\]/i.test(body)) {
+      return 'required';
+    }
+    if (/update\s*level\s*:\s*important/i.test(body) || /\[important\]/i.test(body)) {
+      return 'important';
+    }
+    return 'optional';
+  }
+
+  function setUpdateCardState(stateName, title, message) {
+    if (!dom.toolsUpdateCard) return;
+    dom.toolsUpdateCard.dataset.state = stateName;
+    if (dom.toolsUpdateTitle) dom.toolsUpdateTitle.textContent = title;
+    if (dom.toolsUpdateMessage) dom.toolsUpdateMessage.textContent = message;
+  }
+
+  function getUpdateAvailableTitle(level) {
+    if (level === 'required') return 'Required update available';
+    if (level === 'important') return 'Important update available';
+    return 'Update available';
+  }
+
+  function getUpdateAvailableMessage(update) {
+    const versionText = update.version ? `Version ${update.version}` : 'New version';
+    const currentText = update.currentVersion ? ` from ${update.currentVersion}` : '';
+    return `${versionText}${currentText}`;
+  }
+
+  async function notifyUpdateAvailable(update) {
+    const level = update.level || 'optional';
+    const title = getUpdateAvailableTitle(level);
+    const message = getUpdateAvailableMessage(update);
+
+    displayInAppNotification({
+      id: `update-${update.version || Date.now()}`,
+      type: level === 'required' ? 'critical' : 'info',
+      title,
+      message,
+      actions: [],
+      timestamp: Date.now()
+    });
+
+    if (window.systemAPI?.showUpdateNotification) {
+      try {
+        await window.systemAPI.showUpdateNotification(title, `${message}. Open Watchman to install.`);
+      } catch (error) {
+        console.warn('Could not show update notification:', error);
+      }
+    }
+  }
+
+  async function checkForUpdates({ silent = false, notify = false } = {}) {
+    if (!window.systemAPI?.checkForAppUpdate) {
+      if (!silent) {
+        setUpdateCardState('error', 'Updater unavailable', 'This build cannot check for updates.');
+      }
+      return null;
+    }
+
+    if (!silent) {
+      setUpdateCardState('checking', 'Checking for updates', 'Contacting release channel...');
+      if (dom.toolsUpdateCheckBtn) {
+        dom.toolsUpdateCheckBtn.disabled = true;
+        dom.toolsUpdateCheckBtn.textContent = 'Checking...';
+      }
+    }
+
+    try {
+      const update = await window.systemAPI.checkForAppUpdate();
+      if (update?.available) {
+        pendingUpdateInfo = {
+          ...update,
+          level: getUpdateLevel(update)
+        };
+
+        setUpdateCardState(
+          pendingUpdateInfo.level,
+          getUpdateAvailableTitle(pendingUpdateInfo.level),
+          getUpdateAvailableMessage(pendingUpdateInfo)
+        );
+        if (dom.toolsUpdateInstallBtn) dom.toolsUpdateInstallBtn.hidden = false;
+        if (!silent) showToast('Update available', 'info');
+        if (notify) await notifyUpdateAvailable(pendingUpdateInfo);
+        return pendingUpdateInfo;
+      }
+
+      pendingUpdateInfo = null;
+      setUpdateCardState('ok', 'Watchman is up to date', 'Current version installed');
+      if (dom.toolsUpdateInstallBtn) dom.toolsUpdateInstallBtn.hidden = true;
+      if (!silent) showToast('Watchman is up to date', 'info');
+      return null;
+    } catch (error) {
+      console.warn('Update check failed:', error);
+      if (!silent) {
+        setUpdateCardState('error', 'Update check unavailable', 'Could not reach the release channel.');
+        showToast('Could not check for updates', 'error');
+      }
+      return null;
+    } finally {
+      if (!silent && dom.toolsUpdateCheckBtn) {
+        dom.toolsUpdateCheckBtn.disabled = false;
+        dom.toolsUpdateCheckBtn.textContent = 'Check for Updates';
+      }
+    }
+  }
+
+  function formatUpdateBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) return '';
+    const mb = bytes / (1024 * 1024);
+    return `${mb.toFixed(mb >= 10 ? 1 : 2)} MB`;
+  }
+
+  function handleUpdateProgress(event) {
+    const detail = event?.detail || event || {};
+    if (detail.event === 'Started') {
+      updateDownloadState = {
+        downloaded: 0,
+        total: Number(detail.data?.contentLength || 0)
+      };
+      const totalText = formatUpdateBytes(updateDownloadState.total);
+      setUpdateCardState('installing', 'Downloading update', totalText ? `0 MB of ${totalText}` : 'Download started');
+      return;
+    }
+
+    if (detail.event === 'Progress') {
+      updateDownloadState.downloaded += Number(detail.data?.chunkLength || 0);
+      const downloadedText = formatUpdateBytes(updateDownloadState.downloaded);
+      const totalText = formatUpdateBytes(updateDownloadState.total);
+      setUpdateCardState(
+        'installing',
+        'Downloading update',
+        totalText ? `${downloadedText} of ${totalText}` : `${downloadedText} downloaded`
+      );
+      return;
+    }
+
+    if (detail.event === 'Finished') {
+      setUpdateCardState('installing', 'Installing update', 'Watchman will restart when installation finishes.');
+    }
+  }
+
+  async function installPendingUpdate() {
+    if (!window.systemAPI?.installAppUpdate) {
+      showToast('Updater unavailable', 'error');
+      return;
+    }
+
+    if (dom.toolsUpdateInstallBtn) {
+      dom.toolsUpdateInstallBtn.disabled = true;
+      dom.toolsUpdateInstallBtn.textContent = 'Installing...';
+    }
+    if (dom.toolsUpdateCheckBtn) dom.toolsUpdateCheckBtn.disabled = true;
+
+    updateDownloadState = { downloaded: 0, total: 0 };
+    window.addEventListener('watchman-update-progress', handleUpdateProgress);
+    setUpdateCardState('installing', 'Preparing update', 'Starting installer...');
+
+    try {
+      const result = await window.systemAPI.installAppUpdate();
+      if (!result?.available) {
+        pendingUpdateInfo = null;
+        setUpdateCardState('ok', 'Watchman is up to date', 'Current version installed');
+        if (dom.toolsUpdateInstallBtn) dom.toolsUpdateInstallBtn.hidden = true;
+      }
+    } catch (error) {
+      console.error('Update install failed:', error);
+      setUpdateCardState('error', 'Update failed', 'The update could not be installed.');
+      showToast('Update failed', 'error');
+    } finally {
+      window.removeEventListener('watchman-update-progress', handleUpdateProgress);
+      if (dom.toolsUpdateInstallBtn) {
+        dom.toolsUpdateInstallBtn.disabled = false;
+        dom.toolsUpdateInstallBtn.textContent = 'Install Update';
+      }
+      if (dom.toolsUpdateCheckBtn) dom.toolsUpdateCheckBtn.disabled = false;
+    }
+  }
+
+  function scheduleStartupUpdateCheck() {
+    window.setTimeout(() => {
+      checkForUpdates({ silent: true, notify: true });
+    }, 12000);
+  }
+
   // ====== Export ======
   function formatExportMonthLabel(monthValue) {
     if (!monthValue || !/^\d{4}-\d{2}$/.test(monthValue)) {
@@ -2235,6 +2429,8 @@
 
     // Troubleshooter
     addDomListener(dom.toolsTroubleshootBtn, 'click', runTroubleshoot);
+    addDomListener(dom.toolsUpdateCheckBtn, 'click', () => checkForUpdates({ silent: false, notify: false }));
+    addDomListener(dom.toolsUpdateInstallBtn, 'click', installPendingUpdate);
 
     addDomListener(dom.exportPeriodSelect, 'change', () => {
       setExportStatus('');
@@ -3456,6 +3652,7 @@
     await safeBootStep('wire UI events', () => setupEventListeners());
     await safeBootStep('wire tooltips', () => setupTooltips());
     await safeBootStep('wire notifications', () => setupNotificationListeners());
+    await safeBootStep('schedule update check', () => scheduleStartupUpdateCheck());
     loadTrafficHistory();
     await safeBootStep('load export availability', () => loadExportAvailability());
 

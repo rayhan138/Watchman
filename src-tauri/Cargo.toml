@@ -1,6 +1,6 @@
 [package]
 name = "watchman"
-version = "1.0.0"
+version = "1.0.1"
 description = "Watchman - A lightweight desktop network monitor"
 authors = ["BlinkEye"]
 edition = "2021"
@@ -33,3 +33,5 @@ tauri-plugin-single-instance = "2.0.0"
 windows = { version = "0.57.0", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_System_Diagnostics_Etw", "Win32_System_Time"] }
 tauri-plugin-window-state = "2.0.0"
 tauri-plugin-autostart = "2.0.0"
+tauri-plugin-process = "2.3.1"
+tauri-plugin-updater = "2.10.1"
