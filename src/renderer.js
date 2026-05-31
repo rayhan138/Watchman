@@ -296,6 +296,12 @@
   let widgetSettingsBaseline = null;
   let pendingUpdateInfo = null;
   let updateDownloadState = { downloaded: 0, total: 0 };
+  const THEME_SEQUENCE = ['light', 'dark', 'focus'];
+  const THEME_LABELS = {
+    light: 'Light',
+    dark: 'Dark',
+    focus: 'Focus'
+  };
 
   // ====== Utility Functions ======
 
@@ -321,6 +327,30 @@
   function addDomListener(element, eventName, handler, options) {
     if (!element || typeof element.addEventListener !== 'function') return;
     element.addEventListener(eventName, handler, options);
+  }
+
+  function resolveTheme(theme) {
+    if (theme === 'dark' || theme === 'focus' || theme === 'light') {
+      return theme;
+    }
+
+    return 'light';
+  }
+
+  function getNextTheme(theme = localConfig.theme) {
+    const currentTheme = resolveTheme(theme);
+    const currentIndex = THEME_SEQUENCE.indexOf(currentTheme);
+    const nextIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
+    return THEME_SEQUENCE[nextIndex % THEME_SEQUENCE.length];
+  }
+
+  function applyTheme(theme = localConfig.theme) {
+    const resolvedTheme = resolveTheme(theme);
+    document.body.classList.toggle('dark-mode', resolvedTheme === 'dark');
+    document.body.classList.toggle('focus-mode', resolvedTheme === 'focus');
+    document.body.dataset.theme = resolvedTheme;
+    updateThemeIcon(resolvedTheme);
+    return resolvedTheme;
   }
 
   function listenTauriEvent(eventName, handler) {
@@ -2324,11 +2354,14 @@
     
     if (dom.themeToggleBtn) {
       addDomListener(dom.themeToggleBtn, 'click', () => {
-        document.body.classList.toggle('dark-mode');
-        const isDark = document.body.classList.contains('dark-mode');
-        localConfig.theme = isDark ? 'dark' : 'light';
-        saveLocalConfig();
-        updateThemeIcon(isDark);
+        const nextTheme = getNextTheme();
+        localConfig.theme = nextTheme;
+        applyTheme(nextTheme);
+        saveLocalConfig().catch((error) => {
+          console.error('Failed to save theme:', error);
+          showToast('Could not save theme', 'error');
+        });
+        showToast(`Theme: ${THEME_LABELS[nextTheme]}`, 'info');
       });
     }
 
@@ -2448,21 +2481,14 @@
   }
 
   function applyConfigToDOM() {
+    applyTheme(localConfig.theme);
+
     if (!dom.gaugesSection) return;
 
     if (localConfig.hideGauges) {
       dom.gaugesSection.style.display = 'none';
     } else {
       dom.gaugesSection.style.display = 'grid';
-    }
-    
-    // Theme application
-    if (localConfig.theme === 'dark') {
-      document.body.classList.add('dark-mode');
-      updateThemeIcon(true);
-    } else {
-      document.body.classList.remove('dark-mode');
-      updateThemeIcon(false);
     }
   }
 
@@ -2473,10 +2499,20 @@
     return window.systemAPI.saveConfig(localConfig);
   }
 
-  function updateThemeIcon(isDark) {
+  function updateThemeIcon(theme = resolveTheme(localConfig.theme)) {
     if (!dom.themeIcon) return;
-    if (isDark) {
+    const resolvedTheme = resolveTheme(theme);
+
+    if (dom.themeToggleBtn) {
+      const label = THEME_LABELS[resolvedTheme] || THEME_LABELS.light;
+      dom.themeToggleBtn.title = `Theme: ${label}`;
+      dom.themeToggleBtn.setAttribute('aria-label', `Theme: ${label}`);
+    }
+
+    if (resolvedTheme === 'dark') {
       dom.themeIcon.innerHTML = '<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>';
+    } else if (resolvedTheme === 'focus') {
+      dom.themeIcon.innerHTML = '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/>';
     } else {
       dom.themeIcon.innerHTML = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>';
     }
