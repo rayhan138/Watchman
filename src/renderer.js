@@ -254,7 +254,14 @@
     globalTooltip: document.getElementById('globalTooltip'),
 
     // Toast
-    toastContainer: document.getElementById('toastContainer')
+    toastContainer: document.getElementById('toastContainer'),
+
+    // Startup update prompt
+    startupUpdateOverlay: document.getElementById('startupUpdateOverlay'),
+    startupUpdateCard: document.getElementById('startupUpdateCard'),
+    startupUpdateTitle: document.getElementById('startupUpdateTitle'),
+    startupUpdateMessage: document.getElementById('startupUpdateMessage'),
+    startupUpdateCloseBtn: document.getElementById('startupUpdateCloseBtn')
   };
 
   const DEFAULT_CONFIG = {
@@ -296,12 +303,15 @@
   let widgetSettingsBaseline = null;
   let pendingUpdateInfo = null;
   let updateDownloadState = { downloaded: 0, total: 0 };
+  let activeStartupUpdateInfo = null;
   const THEME_SEQUENCE = ['light', 'dark', 'focus'];
   const THEME_LABELS = {
     light: 'Light',
     dark: 'Dark',
     focus: 'Focus'
   };
+  const UPDATE_REMINDER_INTERVAL_MS = 2 * 24 * 60 * 60 * 1000;
+  const UPDATE_REMINDER_STORAGE_PREFIX = 'watchman.updateReminderShownAt.';
 
   // ====== Utility Functions ======
 
@@ -1647,19 +1657,80 @@
     return `${versionText}${currentText}`;
   }
 
-  async function notifyUpdateAvailable(update) {
+  function getUpdateReminderStorageKey(update) {
+    const version = update?.version || 'unknown';
+    return `${UPDATE_REMINDER_STORAGE_PREFIX}${version}`;
+  }
+
+  function getLastUpdateReminderAt(update) {
+    try {
+      return Number(window.localStorage?.getItem(getUpdateReminderStorageKey(update))) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function rememberUpdateReminder(update) {
+    try {
+      window.localStorage?.setItem(getUpdateReminderStorageKey(update), String(Date.now()));
+    } catch (error) {
+      console.warn('Could not store update reminder timestamp:', error);
+    }
+  }
+
+  function shouldShowUpdateReminder(update) {
+    const lastShownAt = getLastUpdateReminderAt(update);
+    return !lastShownAt || Date.now() - lastShownAt >= UPDATE_REMINDER_INTERVAL_MS;
+  }
+
+  function hideStartupUpdatePrompt() {
+    if (!dom.startupUpdateOverlay) return;
+    dom.startupUpdateOverlay.classList.remove('show');
+    window.setTimeout(() => {
+      if (!dom.startupUpdateOverlay?.classList.contains('show')) {
+        dom.startupUpdateOverlay.hidden = true;
+      }
+    }, 180);
+  }
+
+  function openUpdateTools() {
+    if (activeStartupUpdateInfo) {
+      rememberUpdateReminder(activeStartupUpdateInfo);
+    }
+    hideStartupUpdatePrompt();
+    switchTab('tools');
+    dom.toolsUpdateCard?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+  }
+
+  function showStartupUpdatePrompt(update) {
+    if (!dom.startupUpdateOverlay) return;
+    activeStartupUpdateInfo = update;
+
     const level = update.level || 'optional';
     const title = getUpdateAvailableTitle(level);
     const message = getUpdateAvailableMessage(update);
 
-    displayInAppNotification({
-      id: `update-${update.version || Date.now()}`,
-      type: level === 'required' ? 'critical' : 'info',
-      title,
-      message,
-      actions: [],
-      timestamp: Date.now()
+    if (dom.startupUpdateTitle) dom.startupUpdateTitle.textContent = title;
+    if (dom.startupUpdateMessage) dom.startupUpdateMessage.textContent = message;
+    if (dom.startupUpdateCard) dom.startupUpdateCard.dataset.state = level;
+
+    dom.startupUpdateOverlay.hidden = false;
+    requestAnimationFrame(() => {
+      dom.startupUpdateOverlay?.classList.add('show');
     });
+    rememberUpdateReminder(update);
+  }
+
+  async function notifyUpdateAvailable(update) {
+    if (!shouldShowUpdateReminder(update)) {
+      return;
+    }
+
+    const level = update.level || 'optional';
+    const title = getUpdateAvailableTitle(level);
+    const message = getUpdateAvailableMessage(update);
+
+    showStartupUpdatePrompt(update);
 
     if (window.systemAPI?.showUpdateNotification) {
       try {
@@ -2464,6 +2535,20 @@
     addDomListener(dom.toolsTroubleshootBtn, 'click', runTroubleshoot);
     addDomListener(dom.toolsUpdateCheckBtn, 'click', () => checkForUpdates({ silent: false, notify: false }));
     addDomListener(dom.toolsUpdateInstallBtn, 'click', installPendingUpdate);
+    addDomListener(dom.startupUpdateCloseBtn, 'click', (event) => {
+      event.stopPropagation();
+      if (activeStartupUpdateInfo) {
+        rememberUpdateReminder(activeStartupUpdateInfo);
+      }
+      hideStartupUpdatePrompt();
+    });
+    addDomListener(dom.startupUpdateCard, 'click', openUpdateTools);
+    addDomListener(dom.startupUpdateCard, 'keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openUpdateTools();
+      }
+    });
 
     addDomListener(dom.exportPeriodSelect, 'change', () => {
       setExportStatus('');

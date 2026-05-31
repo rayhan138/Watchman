@@ -2320,8 +2320,8 @@ svg { stroke: var(--text-dark); }
 
 .update-card {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  align-items: stretch;
+  flex-direction: column;
   gap: 12px;
   min-height: 64px;
   padding: 12px 14px;
@@ -2346,6 +2346,7 @@ svg { stroke: var(--text-dark); }
 
 .update-copy {
   min-width: 0;
+  width: 100%;
 }
 
 .update-title {
@@ -2363,7 +2364,9 @@ svg { stroke: var(--text-dark); }
 }
 
 .update-install-btn {
-  flex-shrink: 0;
+  align-self: stretch;
+  min-height: 32px;
+  justify-content: center;
 }
 
 /* Export */
@@ -3131,6 +3134,143 @@ svg { stroke: var(--text-dark); }
 .notification-close:hover {
   background: var(--surface-hover);
   color: var(--text-dark);
+}
+
+/* ---------- Startup Update Prompt ---------- */
+.startup-update-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(8px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+
+.startup-update-overlay.show {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.startup-update-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  width: min(390px, calc(100vw - 56px));
+  min-height: 82px;
+  padding: 17px 18px 17px 20px;
+  border: var(--border-thickness) solid var(--border-color);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.96);
+  color: var(--text-dark);
+  box-shadow: 0 22px 50px rgba(17, 24, 39, 0.24);
+  cursor: pointer;
+  transform: translateY(10px) scale(0.98);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.startup-update-overlay.show .startup-update-card {
+  transform: translateY(0) scale(1);
+}
+
+.startup-update-card:hover,
+.startup-update-card:focus-visible {
+  border-color: rgba(17, 24, 39, 0.45);
+  box-shadow: 0 26px 56px rgba(17, 24, 39, 0.28);
+  outline: none;
+}
+
+.startup-update-card[data-state="important"],
+.startup-update-card[data-state="required"] {
+  border-left-color: var(--warning);
+}
+
+.startup-update-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #4f8df7;
+  color: #ffffff;
+  box-shadow: 0 8px 16px rgba(79, 141, 247, 0.24);
+}
+
+.startup-update-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.startup-update-title {
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1.2;
+  color: var(--text-dark);
+}
+
+.startup-update-message {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.startup-update-close {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.startup-update-close:hover,
+.startup-update-close:focus-visible {
+  background: rgba(17, 24, 39, 0.08);
+  color: var(--text-dark);
+  outline: none;
+}
+
+body.dark-mode .startup-update-overlay {
+  background: rgba(8, 9, 13, 0.34);
+}
+
+body.dark-mode .startup-update-card {
+  background: rgba(17, 19, 23, 0.96);
+  border-color: rgba(247, 242, 234, 0.16);
+  border-left-color: var(--accent);
+  box-shadow: 0 28px 60px rgba(0, 0, 0, 0.45);
+}
+
+body.dark-mode .startup-update-card:hover,
+body.dark-mode .startup-update-card:focus-visible {
+  border-color: rgba(247, 242, 234, 0.28);
+}
+
+body.focus-mode .startup-update-overlay {
+  background: rgba(216, 214, 207, 0.2);
+}
+
+body.focus-mode .startup-update-card {
+  background: rgba(248, 246, 238, 0.96);
+  box-shadow: 0 26px 56px rgba(17, 19, 15, 0.24);
 }
 
 
