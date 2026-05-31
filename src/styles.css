@@ -60,6 +60,32 @@ body.dark-mode {
   --accent-ring: rgba(31, 210, 155, 0.24);
 }
 
+body.focus-mode {
+  --bg-white: #d8d6cf;
+  --bg-gradient-1: rgba(255, 255, 255, 0.32);
+  --bg-gradient-2: rgba(176, 172, 161, 0.38);
+  --bg-gradient-3: rgba(24, 200, 139, 0.1);
+
+  --text-dark: #11130f;
+  --text-muted: #53564f;
+
+  --border-color: #171916;
+  --header-bg: rgba(226, 224, 217, 0.94);
+  --row-border-color: rgba(17, 19, 15, 0.11);
+
+  --surface-bg: rgba(239, 237, 229, 0.62);
+  --surface-hover: rgba(248, 246, 238, 0.82);
+  --gauge-bg: rgba(17, 19, 15, 0.18);
+
+  --accent: #18b98d;
+  --accent-hover: #129f78;
+  --accent-ring: rgba(24, 185, 141, 0.24);
+  --success: #14b884;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --danger-hover: #b91c1c;
+}
+
 *, *::before, *::after {
   margin: 0;
   padding: 0;
@@ -3834,4 +3860,216 @@ body.dark-mode .settings-divider {
 
 body.dark-mode .settings-version {
   color: rgba(247, 242, 234, 0.62);
+}
+
+/* ---------- Focus Mode Polish ---------- */
+body.focus-mode {
+  background:
+    linear-gradient(135deg, rgba(249, 248, 242, 0.96) 0%, rgba(219, 217, 209, 0.96) 48%, rgba(197, 194, 184, 0.96) 100%);
+}
+
+body.focus-mode .bg-blob-1,
+body.focus-mode .bg-blob-2,
+body.focus-mode .bg-blob-3 {
+  opacity: 0.55;
+  filter: blur(150px);
+}
+
+body.focus-mode .titlebar,
+body.focus-mode .tab-bar,
+body.focus-mode .status-bar {
+  background: rgba(226, 224, 217, 0.72);
+  backdrop-filter: blur(14px);
+}
+
+body.focus-mode .titlebar-btn:hover {
+  background: rgba(17, 19, 15, 0.08);
+  border-color: rgba(17, 19, 15, 0.24);
+}
+
+body.focus-mode .tab-item.active,
+body.focus-mode .du-period-btn.active,
+body.focus-mode .th-filter-btn.active,
+body.focus-mode .export-static-pill,
+body.focus-mode .export-fmt-btn.active {
+  background: #11130f;
+  color: #f7f4ec;
+  box-shadow: 0 10px 20px rgba(17, 19, 15, 0.14);
+}
+
+body.focus-mode .tab-item:hover,
+body.focus-mode .du-period-btn:hover,
+body.focus-mode .th-filter-btn:hover,
+body.focus-mode .export-fmt-btn:hover {
+  background: rgba(17, 19, 15, 0.07);
+  color: #11130f;
+}
+
+body.focus-mode .tab-item.active:hover,
+body.focus-mode .tab-item.active:focus-visible,
+body.focus-mode .du-period-btn.active:hover,
+body.focus-mode .du-period-btn.active:focus-visible,
+body.focus-mode .th-filter-btn.active:hover,
+body.focus-mode .th-filter-btn.active:focus-visible,
+body.focus-mode .export-fmt-btn.active:hover,
+body.focus-mode .export-fmt-btn.active:focus-visible {
+  background: #11130f;
+  color: #f7f4ec;
+}
+
+body.focus-mode .speed-card,
+body.focus-mode .session-card,
+body.focus-mode .dash-snapshot-card,
+body.focus-mode .chart-container,
+body.focus-mode .traffic-light-card,
+body.focus-mode .gauge-card,
+body.focus-mode .details-panel,
+body.focus-mode .du-card,
+body.focus-mode .du-comparison-card,
+body.focus-mode .du-limit-card,
+body.focus-mode .app-table-wrapper,
+body.focus-mode .nh-quality-card,
+body.focus-mode .nh-metric-card,
+body.focus-mode .nh-connection-card,
+body.focus-mode .nh-speedtest-card,
+body.focus-mode .traffic-history-panel,
+body.focus-mode .th-stat-card,
+body.focus-mode .th-chart-wrapper,
+body.focus-mode .tools-card,
+body.focus-mode .settings-content,
+body.focus-mode .confirm-content,
+body.focus-mode .update-card,
+body.focus-mode .test-result {
+  background: linear-gradient(135deg, rgba(247, 245, 237, 0.82), rgba(226, 223, 214, 0.9));
+  box-shadow: 0 16px 28px rgba(17, 19, 15, 0.1);
+}
+
+body.focus-mode .details-panel.open {
+  background: rgba(247, 245, 237, 0.9);
+}
+
+body.focus-mode .session-card,
+body.focus-mode .dash-snapshot-card,
+body.focus-mode .update-card {
+  border-color: rgba(17, 19, 15, 0.9);
+}
+
+body.focus-mode .session-reset-btn,
+body.focus-mode .btn-primary {
+  background: #11130f;
+  border-color: #11130f;
+  color: #f7f4ec;
+  box-shadow: 0 10px 18px rgba(17, 19, 15, 0.12);
+}
+
+body.focus-mode .session-reset-btn:hover,
+body.focus-mode .btn-primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, #20d39c, #14b884);
+  border-color: rgba(20, 184, 132, 0.42);
+  color: #06110d;
+  box-shadow: 0 12px 20px rgba(20, 184, 132, 0.2);
+}
+
+body.focus-mode .btn-accent,
+body.focus-mode .nh-speedtest-card .btn-accent {
+  background: linear-gradient(135deg, #20d39c, #14b884);
+  border-color: rgba(20, 184, 132, 0.42);
+  color: #06110d;
+  box-shadow: 0 12px 22px rgba(20, 184, 132, 0.2);
+}
+
+body.focus-mode .btn-accent:hover:not(:disabled),
+body.focus-mode .nh-speedtest-card .btn-accent:hover:not(:disabled) {
+  background: linear-gradient(135deg, #27dca6, #17c08c);
+}
+
+body.focus-mode .dash-snapshot-chip,
+body.focus-mode .app-data-usage-btn {
+  background: rgba(248, 246, 238, 0.82);
+  border-color: rgba(17, 19, 15, 0.22);
+  color: #11130f;
+}
+
+body.focus-mode .dash-snapshot-chip:hover,
+body.focus-mode .app-data-usage-btn:hover:not(:disabled) {
+  background: rgba(20, 184, 132, 0.12);
+  border-color: rgba(20, 184, 132, 0.28);
+  color: #0c6f52;
+}
+
+body.focus-mode .minimal-gauge {
+  background: radial-gradient(circle at 35% 28%, rgba(255, 255, 255, 0.38), rgba(17, 19, 15, 0.05) 62%, rgba(17, 19, 15, 0.08) 100%);
+  border-color: rgba(17, 19, 15, 0.8);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+}
+
+body.focus-mode #cpuGauge .gauge-fill {
+  background: linear-gradient(180deg, rgba(17, 19, 15, 0.05) 0%, rgba(17, 19, 15, 0.18) 100%);
+}
+
+body.focus-mode #ramGauge .gauge-fill {
+  background: linear-gradient(180deg, rgba(17, 19, 15, 0.08) 0%, rgba(17, 19, 15, 0.28) 100%);
+}
+
+body.focus-mode #gpuGaugeCard .gauge-fill {
+  background: linear-gradient(180deg, rgba(17, 19, 15, 0.1) 0%, rgba(17, 19, 15, 0.32) 100%);
+}
+
+body.focus-mode .app-row-alt {
+  background: rgba(17, 19, 15, 0.04);
+}
+
+body.focus-mode .app-table th,
+body.focus-mode .history-table th {
+  background: rgba(226, 224, 217, 0.94);
+}
+
+body.focus-mode .app-name-icon {
+  background: rgba(17, 19, 15, 0.08);
+}
+
+body.focus-mode .app-status-live {
+  background: rgba(59, 130, 246, 0.14);
+  color: #1d4ed8;
+  border-color: rgba(59, 130, 246, 0.22);
+}
+
+body.focus-mode .app-status-background {
+  background: rgba(20, 184, 132, 0.14);
+  color: #047857;
+  border-color: rgba(20, 184, 132, 0.24);
+}
+
+body.focus-mode .app-status-recent {
+  background: rgba(17, 19, 15, 0.07);
+  color: #53564f;
+  border-color: rgba(17, 19, 15, 0.1);
+}
+
+body.focus-mode .speed-inactive {
+  color: #77796f;
+}
+
+body.focus-mode .nh-connection-visual {
+  background: rgba(248, 246, 238, 0.66);
+  border-color: rgba(17, 19, 15, 0.18);
+}
+
+body.focus-mode .detail-row:hover {
+  background: rgba(17, 19, 15, 0.035);
+}
+
+body.focus-mode .th-year-picker-popover,
+body.focus-mode .notification {
+  background: #efede5;
+  border-color: rgba(17, 19, 15, 0.28);
+  box-shadow: 0 18px 38px rgba(17, 19, 15, 0.16);
+}
+
+body.focus-mode .settings-divider {
+  background: rgba(17, 19, 15, 0.12);
+}
+
+body.focus-mode .settings-version {
+  color: rgba(17, 19, 15, 0.62);
 }
