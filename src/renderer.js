@@ -89,6 +89,7 @@
     uptimeDisplay: document.getElementById('uptimeDisplay'),
 
     // Controls
+    feedbackBtn: document.getElementById('feedbackBtn'),
     minimizeBtn: document.getElementById('minimizeBtn'),
     closeBtn: document.getElementById('closeBtn'),
     networkDetailsToggle: document.getElementById('networkDetailsToggle'),
@@ -242,6 +243,7 @@
     cfgRecommendedBtn: document.getElementById('cfgRecommendedBtn'),
     cfgUndoBtn: document.getElementById('cfgUndoBtn'),
     cfgSaveBtn: document.getElementById('cfgSaveBtn'),
+    settingsVersion: document.getElementById('settingsVersion'),
 
     // Confirm Dialog
     confirmModal: document.getElementById('confirmModal'),
@@ -337,6 +339,18 @@
   function addDomListener(element, eventName, handler, options) {
     if (!element || typeof element.addEventListener !== 'function') return;
     element.addEventListener(eventName, handler, options);
+  }
+
+  async function loadAppVersion() {
+    if (!dom.settingsVersion) return;
+
+    try {
+      const version = await window.systemAPI?.getAppVersion?.();
+      dom.settingsVersion.textContent = version ? `Watchman v${version}` : 'Watchman';
+    } catch (error) {
+      console.warn('[settings] failed to load app version', error);
+      dom.settingsVersion.textContent = 'Watchman';
+    }
   }
 
   function resolveTheme(theme) {
@@ -2353,6 +2367,14 @@
     setupReleaseContextMenuPolicy();
 
     // Window controls
+    addDomListener(dom.feedbackBtn, 'click', async () => {
+      try {
+        await window.systemAPI.openFeedbackForm();
+      } catch (e) {
+        console.error('Failed to open feedback form:', e);
+        showToast('Could not open feedback form', 'error');
+      }
+    });
     addDomListener(dom.minimizeBtn, 'click', () => window.systemAPI?.minimizeWindow?.());
     addDomListener(dom.closeBtn, 'click', () => window.systemAPI?.closeWindow?.());
     addDomListener(dom.appDataUsageSettingsBtn, 'click', openWindowsDataUsageSettings);
@@ -3773,6 +3795,7 @@
     await safeBootStep('wire UI events', () => setupEventListeners());
     await safeBootStep('wire tooltips', () => setupTooltips());
     await safeBootStep('wire notifications', () => setupNotificationListeners());
+    await safeBootStep('load app version', () => loadAppVersion());
     await safeBootStep('schedule update check', () => scheduleStartupUpdateCheck());
     loadTrafficHistory();
     await safeBootStep('load export availability', () => loadExportAvailability());
