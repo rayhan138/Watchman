@@ -26,6 +26,7 @@ import { relaunch } from '@tauri-apps/plugin-process';
     getSystemInfo: () => invoke('cmd_get_system_info'),
 
     // ====== Config ======
+    getAppVersion: () => invoke('plugin:app|version'),
     getConfig: () => invoke('get_config'),
     saveConfig: (cfg) => invoke('save_config', { newConfig: cfg }),
     applyRecommendedSettings: () => invoke('apply_recommended_settings'),
@@ -67,6 +68,9 @@ import { relaunch } from '@tauri-apps/plugin-process';
 
     // ====== Export ======
     exportCSV: (options) => invoke('export_csv', { options }),
+
+    // ====== External Links ======
+    openFeedbackForm: () => invoke('cmd_open_feedback_form'),
 
     // ====== Notifications ======
     dismissNotification: (id) => invoke('dismiss_notification', { notificationId: id }),

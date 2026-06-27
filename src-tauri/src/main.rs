@@ -29,6 +29,8 @@ use std::{
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+const FEEDBACK_FORM_URL: &str = "https://tally.so/r/81WZrx";
+
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 
@@ -521,6 +523,7 @@ fn main() {
             cmd_get_widget_display_mode,
             cmd_get_taskbar_theme,
             cmd_open_windows_data_usage_settings,
+            cmd_open_feedback_form,
             cmd_show_update_notification,
         ])
         .setup(move |app| {
@@ -1612,6 +1615,11 @@ exit 1
         open::that("ms-settings:datausage")
             .map_err(|err| format!("Failed to open Windows Data Usage settings: {err}"))
     }
+}
+
+#[tauri::command]
+fn cmd_open_feedback_form() -> Result<(), String> {
+    open::that(FEEDBACK_FORM_URL).map_err(|err| format!("Failed to open feedback form: {err}"))
 }
 
 #[tauri::command]
