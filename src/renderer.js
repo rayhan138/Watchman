@@ -90,6 +90,7 @@
 
     // Controls
     feedbackBtn: document.getElementById('feedbackBtn'),
+    websiteBtn: document.getElementById('websiteBtn'),
     minimizeBtn: document.getElementById('minimizeBtn'),
     closeBtn: document.getElementById('closeBtn'),
     networkDetailsToggle: document.getElementById('networkDetailsToggle'),
@@ -2373,6 +2374,14 @@
       } catch (e) {
         console.error('Failed to open feedback form:', e);
         showToast('Could not open feedback form', 'error');
+      }
+    });
+    addDomListener(dom.websiteBtn, 'click', async () => {
+      try {
+        await window.systemAPI.openWebsite();
+      } catch (e) {
+        console.error('Failed to open website:', e);
+        showToast('Could not open website', 'error');
       }
     });
     addDomListener(dom.minimizeBtn, 'click', () => window.systemAPI?.minimizeWindow?.());
