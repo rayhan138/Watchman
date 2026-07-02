@@ -260,6 +260,17 @@ button:not(.titlebar-btn):active {
   color: var(--bg-white);
 }
 
+.titlebar-website-btn {
+  color: var(--text-dark);
+}
+
+.titlebar-website-btn:hover,
+.titlebar-website-btn:focus-visible {
+  border-color: var(--border-color);
+  background: var(--text-dark);
+  color: var(--bg-white);
+}
+
 /* ---------- Tab Bar ---------- */
 .tab-bar {
   display: flex;
@@ -3786,6 +3797,17 @@ body.dark-mode .titlebar-feedback-btn:focus-visible {
   color: #101215;
 }
 
+body.dark-mode .titlebar-website-btn {
+  color: #f7f2ea;
+}
+
+body.dark-mode .titlebar-website-btn:hover,
+body.dark-mode .titlebar-website-btn:focus-visible {
+  background: #f7f2ea;
+  border-color: #f7f2ea;
+  color: #101215;
+}
+
 body.dark-mode .tab-item.active,
 body.dark-mode .du-period-btn.active,
 body.dark-mode .th-filter-btn.active,
@@ -4061,6 +4083,17 @@ body.focus-mode .titlebar-btn:hover {
 
 body.focus-mode .titlebar-feedback-btn:hover,
 body.focus-mode .titlebar-feedback-btn:focus-visible {
+  background: #11130f;
+  border-color: #11130f;
+  color: #f7f4ec;
+}
+
+body.focus-mode .titlebar-website-btn {
+  color: #11130f;
+}
+
+body.focus-mode .titlebar-website-btn:hover,
+body.focus-mode .titlebar-website-btn:focus-visible {
   background: #11130f;
   border-color: #11130f;
   color: #f7f4ec;

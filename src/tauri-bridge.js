@@ -71,6 +71,7 @@ import { relaunch } from '@tauri-apps/plugin-process';
 
     // ====== External Links ======
     openFeedbackForm: () => invoke('cmd_open_feedback_form'),
+    openWebsite: () => invoke('cmd_open_website'),
 
     // ====== Notifications ======
     dismissNotification: (id) => invoke('dismiss_notification', { notificationId: id }),

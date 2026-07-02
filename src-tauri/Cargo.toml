@@ -1,6 +1,6 @@
 [package]
 name = "watchman"
-version = "1.0.3"
+version = "1.0.4"
 description = "Watchman - A lightweight desktop network monitor"
 authors = ["BlinkEye"]
 edition = "2021"

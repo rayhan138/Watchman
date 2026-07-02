@@ -30,6 +30,7 @@ use std::{
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const FEEDBACK_FORM_URL: &str = "https://tally.so/r/81WZrx";
+const WATCHMAN_WEBSITE_URL: &str = "https://watchman.blinkeye.app/";
 
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
@@ -524,6 +525,7 @@ fn main() {
             cmd_get_taskbar_theme,
             cmd_open_windows_data_usage_settings,
             cmd_open_feedback_form,
+            cmd_open_website,
             cmd_show_update_notification,
         ])
         .setup(move |app| {
@@ -1620,6 +1622,11 @@ exit 1
 #[tauri::command]
 fn cmd_open_feedback_form() -> Result<(), String> {
     open::that(FEEDBACK_FORM_URL).map_err(|err| format!("Failed to open feedback form: {err}"))
+}
+
+#[tauri::command]
+fn cmd_open_website() -> Result<(), String> {
+    open::that(WATCHMAN_WEBSITE_URL).map_err(|err| format!("Failed to open website: {err}"))
 }
 
 #[tauri::command]
