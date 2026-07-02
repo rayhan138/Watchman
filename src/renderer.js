@@ -4,6 +4,7 @@
 
   // ====== Constants ======
   const CHART_POINTS = 60;   // 60 seconds of history
+  const NETWORK_HEALTH_REFRESH_INTERVAL_MS = 20 * 60 * 1000;
 
   // ====== State ======
   const state = {
@@ -944,6 +945,7 @@
       tabId = 'dashboard';
     }
 
+    const previousTab = state.currentTab;
     state.currentTab = tabId;
 
     // Update tab buttons
@@ -974,6 +976,10 @@
 
     // Refresh data on tab switch
     refreshTab(tabId);
+
+    if (previousTab === 'network' && tabId !== 'network') {
+      stopNetworkHealthPolling();
+    }
   }
 
   function initTab(tabId) {
@@ -1007,6 +1013,7 @@
         loadApplications();
         break;
       case 'network':
+        startNetworkHealthPolling();
         loadNetworkHealth();
         break;
     }
@@ -1484,12 +1491,19 @@
   function initNetworkHealth() {
     // Speed test button handler is attached in init() to work immediately
     // No need to attach it again here
+  }
 
-    // Start polling
-    if (state.healthPollInterval) clearInterval(state.healthPollInterval);
+  function startNetworkHealthPolling() {
+    if (state.healthPollInterval) return;
     state.healthPollInterval = setInterval(() => {
       if (state.currentTab === 'network') loadNetworkHealth();
-    }, 10000);
+    }, NETWORK_HEALTH_REFRESH_INTERVAL_MS);
+  }
+
+  function stopNetworkHealthPolling() {
+    if (!state.healthPollInterval) return;
+    clearInterval(state.healthPollInterval);
+    state.healthPollInterval = null;
   }
 
   async function loadNetworkHealth() {
