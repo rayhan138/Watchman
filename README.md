@@ -1,3 +1,10 @@
+
+
+
+<img width="600" height="200" alt="Monitor your bandwidth (3)" src="https://github.com/user-attachments/assets/59f491df-d3fb-40e9-896b-c676598cae85" />
+
+
+
 # Watchman
 
 Watchman is a lightweight Windows network monitor that helps you see what your PC is doing with your internet in real time.
