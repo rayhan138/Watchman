@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/tauri-v2.10.3/crates/tauri-config-schema/schema.json",
+  "$schema": "https://schema.tauri.app/v2/tauri.schema.json",
   "productName": "Watchman",
   "version": "1.0.5",
   "identifier": "app.blinkeye.watchman",

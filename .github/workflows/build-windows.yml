@@ -4,11 +4,31 @@ on:
   push:
     branches:
       - main
-      - "codex/**"
       - "release/**"
+      - "fix/**"
+    paths-ignore:
+      - "README.md"
+      - "LICENSE.md"
+      - "SECURITY.md"
+      - "CONTRIBUTING.md"
+      - "CODE_OF_CONDUCT.md"
+      - "docs/**"
+      - "*.md"
+      - "assets/**"
+      - "screenshots/**"
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - "README.md"
+      - "LICENSE.md"
+      - "SECURITY.md"
+      - "CONTRIBUTING.md"
+      - "CODE_OF_CONDUCT.md"
+      - "docs/**"
+      - "*.md"
+      - "assets/**"
+      - "screenshots/**"
   workflow_dispatch:
 
 jobs:
