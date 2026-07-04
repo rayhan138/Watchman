@@ -1,7 +1,8 @@
 
 
+<img width="600" height="200" alt="Monitor your bandwidth (5)" src="https://github.com/user-attachments/assets/8dbf79ae-640c-4868-a24c-ac301ecc79c3" />
 
-<img width="600" height="200" alt="Monitor your bandwidth (3)" src="https://github.com/user-attachments/assets/59f491df-d3fb-40e9-896b-c676598cae85" />
+
 
 
 
