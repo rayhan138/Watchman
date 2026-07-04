@@ -1,6 +1,7 @@
 
 
-<img width="600" height="200" alt="Monitor your bandwidth (5)" src="https://github.com/user-attachments/assets/8dbf79ae-640c-4868-a24c-ac301ecc79c3" />
+<img width="600" height="200" alt="Monitor your bandwidth" src="https://github.com/user-attachments/assets/129137cc-38f1-4f77-bb13-f30b0d50d0c9" />
+
 
 
 
@@ -18,10 +19,8 @@ It shows live download and upload speed, per-app bandwidth activity, traffic his
 
 ## Screenshots
 
-<!-- Add your screenshots here after pushing:
-![Watchman Main Interface](./path-to-your-screenshot.png)
-![Taskbar Widget](./path-to-your-taskbar-screenshot.png)
--->
+<img width="1920" height="600" alt="Untitled design (62)" src="https://github.com/user-attachments/assets/35214cd2-1dcc-494c-894c-d68bbc74a0dd" />
+
 
 ---
 
