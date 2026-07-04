@@ -1,99 +1,182 @@
 # Watchman
 
+Watchman is a lightweight Windows network monitor that helps you see what your PC is doing with your internet in real time.
 
+It shows live download and upload speed, per-app bandwidth activity, traffic history, connection health, system usage, and a compact taskbar widget in one clean desktop app.
 
+[Official Website](https://watchman.blinkeye.app/)  
+[Download Latest Release](https://github.com/rayhan138/Watchman/releases/latest)  
+[Join our Discord](https://discord.gg/RSrx4zs2Hh)
 
-<img width="600" height="200" alt="Untitled design (5)" src="https://github.com/user-attachments/assets/f78603eb-49de-4f7a-9038-a653fda12d39" />
+## Screenshots
 
+<!-- Add your screenshots here after pushing:
+![Watchman Main Interface](./path-to-your-screenshot.png)
+![Taskbar Widget](./path-to-your-taskbar-screenshot.png)
+-->
 
+---
 
+## Why Watchman?
 
+Sometimes your internet feels slow, but it is not always clear what is using it in the background.
 
+Watchman was built to make that easier to understand. It gives you a simple place to see your current network speed, which apps are active, how much data you have used, and whether your connection looks stable.
 
+The goal is not to be a heavy network tool. Watchman is made to be small, useful, and easy to keep open while you work.
 
+---
 
-Watchman is a Windows desktop app for live network monitoring, traffic history,
-per-app bandwidth, network health checks, system gauges, and a compact taskbar
-widget.
+## Features
 
-The app is built with Tauri 2, Rust, and a plain HTML/CSS/JavaScript frontend.
+- Live download and upload speed
+- Per-app network activity and connection count
+- Daily, weekly, monthly, and yearly traffic history
+- CPU, RAM, and GPU usage gauges
+- Connection health with latency, jitter, and packet loss
+- M-Lab speed test
+- CSV export for saved traffic history
+- Compact taskbar widget
+- Light, dark, and focus themes
+- Local-first data storage
+- Update checking
+- Feedback button
 
-## Project Structure
+---
 
-```text
-watchman/
-|-- package.json             Frontend and Tauri scripts
-|-- vite.config.js           Vite multi-page build config
-|-- bun.lock                 Locked frontend toolchain dependencies
-|-- src/                     Frontend source
-|   |-- index.html           Main app window
-|   |-- taskbar.html         Taskbar widget window
-|   |-- main.js              Frontend entrypoint
-|   |-- renderer.js          Main app UI behavior
-|   |-- taskbar.js           Widget UI behavior
-|   |-- tauri-bridge.js      Browser-to-Tauri command bridge
-|   |-- styles.css           App styling
-|   `-- watchman-logo.svg    App logo
-|-- src-tauri/               Rust and Tauri backend
-|   |-- Cargo.toml           Rust package metadata
-|   |-- tauri.conf.json      Tauri app configuration
-|   |-- build.rs             Native build integration
-|   |-- capabilities/        Tauri permissions
-|   |-- icons/               App icons
-|   |-- native/              Windows native integration
-|   |-- scripts/             Runtime helper scripts
-|   |-- vendor/              Bundled third-party runtime libraries
-|   `-- src/                 Rust source
-|-- brand/                   Brand and product artwork
-|-- design/                  Design references and mockups
-`-- docs/                    Architecture and maintenance notes
-```
+## Download
 
-Generated folders such as `dist/`, `builds/`, `node_modules/`, and
-`src-tauri/target/` are ignored and should not be committed.
+Download the latest Windows installer from the GitHub Releases page:
 
-## Development
+[Download Watchman](https://github.com/rayhan138/Watchman/releases/latest)
 
-Install dependencies:
+After installing, Watchman opens as a small desktop app and can also show a compact taskbar widget for quick monitoring.
 
-```bash
-bun install
-```
+---
 
-Run the app in development:
+## Local Data Storage
 
-```bash
-bun run tauri:dev
-```
+Watchman stores traffic history locally on your PC.
 
-Build the frontend only:
-
-```bash
-bun run build
-```
-
-Build the desktop app:
-
-```bash
-bun run tauri:build
-```
-
-## Runtime Data
-
-Watchman stores user data locally under the Windows roaming app data folder:
+Main history database:
 
 ```text
-%APPDATA%\Watchman\settings.json
-%APPDATA%\Watchman\history.json
+%APPDATA%\Watchman\watchman.db
 ```
 
-Older app-data paths are not used as active Watchman storage.
+Example Windows path:
 
-## Notes for Maintainers
+```text
+C:\Users\<your-name>\AppData\Roaming\Watchman\watchman.db
+```
 
-- Keep product-facing names as `Watchman`.
-- Keep generated release artifacts out of source control.
-- Treat `src-tauri/vendor/libre-hardware-monitor/` as a bundled runtime
-  dependency for temperature readings.
-- The taskbar widget has a native Windows layer in `src-tauri/native/`; change
-  it only when specifically working on widget embedding behavior.
+Watchman uses a local SQLite database for saved traffic history. This data is used for the Data tab, charts, and CSV export.
+
+Your traffic history stays on your own computer.
+
+---
+
+## Privacy
+
+Watchman is designed as a local-first desktop app.
+
+- No account is required
+- No cloud dashboard is required
+- Traffic history is stored locally
+- The app does not need your personal login data
+- Update checks only contact the GitHub release channel
+- The feedback button opens an external feedback form only when you click it
+
+Some Windows network information may come from system commands or Windows APIs. Watchman uses this information to show connection type, adapter details, speed, and connection health inside the app.
+
+---
+
+## Development Setup
+
+### Prerequisites
+
+Install these before running the app locally:
+
+- Node.js
+- Rust
+- Cargo
+- Tauri prerequisites for Windows
+- Bun or npm
+
+### Install Dependencies
+
+```powershell
+npm install
+```
+
+### Run in Development Mode
+
+```powershell
+npm run tauri:dev
+```
+
+### Build the App
+
+```powershell
+npm run tauri:build
+```
+
+Build output is created by Tauri under:
+
+```text
+src-tauri\target\release\bundle\
+```
+
+---
+
+## Contributing
+
+Contributions are welcome.
+
+You can help by:
+
+- Reporting bugs
+- Suggesting improvements
+- Improving the UI
+- Testing Watchman on different Windows versions
+- Improving documentation
+
+Basic contribution flow:
+
+```powershell
+git clone https://github.com/rayhan138/Watchman.git
+cd Watchman
+git checkout -b feature/your-change
+npm install
+npm run tauri:dev
+```
+
+After making changes, commit and push your branch, then open a pull request.
+
+Please keep changes focused and explain what problem your pull request solves.
+
+---
+
+## Security
+
+If you find a security issue, please do not open a public GitHub issue with sensitive details.
+
+Report it privately instead.
+
+Suggested report details:
+
+- What happened
+- Steps to reproduce
+- Your Windows version
+- Watchman version
+- Any relevant screenshots or logs
+
+---
+
+## License
+
+Watchman is licensed under the terms included in the repository license file.
+
+See:
+
+[LICENSE](./LICENSE.md)
