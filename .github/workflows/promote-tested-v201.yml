@@ -56,6 +56,12 @@ jobs:
           PY
           SOURCE_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_sha"])' "$RUNNER_TEMP/staging-run.json")
           git merge-base --is-ancestor "$SOURCE_SHA" "$GITHUB_SHA" || { echo '::error::The tested source commit is not contained in merged main'; exit 1; }
+          unexpected=$(git diff --name-only "$SOURCE_SHA" "$GITHUB_SHA" | grep -Ev '^(README\.md|migration/README\.md)$' || true)
+          if [[ -n "$unexpected" ]]; then
+            echo '::error::Packaging, updater, or acceptance-test sources changed after the candidate was staged.'
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
           if gh api "repos/$GITHUB_REPOSITORY/releases/tags/v2.0.1" >/dev/null 2>&1; then
             echo '::error::v2.0.1 already has a release; refusing to overwrite it.'
             exit 1

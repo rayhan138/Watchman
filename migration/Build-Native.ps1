@@ -11,9 +11,8 @@ $numericVersion = @('MAJOR','MINOR','PATCH' | ForEach-Object {
 if (!$nativeVersion -or $numericVersion -cne $nativeVersion) { throw 'Text and numeric native versions do not match' }
 $package = Get-Content src-tauri/native-package.json -Raw | ConvertFrom-Json
 $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-if ($package.version -cne $nativeVersion -or $config.version -cne $nativeVersion) {
-    throw "Native, package and Tauri versions must match ($nativeVersion)"
-}
+if ($package.version -cne $nativeVersion) { throw "Native and NSIS package versions must match ($nativeVersion)" }
+if ($config.version -cne '1.0.5') { throw 'Keep the historical Tauri app configuration at 1.0.5; the native package override owns the executable version' }
 if ($package.bundle.publisher -cne 'Noman Dhoni') { throw 'NSIS publisher must be exactly Noman Dhoni' }
 cmake -S native -B builds/native -A x64 -DBUILD_TESTING=ON
 $PSNativeCommandUseErrorActionPreference = $false
