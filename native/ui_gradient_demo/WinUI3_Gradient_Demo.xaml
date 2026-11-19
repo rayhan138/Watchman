@@ -1,0 +1,296 @@
+<!-- WinUI3_Gradient_Demo.xaml -->
+<Page
+    x:Class="Watchman.WinUI3_Gradient_Demo"
+    xmlns="http://schemas.microsoft.com/winfx/2000/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2000/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="White">
+
+    <Grid Width="522" Height="782" CornerRadius="10" BorderBrush="#121212" BorderThickness="1" ClipToBounds="True">
+        
+        <!-- 1. Background Blur Blobs -->
+        <!-- In WinUI 3, we can achieve smooth background blobs using Canvas with Radial Gradients and blur effects -->
+        <Canvas HorizontalAlignment="Stretch" VerticalAlignment="Stretch" IsHitTestVisible="False">
+            <!-- Top-Left Pink Blob -->
+            <Ellipse Width="300" Height="300" Canvas.Left="-50" Canvas.Top="-50">
+                <Ellipse.Fill>
+                    <RadialGradientBrush Center="0.5,0.5" RadiusX="0.5" RadiusY="0.5">
+                        <GradientStop Color="#7FF472B6" Offset="0.0"/> <!-- rgba(244, 114, 182, 0.5) -->
+                        <GradientStop Color="#00F472B6" Offset="1.0"/>
+                    </RadialGradientBrush>
+                </Ellipse.Fill>
+            </Ellipse>
+
+            <!-- Bottom-Right Yellow Blob -->
+            <Ellipse Width="400" Height="400" Canvas.Left="222" Canvas.Top="482">
+                <Ellipse.Fill>
+                    <RadialGradientBrush Center="0.5,0.5" RadiusX="0.5" RadiusY="0.5">
+                        <GradientStop Color="#66FDE047" Offset="0.0"/> <!-- rgba(253, 224, 71, 0.4) -->
+                        <GradientStop Color="#00FDE047" Offset="1.0"/>
+                    </RadialGradientBrush>
+                </Ellipse.Fill>
+            </Ellipse>
+
+            <!-- Mid-Left Orange Blob -->
+            <Ellipse Width="250" Height="250" Canvas.Left="100" Canvas.Top="300">
+                <Ellipse.Fill>
+                    <RadialGradientBrush Center="0.5,0.5" RadiusX="0.5" RadiusY="0.5">
+                        <GradientStop Color="#66FB923C" Offset="0.0"/> <!-- rgba(251, 146, 60, 0.4) -->
+                        <GradientStop Color="#00FB923C" Offset="1.0"/>
+                    </RadialGradientBrush>
+                </Ellipse.Fill>
+            </Ellipse>
+        </Canvas>
+
+        <!-- Main Layout Stack -->
+        <Grid RowDefinitions="Auto,Auto,*,Auto">
+            
+            <!-- 2. Top Bar -->
+            <Grid Grid.Row="0" Height="48" BorderBrush="#121212" BorderThickness="0,0,0,1" Padding="16,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                    <!-- Logo placeholder -->
+                    <Image Source="ms-appx:///Assets/watchman-logo.png" Width="22" Height="22"/>
+                    <TextBlock Text="WATCHMAN" FontSize="14" FontWeight="Bold" CharacterSpacing="200" VerticalAlignment="Center"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                    <!-- Header Icon Buttons -->
+                    <Button Style="{ThemeResource DateTimePickerFlyoutButtonStyle}" Width="32" Height="32" Content="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="12"/> <!-- Settings -->
+                    <Button Style="{ThemeResource DateTimePickerFlyoutButtonStyle}" Width="32" Height="32" Content="&#xE708;" FontFamily="Segoe MDL2 Assets" FontSize="12"/> <!-- Dark Mode -->
+                    <Button Style="{ThemeResource DateTimePickerFlyoutButtonStyle}" Width="32" Height="32" Content="&#xE921;" FontFamily="Segoe MDL2 Assets" FontSize="12"/> <!-- Minimize -->
+                    <Button Style="{ThemeResource DateTimePickerFlyoutButtonStyle}" Width="32" Height="32" Content="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="12"/> <!-- Close -->
+                </StackPanel>
+            </Grid>
+
+            <!-- 3. Navigation Tabs -->
+            <StackPanel Grid.Row="1" Orientation="Horizontal" Height="48" BorderBrush="#121212" BorderThickness="0,0,0,1" Padding="12,0" Spacing="4" VerticalAlignment="Center">
+                <Button Content="Dashboard" Style="{StaticResource AccentButtonStyle}" CornerRadius="15" Padding="12,6"/>
+                <Button Content="Data" Style="{StaticResource DefaultButtonStyle}" CornerRadius="15" Padding="12,6"/>
+                <Button Content="Apps" Style="{StaticResource DefaultButtonStyle}" CornerRadius="15" Padding="12,6"/>
+                <Button Content="Network" Style="{StaticResource DefaultButtonStyle}" CornerRadius="15" Padding="12,6"/>
+                <Button Content="Tools" Style="{StaticResource DefaultButtonStyle}" CornerRadius="15" Padding="12,6"/>
+            </StackPanel>
+
+            <!-- 4. Scrollable Content Area -->
+            <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Hidden" Padding="20">
+                <StackPanel Spacing="16">
+                    
+                    <!-- Speed Cards -->
+                    <StackPanel Spacing="12">
+                        <!-- Download Card -->
+                        <Border BorderBrush="#121212" BorderThickness="1" CornerRadius="28" Padding="20,14" Background="Transparent">
+                            <Grid>
+                                <StackPanel Orientation="Horizontal" Spacing="14" HorizontalAlignment="Left">
+                                    <TextBlock Text="↓" FontSize="24" FontWeight="Bold" Foreground="#3B82F6"/>
+                                    <TextBlock Text="Download" FontSize="13" FontWeight="ExtraBold" VerticalAlignment="Center" CharacterSpacing="100"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="6" HorizontalAlignment="Right" VerticalAlignment="Center">
+                                    <TextBlock Text="1.5" FontSize="36" FontWeight="Black" FontFamily="Nunito Sans"/>
+                                    <TextBlock Text="KB/s" FontSize="14" FontWeight="Bold" Foreground="#333333" VerticalAlignment="Bottom" Margin="0,0,0,4"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <!-- Upload Card -->
+                        <Border BorderBrush="#121212" BorderThickness="1" CornerRadius="28" Padding="20,14" Background="Transparent">
+                            <Grid>
+                                <StackPanel Orientation="Horizontal" Spacing="14" HorizontalAlignment="Left">
+                                    <TextBlock Text="↑" FontSize="24" FontWeight="Bold" Foreground="#F97316"/>
+                                    <TextBlock Text="Upload" FontSize="13" FontWeight="ExtraBold" VerticalAlignment="Center" CharacterSpacing="100"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="6" HorizontalAlignment="Right" VerticalAlignment="Center">
+                                    <TextBlock Text="0.1" FontSize="36" FontWeight="Black" FontFamily="Nunito Sans"/>
+                                    <TextBlock Text="KB/s" FontSize="14" FontWeight="Bold" Foreground="#333333" VerticalAlignment="Bottom" Margin="0,0,0,4"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                    </StackPanel>
+
+                    <!-- Current Session Card with Gradient Background -->
+                    <Border BorderBrush="#121212" BorderThickness="1" CornerRadius="24" Padding="18,14,18,15">
+                        <Border.Background>
+                            <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                <GradientStop Color="#C7FFF7ED" Offset="0.0"/> <!-- rgba(255, 247, 237, 0.78) -->
+                                <GradientStop Color="#E5FFFFFF" Offset="1.0"/> <!-- rgba(255, 255, 255, 0.9) -->
+                            </LinearGradientBrush>
+                        </Border.Background>
+                        <StackPanel>
+                            <Grid Margin="0,0,0,13">
+                                <StackPanel VerticalAlignment="Center">
+                                    <TextBlock Text="CURRENT SESSION" FontSize="13" FontWeight="Black" CharacterSpacing="120"/>
+                                    <TextBlock Text="Since app opened or last reset" FontSize="10" Foreground="#333333" FontWeight="SemiBold"/>
+                                </StackPanel>
+                                <Button Content="Reset Session" Background="Black" Foreground="White" FontSize="10" FontWeight="Black" CornerRadius="12" Padding="13,9" HorizontalAlignment="Right"/>
+                            </Grid>
+
+                            <Border BorderBrush="#0D000000" BorderThickness="0,1,0,0" Padding="0,10,0,0">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="DOWNLOAD" FontSize="9" FontWeight="Black" Foreground="#333333" CharacterSpacing="80"/>
+                                        <TextBlock Text="3.39 GB" FontSize="24" FontWeight="Black" FontFamily="Nunito Sans"/>
+                                    </StackPanel>
+
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="UPLOAD" FontSize="9" FontWeight="Black" Foreground="#333333" CharacterSpacing="80"/>
+                                        <TextBlock Text="549.56 MB" FontSize="24" FontWeight="Black" FontFamily="Nunito Sans"/>
+                                    </StackPanel>
+
+                                    <StackPanel Grid.Column="2">
+                                        <TextBlock Text="TOTAL" FontSize="9" FontWeight="Black" Foreground="#333333" CharacterSpacing="80"/>
+                                        <TextBlock Text="3.93 GB" FontSize="24" FontWeight="Black" Foreground="#3B82F6" FontFamily="Nunito Sans"/>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Usage Snapshot Card with Gradient Background -->
+                    <Border BorderBrush="#121212" BorderThickness="1" CornerRadius="24" Padding="18,16,18,14">
+                        <Border.Background>
+                            <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                <GradientStop Color="#D1FFF7ED" Offset="0.0"/> <!-- rgba(255, 247, 237, 0.82) -->
+                                <GradientStop Color="#EBFFFFFF" Offset="1.0"/> <!-- rgba(255, 255, 255, 0.92) -->
+                            </LinearGradientBrush>
+                        </Border.Background>
+                        <StackPanel>
+                            <Grid Margin="0,0,0,14">
+                                <TextBlock Text="USAGE SNAPSHOT" FontSize="13" FontWeight="Black" CharacterSpacing="120" VerticalAlignment="Center"/>
+                                <Button Content="Today" Style="{ThemeResource DefaultButtonStyle}" FontSize="11" CornerRadius="12" Padding="12,7" HorizontalAlignment="Right"/>
+                            </Grid>
+
+                            <Grid Margin="0,0,0,6">
+                                <Grid.ColumnDefinitions>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                </Grid.ColumnDefinitions>
+
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="TOTAL" FontSize="9" FontWeight="SemiBold" Foreground="#333333"/>
+                                    <TextBlock Text="6.97 GB" FontSize="24" FontWeight="ExtraBold" FontFamily="Nunito Sans"/>
+                                </StackPanel>
+
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Text="↓ DOWNLOAD" FontSize="9" FontWeight="SemiBold" Foreground="#333333"/>
+                                    <TextBlock Text="4.88 GB" FontSize="24" FontWeight="ExtraBold" FontFamily="Nunito Sans"/>
+                                </StackPanel>
+
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="↑ UPLOAD" FontSize="9" FontWeight="SemiBold" Foreground="#333333"/>
+                                    <TextBlock Text="2.09 GB" FontSize="24" FontWeight="ExtraBold" FontFamily="Nunito Sans"/>
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock Text="Updated just now" FontSize="10" Foreground="#333333" FontWeight="SemiBold" Margin="0,6,0,0"/>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Normal Status Banner -->
+                    <Border BorderBrush="#121212" BorderThickness="1" CornerRadius="25" Padding="20,12">
+                        <StackPanel Orientation="Horizontal" Spacing="16">
+                            <Ellipse Width="20" Height="20" Fill="#10B981"/>
+                            <StackPanel VerticalAlignment="Center">
+                                <TextBlock Text="NORMAL" FontSize="14" FontWeight="Black" CharacterSpacing="100"/>
+                                <TextBlock Text="Network usage is within normal range" FontSize="10" Foreground="#333333" FontWeight="SemiBold"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Hardware Stats Dials -->
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- CPU Dial -->
+                        <Border Grid.Column="0" BorderBrush="#121212" BorderThickness="1" CornerRadius="24" Padding="10,16" Background="Transparent" Margin="0,0,5,0">
+                            <StackPanel HorizontalAlignment="Center">
+                                <Grid Width="56" Height="56" Margin="0,0,0,10">
+                                    <!-- Circular Progress Indicator here -->
+                                    <ProgressRing Value="8" IsIndeterminate="False" Width="56" Height="56" Foreground="Black"/>
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                        <TextBlock Text="8" FontSize="22" FontWeight="ExtraBold" FontFamily="Nunito Sans"/>
+                                        <TextBlock Text="%" FontSize="12" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Grid>
+                                <TextBlock Text="CPU" FontSize="13" FontWeight="Black" CharacterSpacing="100" HorizontalAlignment="Center"/>
+                                <TextBlock Text="12 cores" FontSize="10" Foreground="#333333" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- RAM Dial -->
+                        <Border Grid.Column="1" BorderBrush="#121212" BorderThickness="1" CornerRadius="24" Padding="10,16" Background="Transparent" Margin="5,0,5,0">
+                            <StackPanel HorizontalAlignment="Center">
+                                <Grid Width="56" Height="56" Margin="0,0,0,10">
+                                    <ProgressRing Value="67" IsIndeterminate="False" Width="56" Height="56" Foreground="Black"/>
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                        <TextBlock Text="67" FontSize="22" FontWeight="ExtraBold" FontFamily="Nunito Sans"/>
+                                        <TextBlock Text="%" FontSize="12" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Grid>
+                                <TextBlock Text="RAM" FontSize="13" FontWeight="Black" CharacterSpacing="100" HorizontalAlignment="Center"/>
+                                <TextBlock Text="9.3 / 13.9 GB" FontSize="10" Foreground="#333333" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- GPU Dial -->
+                        <Border Grid.Column="2" BorderBrush="#121212" BorderThickness="1" CornerRadius="24" Padding="10,16" Background="Transparent" Margin="5,0,0,0">
+                            <StackPanel HorizontalAlignment="Center">
+                                <Grid Width="56" Height="56" Margin="0,0,0,10">
+                                    <ProgressRing Value="9" IsIndeterminate="False" Width="56" Height="56" Foreground="Black"/>
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                        <TextBlock Text="9" FontSize="22" FontWeight="ExtraBold" FontFamily="Nunito Sans"/>
+                                        <TextBlock Text="%" FontSize="12" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Grid>
+                                <TextBlock Text="GPU" FontSize="13" FontWeight="Black" CharacterSpacing="100" HorizontalAlignment="Center"/>
+                                <TextBlock Text="3D" FontSize="10" Foreground="#333333" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+
+                    <!-- Expandable items -->
+                    <StackPanel Spacing="10">
+                        <Border BorderBrush="#121212" BorderThickness="1" CornerRadius="28" Padding="20,14" Background="Transparent">
+                            <Grid>
+                                <TextBlock Text="→" FontSize="14" FontWeight="Bold" HorizontalAlignment="Left"/>
+                                <TextBlock Text="Network Details" FontSize="13" FontWeight="ExtraBold" CharacterSpacing="100" Margin="24,0,0,0"/>
+                            </Grid>
+                        </Border>
+                        <Border BorderBrush="#121212" BorderThickness="1" CornerRadius="28" Padding="20,14" Background="Transparent">
+                            <Grid>
+                                <TextBlock Text="→" FontSize="14" FontWeight="Bold" HorizontalAlignment="Left"/>
+                                <TextBlock Text="System Information" FontSize="13" FontWeight="ExtraBold" CharacterSpacing="100" Margin="24,0,0,0"/>
+                            </Grid>
+                        </Border>
+                    </StackPanel>
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- 5. Footer Status Bar -->
+            <Grid Grid.Row="3" Height="32" BorderBrush="#121212" BorderThickness="0,1,0,0" Padding="16,0">
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <Ellipse Width="8" Height="8" Fill="#10B981"/>
+                    <TextBlock Text="Connected" FontSize="10" FontWeight="Bold" Foreground="#333333" CharacterSpacing="100"/>
+                </StackPanel>
+                <TextBlock Text="Uptime: 7H 35M" FontSize="10" FontWeight="Bold" Foreground="#333333" CharacterSpacing="100" FontFamily="JetBrains Mono" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+            </Grid>
+        </Grid>
+    </Grid>
+</Page>

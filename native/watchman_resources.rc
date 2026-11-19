@@ -1,0 +1,15 @@
+#include "resource.h"
+
+IDI_WATCHMAN_APP ICON "watchman_shell.ico"
+IDR_WATCHMAN_LOGO RCDATA "assets\\watchman-logo.png"
+
+IDR_FONT_INTER_REGULAR RCDATA "fonts\\Inter-Regular.ttf"
+IDR_FONT_INTER_MEDIUM RCDATA "fonts\\Inter-Medium.ttf"
+IDR_FONT_INTER_SEMIBOLD RCDATA "fonts\\Inter-SemiBold.ttf"
+IDR_FONT_INTER_BOLD RCDATA "fonts\\Inter-Bold.ttf"
+IDR_FONT_INTER_EXTRABOLD RCDATA "fonts\\Inter-ExtraBold.ttf"
+IDR_FONT_NUNITO_SANS RCDATA "fonts\\NunitoSans-ExtraBold.ttf"
+IDR_FONT_JETBRAINS_REGULAR RCDATA "fonts\\JetBrainsMono-Regular.ttf"
+IDR_FONT_JETBRAINS_MEDIUM RCDATA "fonts\\JetBrainsMono-Medium.ttf"
+IDR_FONT_JETBRAINS_SEMIBOLD RCDATA "fonts\\JetBrainsMono-SemiBold.ttf"
+IDR_FONT_JETBRAINS_BOLD RCDATA "fonts\\JetBrainsMono-Bold.ttf"
