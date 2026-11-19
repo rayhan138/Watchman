@@ -1,0 +1,61 @@
+# Only on a freshly provisioned Windows runner, immediately after Test-LegacyInstall.
+param([string]$Setup = 'builds/staged/Watchman_2.0.0_x64-setup.exe')
+$ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
+function Require($ok,$message){ if (!$ok) { throw $message } }
+function Entry {
+    $rows = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' | Where-Object DisplayName -eq 'Watchman')
+    Require ($rows.Count -eq 1) 'Expected one machine uninstall entry'
+    $rows[0]
+}
+function Wait-App($file, $argsList) {
+    $process = Start-Process -FilePath $file -ArgumentList $argsList -PassThru
+    Require ($process.WaitForExit(120000)) "Timed out: $file"
+    Require ($process.ExitCode -eq 0) "Failed ($($process.ExitCode)): $file"
+}
+$old = Entry
+Require ($old.DisplayVersion -eq '1.0.5') 'Baseline missing'
+$app = Join-Path (Split-Path $old.UninstallString.Trim('"')) 'watchman.exe'
+$profileDir = Join-Path $env:APPDATA 'Watchman'
+$native = Join-Path $env:APPDATA 'Watchman.Native'
+$null = New-Item $profileDir -ItemType Directory -Force
+'{"theme":"light","startOnBoot":true,"unitModeBits":true,"hideGauges":true,"futureField":123}' | Set-Content "$profileDir/settings.json"
+'{"records":{"2025-01-01":{"upload":707,"download":808}}}' | Set-Content "$profileDir/history.json"
+'Stay intact' | Set-Content "$profileDir/unknown.txt"
+$v1 = Start-Process $app -PassThru
+Start-Sleep -Seconds 8
+Require (!$v1.HasExited) 'Released v1 is not running'
+# The v1 updater uses the passive/update/restart contract; wait for installer, not its restarted child.
+Wait-App $Setup '/P /UPDATE /R'
+Require ($v1.HasExited) 'Old app did not stop'
+$new = Entry
+Require ($old.PSPath -eq $new.PSPath -and $new.DisplayVersion -eq '2.0.0') 'Wrong uninstall identity'
+Require ((Get-FileHash $app).Hash -eq (Get-FileHash builds/native/Release/Watchman.exe).Hash) 'Installed executable is not the MSVC build'
+for ($i=0; $i -lt 60 -and !(Test-Path "$native/migration-v2.complete"); $i++) { Start-Sleep 1 }
+Require (Test-Path "$native/migration-v2.complete") 'Restart/first launch did not migrate data'
+Require (@(Get-Process watchman -ErrorAction Ignore).Count -eq 1) 'Expected one restarted Watchman'
+Require ((Get-ItemProperty 'HKCU:\Software\Watchman').UnitModeBits -eq 1) 'Settings were not imported'
+Require ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').Watchman -match 'watchman.exe" --startup$') 'Startup entry missing or invalid'
+foreach ($name in 'settings.json','history.json','unknown.txt','watchman.db') {
+    Require ((Get-FileHash "$profileDir/$name").Hash -eq (Get-FileHash "$native/original-v1/$name").Hash) "Original $name changed"
+}
+python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); assert c.execute('pragma integrity_check').fetchone()==('ok',); assert c.execute(`"select upload_bytes,download_bytes from daily_traffic where date='2025-01-01'`").fetchone()==(707,808)" "$native/watchman.db"
+$links = @(Get-ChildItem "$env:ProgramData/Microsoft/Windows/Start Menu/Programs" -Recurse -Filter 'Watchman.lnk')
+Require ($links.Count -eq 1) 'Expected one Start menu shortcut'
+Require ((New-Object -ComObject WScript.Shell).CreateShortcut($links[0].FullName).TargetPath -eq $app) 'Wrong shortcut target'
+Stop-Process -Name watchman -Force
+Wait-Process -Name watchman -Timeout 15 -ErrorAction SilentlyContinue
+# Isolate file fixtures; this job owns the entire disposable user and registry.
+$real = $env:APPDATA
+try {
+    $env:APPDATA = Join-Path $env:RUNNER_TEMP 'json-only-profile'
+    $older = New-Item "$env:APPDATA/Watchman" -ItemType Directory -Force
+    '{"records":{"2020-02-29":{"upload":123,"download":987}}}' | Set-Content "$older/history.json.bak"
+    'broken' | Set-Content "$older/history.json"
+    Wait-App $app '--migrate-only'
+    Wait-App $app '--migrate-only'
+    python -c "import sqlite3,sys; assert sqlite3.connect(sys.argv[1]).execute('select upload_bytes,download_bytes from daily_traffic').fetchall()==[(123,987)]" "$env:APPDATA/Watchman.Native/watchman.db"
+} finally { $env:APPDATA = $real }
+Wait-App $new.UninstallString.Trim('"') '/S'
+for ($i=0; $i -lt 30 -and (Test-Path $app); $i++) {Start-Sleep 1}
+Require (!(Test-Path $app) -and (Test-Path "$native/original-v1/history.json")) 'Uninstall removed data or left executable'

@@ -16,6 +16,7 @@
 #include "app_tracker.h"
 #include "ping_tester.h"
 #include "storage.h"
+#include "legacy_migration.h"
 #include "ui_style.h"
 #include "speed_tester.h"
 #include "taskbar_embed.h"
@@ -1211,6 +1212,14 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         MessageBoxW(nullptr, L"Watchman could not establish its single-instance guard. No monitoring was started.", L"Watchman", MB_OK | MB_ICONERROR);
         return 1;
     }
+
+    const bool migrate_only = std::find(arguments.begin(), arguments.end(), L"--migrate-only") != arguments.end();
+    try { PrepareNativeProfile(); }
+    catch (const std::exception& error) {
+        if (!migrate_only) MessageBoxA(nullptr, error.what(), "Watchman could not prepare this profile. Original files retained.", MB_ICONERROR);
+        return 2;
+    }
+    if (migrate_only) return 0;
 
     // Initialize WinSock (needed for ping sockets and general networking)
     WSADATA wsaData;

@@ -213,11 +213,11 @@ TrafficStorage::~TrafficStorage() {
 }
 
 std::wstring TrafficStorage::GetDatabasePath() {
-    const DWORD size = ExpandEnvironmentStringsW(L"%APPDATA%\\Watchman\\watchman.db", nullptr, 0);
+    const DWORD size = ExpandEnvironmentStringsW(L"%APPDATA%\\Watchman.Native\\watchman.db", nullptr, 0);
     if (size == 0) return {};
     std::wstring path(size, L'\0');
     const DWORD written = ExpandEnvironmentStringsW(
-        L"%APPDATA%\\Watchman\\watchman.db", path.data(), size);
+        L"%APPDATA%\\Watchman.Native\\watchman.db", path.data(), size);
     if (written == 0 || written > size || path.find(L"%APPDATA%") != std::wstring::npos) return {};
     path.resize(written - 1);
     return path;

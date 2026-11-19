@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "renderer.h"
+#include "update.h"
 #include <d2d1helper.h>
 #include <wincodec.h>
 #include "speed_tester.h"
@@ -3160,17 +3161,7 @@ void AppRenderer::OnLButtonDown(HWND hwnd, int x, int y, WatchmanEngine& engine)
             return;
         }
         if (contains(updates_button)) {
-            // Native update installation needs a signed installer package.
-            // Open the real release channel rather than presenting a fake
-            // local update result.
-            ShellExecuteW(
-                hwnd,
-                L"open",
-                L"https://github.com/rayhan138/Watchman/releases/latest",
-                nullptr,
-                nullptr,
-                SW_SHOWNORMAL
-            );
+            CheckForUpdate(hwnd);
             return;
         }
         if (contains(period_rect)) {

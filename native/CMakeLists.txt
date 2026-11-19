@@ -15,6 +15,8 @@ endif()
 
 # Source files
 set(SOURCES
+    update.cpp
+    legacy_migration.cpp
     main.cpp
     renderer.cpp
     metrics.cpp
@@ -77,6 +79,8 @@ add_executable(Watchman WIN32 ${SOURCES} ${HEADERS})
 
 # Link necessary Windows SDK libraries
 target_link_libraries(Watchman PRIVATE
+    version.lib
+    crypt32.lib
     d2d1.lib
     dwrite.lib
     dwmapi.lib
