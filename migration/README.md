@@ -37,7 +37,11 @@ The full public key is identical in tags v1.0.1–v1.0.5. v1.0.5 is `2e490a181ce
 
 ## Acceptance evidence
 
-The staging installer tested before the SQLite-only policy is superseded. Do not use it to validate this revision. `test_history_policy.py` exercises the installed executable with overlapping SQLite/JSON days, an earlier C++ per-app table and WAL, an existing native-only record, JSON-only data, and damaged/missing database files. The signed staging job tests the exact artifact on a second Windows VM.
+Use the [new signed staging artifact](https://github.com/rayhan138/Watchman/actions/runs/44613120194/artifacts/14573248074) built from `a8e6314e4ea27fe79270f4f7fc6be59e8674188a`. It supersedes the earlier 2.0.0 staging build, which imported history JSON. The Settings header shows **v2.0.0**; because both candidates have the same version, identify this build by its artifact ID and hash, not by the badge alone.
+
+* [Build, CTest, CI signing and verification against released v1 trust](https://github.com/rayhan138/Watchman/actions/runs/44613120194/job/135874628219): passed. Archive SHA-256: `673744648717cb9a5da65cd84073785ca4aae4ce60a7149422e3ac1e74d400b8` (ZIP, not EXE). The archive contains the installer, `.sig`, staged `latest.json` and expected installed app hash.
+* [Independent signed-byte acceptance on disposable Windows](https://github.com/rayhan138/Watchman/actions/runs/44613120194/job/135876263116): passed. The second runner upgraded installed v1.0.5 from a non-default path via controlled HTTPS, tested settings, startup, shortcuts, uninstall and rollback. Installed-executable fixtures checked daily/per-app SQLite from an earlier C++ schema with committed WAL data, valid conflicting JSON, fresh empty history with JSON only, untouched originals/backups, survival of an existing native-only row, and refusal to replace corrupt/truncated/orphaned history. The production feed was not redirected or modified.
+* [Default-path v1.0.5 upgrade on Windows](https://github.com/rayhan138/Watchman/actions/runs/44613128680/job/135874648427): passed.
 
 ## Recovery and limitations
 
