@@ -1,6 +1,6 @@
-# Watchman 2.0.1 publisher hotfix — candidate
+# Watchman 2.0.1 publisher hotfix
 
-The published v2.0.0 release remains stable Latest while this candidate is built and tested. Do not publish or promote v2.0.1 unless both independent disposable-Windows upgrade tests pass on the exact same signed artifact.
+The v2.0.0 tag, signed assets, and updater trust remain unchanged. The v2.0.1 publisher hotfix may be promoted only through the manual gate after both independent disposable-Windows upgrades pass on the same signed artifact.
 
 ## Provenance and package
 
@@ -37,7 +37,7 @@ The full public key is identical in tags v1.0.1–v1.0.5. v1.0.5 is `2e490a181ce
 
 ## Previous release baseline evidence (v2.0.0)
 
-The [signed v2.0.0 release baseline](https://github.com/rayhan138/Watchman/releases/tag/v2.0.0) is immutable and remains stable Latest until the v2.0.1 acceptance gate completes. Its tested artifact was built from `a8e6314e4ea27fe79270f4f7fc6be59e8674188a`; the Settings header showed **v2.0.0**. This baseline's tests and hashes are retained below for provenance.
+The [signed v2.0.0 release baseline](https://github.com/rayhan138/Watchman/releases/tag/v2.0.0) is immutable and its assets remain unchanged. It stayed stable Latest through v2.0.1 acceptance; the separate manual promotion gate transfers Latest only after both independent Windows tests pass. Its tested artifact was built from `a8e6314e4ea27fe79270f4f7fc6be59e8674188a`; the Settings header showed **v2.0.0**. This baseline's tests and hashes are retained below for provenance.
 
 * [Build, CTest, CI signing and verification against released v1 trust](https://github.com/rayhan138/Watchman/actions/runs/44613120194/job/135874628219): passed. Archive SHA-256: `673744648717cb9a5da65cd84073785ca4aae4ce60a7149422e3ac1e74d400b8` (ZIP, not EXE). The archive contains the installer, `.sig`, staged `latest.json` and expected installed app hash.
 * [Independent signed-byte acceptance on disposable Windows](https://github.com/rayhan138/Watchman/actions/runs/44613120194/job/135876263116): passed. The second runner upgraded installed v1.0.5 from a non-default path via controlled HTTPS, tested settings, startup, shortcuts, uninstall and rollback. Installed-executable fixtures checked daily/per-app SQLite from an earlier C++ schema with committed WAL data, valid conflicting JSON, fresh empty history with JSON only, untouched originals/backups, survival of an existing native-only row, and refusal to replace corrupt/truncated/orphaned history. The production feed was not redirected or modified.
@@ -45,11 +45,13 @@ The [signed v2.0.0 release baseline](https://github.com/rayhan138/Watchman/relea
 
 ## v2.0.1 acceptance evidence
 
-**Not yet run.** The candidate has not been built, signed, or tested yet. Do not publish unless both independent Windows jobs pass on one identical staged artifact:
+The final candidate was built and signed from commit `1154283b2a81f57089e66f792862ea17362a9c54` on the active hotfix branch. Staging run [44634660279](https://github.com/rayhan138/Watchman/actions/runs/44634660279) completed successfully. Both independent Windows jobs downloaded the same `watchman-2.0.1-staged` artifact from that run and passed:
 
-* v1.0.5 → v2.0.1: [pending]
-* v2.0.0 → v2.0.1: [pending]
-* Staged installer, matching `.sig`, feed, executable hash and artifact provenance: [pending]
+* v1.0.5 → v2.0.1: [passed](https://github.com/rayhan138/Watchman/actions/runs/44634660279/job/135951268760). Verified publisher/CompanyName, exact installed executable hash, single in-place install, custom path, SQLite and settings/startup/profile preservation, JSON-history non-import, and rollback.
+* v2.0.0 → v2.0.1: [passed](https://github.com/rayhan138/Watchman/actions/runs/44634660279/job/135951268761). Verified genuine signed v2.0.0 baseline, same install/uninstall identity, publisher/CompanyName, custom path, SQLite history, settings/startup/profile preservation, and one install.
+* Staged signed installer, matching `.sig`, `latest.json`, and installed-executable hash: [stage job passed](https://github.com/rayhan138/Watchman/actions/runs/44634660279/job/135949961292). Artifact `watchman-2.0.1-staged` is 1,881,362 bytes, SHA-256 `7294ce8ca0a10bf4c2c421c12aa52345db47ff557d279b41f11945d7f8fe8938`.
+
+`promote-tested-v201.yml` is the only publishing path. It requires this successful staging run and both job results, downloads the same artifact by run ID, re-verifies the signed installer and feed, refuses overwrites, and checks the public assets plus unchanged v2.0.0/v1.x releases and tags. Promotion publishes the tested bytes as stable Latest; signing secrets are not exposed to the promotion job.
 
 ## Recovery and limitations
 

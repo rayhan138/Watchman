@@ -9,7 +9,7 @@
 
 # Watchman
 
-**2.0.1 publisher hotfix candidate:** The app in `native/` is C++/Win32. The candidate sets the Windows publisher and executable CompanyName to **Noman Dhoni** while retaining the existing install identity and user data. [Migration notes and acceptance evidence](migration/README.md). The stable release link remains on v2.0.0 until both independent Windows upgrade tests pass.
+**2.0.1 publisher hotfix:** The app in `native/` is C++/Win32. The signed candidate sets Windows Installed apps Publisher and executable CompanyName to **Noman Dhoni** while retaining the existing install identity and user data. [Windows acceptance evidence and gated promotion details](migration/README.md). The v2.0.0 tag and assets remain unchanged.
 
 Watchman is a lightweight Windows network monitor that helps you see what your PC is doing with your internet in real time.
 
