@@ -3,6 +3,17 @@ trap { Write-Host "::error::$($_.Exception.Message) at line $($_.InvocationInfo.
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 Set-Location "$PSScriptRoot/.."
+$versionHeader = Get-Content native/version.h -Raw
+$nativeVersion = [regex]::Match($versionHeader, '(?m)^#define WATCHMAN_VERSION_TEXT "([0-9]+\.[0-9]+\.[0-9]+)"\r?$').Groups[1].Value
+$numericVersion = @('MAJOR','MINOR','PATCH' | ForEach-Object {
+    [regex]::Match($versionHeader, "(?m)^#define WATCHMAN_VERSION_$_ ([0-9]+)\r?$").Groups[1].Value
+}) -join '.'
+if (!$nativeVersion -or $numericVersion -cne $nativeVersion) { throw 'Text and numeric native versions do not match' }
+$package = Get-Content src-tauri/native-package.json -Raw | ConvertFrom-Json
+$config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+if ($package.version -cne $nativeVersion) { throw "Native and NSIS package versions must match ($nativeVersion)" }
+if ($config.version -cne '1.0.5') { throw 'Keep the historical Tauri app configuration at 1.0.5; the native package override owns the executable version' }
+if ($package.bundle.publisher -cne 'Noman Dhoni') { throw 'NSIS publisher must be exactly Noman Dhoni' }
 cmake -S native -B builds/native -A x64 -DBUILD_TESTING=ON
 $PSNativeCommandUseErrorActionPreference = $false
 cmake --build builds/native --config Release --parallel 4 2>&1 | Tee-Object builds/compile.log
@@ -22,12 +33,12 @@ $null = New-Item src-tauri/target/release -ItemType Directory -Force
 Copy-Item builds/native/Release/Watchman.exe src-tauri/target/release/watchman.exe
 Copy-Item migration/verify/target/release/watchman-verify-release.exe src-tauri/
 Copy-Item native/fonts/*-*.txt src-tauri/
-# Bundle only: same NSIS template, binary name, publisher and registry identity as v1.
+# Bundle only: same NSIS template, binary name and uninstall identity; publisher is intentionally updated.
 npm ci --ignore-scripts --no-audit --no-fund
 $PSNativeCommandUseErrorActionPreference = $false
 & ./node_modules/.bin/tauri.cmd bundle --config src-tauri/native-package.json --bundles nsis --no-sign --ci 2>&1 | Tee-Object builds/bundle.log
 if ($LASTEXITCODE) { Get-Content builds/bundle.log -Tail 8 | ForEach-Object {Write-Host "::error::$_"}; throw 'Packaging failed' }
 $PSNativeCommandUseErrorActionPreference = $true
 $null = New-Item builds/staged -ItemType Directory -Force
-Copy-Item src-tauri/target/release/bundle/nsis/Watchman_2.0.0_x64-setup.exe builds/staged/
+Copy-Item "src-tauri/target/release/bundle/nsis/Watchman_${nativeVersion}_x64-setup.exe" builds/staged/
 (Get-FileHash builds/native/Release/Watchman.exe).Hash | Set-Content builds/staged/Watchman.exe.sha256

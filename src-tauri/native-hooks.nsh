@@ -1,4 +1,24 @@
 !macro NSIS_HOOK_PREINSTALL
+  ; Tauri's NSIS template derives its install-location registry key from the
+  ; publisher. The v1.x and v2.0.0 key was Software\blinkeye\Watchman;
+  ; changing the displayed publisher must not redirect an in-place update.
+  Push $4
+  ReadRegStr $4 SHCTX "Software\Noman Dhoni\Watchman" ""
+  ClearErrors
+  ${If} $4 == ""
+    ; Only apply this fallback while the selected path is still the default.
+    ; A user-selected directory on the interactive installer page wins.
+    ${If} $INSTDIR == "$PROGRAMFILES64\Watchman"
+      ReadRegStr $4 SHCTX "Software\blinkeye\Watchman" ""
+      ClearErrors
+      ${If} $4 != ""
+        StrCpy $INSTDIR $4
+        SetOutPath $INSTDIR
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  Pop $4
+
   FindWindow $0 "WatchmanWindowClass"
   ${If} $0 != 0
     ; Native ExitMessage is WM_APP + 14. Let the engine flush its pending samples.

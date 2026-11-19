@@ -57,6 +57,7 @@ set(HEADERS
     engine.h
     snapshots.h
     resource.h
+    version.h
     telemetry_math.h
     network_test_protocol.h
     light_theme_reference.h
@@ -114,9 +115,17 @@ set_target_properties(Watchman PROPERTIES
 # No separate font installer or runtime package is required.
 install(TARGETS Watchman RUNTIME DESTINATION .)
 install(FILES PORTABLE_README.txt DESTINATION .)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/version.h" WATCHMAN_VERSION_DEFINITION
+    REGEX "^#define WATCHMAN_VERSION_TEXT \"[0-9]+\\.[0-9]+\\.[0-9]+\"$")
+if(NOT WATCHMAN_VERSION_DEFINITION)
+    message(FATAL_ERROR "Could not read WATCHMAN_VERSION_TEXT from version.h")
+endif()
+string(REGEX REPLACE
+    "^#define WATCHMAN_VERSION_TEXT \"([0-9]+\\.[0-9]+\\.[0-9]+)\"$"
+    "\\1" WATCHMAN_APP_VERSION "${WATCHMAN_VERSION_DEFINITION}")
 set(CPACK_PACKAGE_NAME "Watchman")
-set(CPACK_PACKAGE_VERSION "2.0.0")
-set(CPACK_PACKAGE_FILE_NAME "Watchman-2.0.0-win64-portable")
+set(CPACK_PACKAGE_VERSION "${WATCHMAN_APP_VERSION}")
+set(CPACK_PACKAGE_FILE_NAME "Watchman-${WATCHMAN_APP_VERSION}-win64-portable")
 set(CPACK_GENERATOR "ZIP")
 include(CPack)
 
@@ -141,8 +150,16 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
     add_executable(WatchmanUpdateProtocolProbe update.cpp)
-    target_compile_definitions(WatchmanUpdateProtocolProbe PRIVATE WATCHMAN_PROTOCOL_PROBE)
+    target_compile_definitions(WatchmanUpdateProtocolProbe PRIVATE
+        WATCHMAN_PROTOCOL_PROBE WATCHMAN_PROTOCOL_PROBE_MAJOR=1
+        WATCHMAN_PROTOCOL_PROBE_MINOR=0 WATCHMAN_PROTOCOL_PROBE_PATCH=5)
     target_link_libraries(WatchmanUpdateProtocolProbe PRIVATE crypt32 version shell32 ole32 winhttp)
+
+    add_executable(WatchmanUpdateProtocolProbeV2 update.cpp)
+    target_compile_definitions(WatchmanUpdateProtocolProbeV2 PRIVATE
+        WATCHMAN_PROTOCOL_PROBE WATCHMAN_PROTOCOL_PROBE_MAJOR=2
+        WATCHMAN_PROTOCOL_PROBE_MINOR=0 WATCHMAN_PROTOCOL_PROBE_PATCH=0)
+    target_link_libraries(WatchmanUpdateProtocolProbeV2 PRIVATE crypt32 version shell32 ole32 winhttp)
     add_executable(FloatingMonitorSettingsLayoutTest tests/floating_monitor_settings_layout_test.cpp)
     target_include_directories(FloatingMonitorSettingsLayoutTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(FloatingMonitorSettingsLayoutTest PRIVATE gdi32)

@@ -9,7 +9,7 @@
 
 # Watchman
 
-**2.0.0 staging branch:** The app in `native/` is C++/Win32. [Migration notes, acceptance evidence and rollback](migration/README.md). The release link below still points to the public release; it does not distribute this candidate.
+**2.0.1 publisher hotfix:** The app in `native/` is C++/Win32. The signed candidate sets Windows Installed apps Publisher and executable CompanyName to **Noman Dhoni** while retaining the existing install identity and user data. [Windows acceptance evidence and gated promotion details](migration/README.md). The v2.0.0 tag and assets remain unchanged.
 
 Watchman is a lightweight Windows network monitor that helps you see what your PC is doing with your internet in real time.
 
@@ -108,7 +108,7 @@ cmake --build builds/native --config Release
 ctest --test-dir builds/native -C Release --output-on-failure
 ```
 
-For the complete installer, run `./migration/Build-Native.ps1` under PowerShell 7 with Rust/Cargo, Node/npm and network access for packaging tools. Output: `builds/staged/Watchman_2.0.0_x64-setup.exe`. This is **unsigned** until the separate staging signing workflow runs. The C++ binary embeds its logo, icon and fonts. The native signature verifier is installed beside it. Tauri's CLI runs only on the packaging host to reuse the v1 NSIS contract. It does not build the app or install WebView2.
+For the complete installer, run `./migration/Build-Native.ps1` under PowerShell 7 with Rust/Cargo, Node/npm and network access for packaging tools. Output: `builds/staged/Watchman_2.0.1_x64-setup.exe`. This is **unsigned** until the staging workflow signs it with the existing updater key. The C++ binary embeds its logo, icon, fonts, version and CompanyName. The native signature verifier is installed beside it. Tauri's CLI runs only on the packaging host to reuse the v1 NSIS contract; it does not build the app or install WebView2.
 
 `src/` and `src-tauri/` retain the v1 reference implementation. Do not run the v1 build command to produce v2 artifacts.
 

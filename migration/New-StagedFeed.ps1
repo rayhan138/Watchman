@@ -2,7 +2,10 @@
 param([Parameter(Mandatory)][string]$ArtifactDirectory)
 $ErrorActionPreference = 'Stop'
 $dir = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
-$name = 'Watchman_2.0.0_x64-setup.exe'
+$version = (Get-Content src-tauri/native-package.json -Raw | ConvertFrom-Json).version
+$nativeVersion = [regex]::Match((Get-Content native/version.h -Raw), '(?m)^#define WATCHMAN_VERSION_TEXT "([0-9]+\.[0-9]+\.[0-9]+)"\r?$').Groups[1].Value
+if (!$nativeVersion -or $version -cne $nativeVersion) { throw 'Native and installer versions do not match' }
+$name = "Watchman_${version}_x64-setup.exe"
 $installer = Join-Path $dir $name
 $sig = (Get-Content -LiteralPath "$installer.sig" -Raw).Trim()
 $temp = [IO.Path]::GetTempFileName()
@@ -14,12 +17,12 @@ try {
     Remove-Item -LiteralPath $temp
 }
 $feed = [ordered]@{
-    version = '2.0.0'
-    notes = "Update level: optional`n`nMigrate Watchman to the native Windows application."
+    version = $version
+    notes = "Watchman $version publisher and metadata update."
     pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     platforms = @{'windows-x86_64' = @{
         signature = $sig
-        url = "https://github.com/rayhan138/Watchman/releases/download/v2.0.0/$name"
+        url = "https://github.com/rayhan138/Watchman/releases/download/v$version/$name"
     }}
 }
 # Never overwrite even a local pre-existing manifest.

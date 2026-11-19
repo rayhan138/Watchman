@@ -1,8 +1,10 @@
 # Only on a freshly provisioned Windows runner, immediately after Test-LegacyInstall.
-param([string]$Setup = 'builds/staged/Watchman_2.0.0_x64-setup.exe', [string]$ProtocolProbe)
+param([string]$Setup, [string]$ProtocolProbe)
 trap { Write-Host "::error::$($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)"; exit 1 }
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
+$version = (Get-Content src-tauri/native-package.json -Raw | ConvertFrom-Json).version
+if (!$Setup) { $Setup = "builds/staged/Watchman_${version}_x64-setup.exe" }
 function Require($ok,$message){ if (!$ok) { throw $message } }
 function Entry {
     $rows = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' | Where-Object DisplayName -eq 'Watchman')
@@ -14,9 +16,14 @@ function Wait-App($file, $argsList) {
     Require ($process.WaitForExit(120000)) "Timed out: $file"
     Require ($process.ExitCode -eq 0) "Failed ($($process.ExitCode)): $file"
 }
+$setupInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path $Setup).Path)
+Require ($setupInfo.ProductVersion -ceq $version) 'Installer PE ProductVersion is not the candidate version'
 $old = Entry
 Require ($old.DisplayVersion -eq '1.0.5') 'Baseline missing'
+$oldEntryPath = $old.PSPath
+$oldInstallPath = $old.InstallLocation.Trim('"')
 $app = Join-Path (Split-Path $old.UninstallString.Trim('"')) 'watchman.exe'
+Require ((Split-Path $app) -eq $oldInstallPath) 'Baseline install location and uninstaller path disagree'
 $profileDir = Join-Path $env:APPDATA 'Watchman'
 $native = Join-Path $env:APPDATA 'Watchman.Native'
 $null = New-Item $profileDir -ItemType Directory -Force
@@ -32,7 +39,21 @@ Require (!$v1.HasExited) 'Released v1 is not running'
 if ($ProtocolProbe) { Wait-App $ProtocolProbe '--install' } else { Wait-App $Setup '/P /UPDATE /R' }
 Require ($v1.HasExited) 'Old app did not stop'
 $new = Entry
-Require ($old.PSPath -eq $new.PSPath -and $new.DisplayVersion -eq '2.0.0') 'Wrong uninstall identity'
+Require ($oldEntryPath -eq $new.PSPath -and $new.DisplayName -eq 'Watchman' -and $new.DisplayVersion -eq $version) 'Uninstall identity/version changed'
+Require ($new.Publisher -ceq 'Noman Dhoni') 'Installed apps publisher is not exactly Noman Dhoni'
+$installPath = $new.InstallLocation.Trim('"')
+Require ($installPath -eq $oldInstallPath -and (Split-Path $new.UninstallString.Trim('"')) -eq $oldInstallPath) 'Custom install path was not preserved'
+$locationKey = Get-Item 'HKLM:\SOFTWARE\Noman Dhoni\Watchman'
+Require ($locationKey.GetValue('') -eq $installPath) 'New publisher install-location key was not saved'
+$locationKey.Close()
+$legacyLocationKey = Get-Item 'HKLM:\SOFTWARE\blinkeye\Watchman'
+Require ($legacyLocationKey.GetValue('') -eq $oldInstallPath) 'Legacy install-location key was not retained for rollback'
+$legacyLocationKey.Close()
+$defaultInstall = Join-Path $env:ProgramFiles 'Watchman'
+if ($defaultInstall -ne $installPath) { Require (!(Test-Path (Join-Path $defaultInstall 'watchman.exe'))) 'Update created a duplicate default-path installation' }
+$installedInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($app)
+Require ($installedInfo.CompanyName -ceq 'Noman Dhoni') 'Executable CompanyName is not exactly Noman Dhoni'
+Require ($installedInfo.FileVersion -ceq $version -and $installedInfo.ProductVersion -ceq $version) 'Executable PE version metadata is not 2.0.1'
 Require ((Get-FileHash $app).Hash -eq (Get-Content builds/staged/Watchman.exe.sha256).Trim()) 'Installed executable is not the MSVC build'
 $baseline = "$env:RUNNER_TEMP/watchman-v1-baseline/Watchman_1.0.5_x64-setup.exe"
 & (Join-Path (Split-Path $app) 'watchman-verify-release.exe') $baseline "$baseline.minisig"
