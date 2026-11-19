@@ -1,0 +1,113 @@
+# One-time transport for the explicitly approved artifact. This workflow lives
+# only on the Arena working branch, NOT on main or the release commit.
+name: Promote exact approved Watchman 2.0.0 artifact
+on:
+  push:
+    branches: [arena/03b9380c-watchman]
+    paths: [.github/workflows/promote-approved-v2.yml]
+permissions:
+  actions: read
+  contents: write
+concurrency: promote-watchman-v2.0.0
+jobs:
+  promote:
+    if: github.repository == 'rayhan138/Watchman'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MERGE: a26e926e84a1ac275fa15326d77bc2d6e0639042
+      TESTED: a8e6314e4ea27fe79270f4f7fc6be59e8674188a
+      GH_REPO: rayhan138/Watchman
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.MERGE }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify merged source and build only the standalone public-key verifier
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$MERGE"
+          git diff --exit-code "$TESTED" HEAD -- . ':(exclude)migration/README.md'
+          cargo build --release --locked --manifest-path migration/verify/Cargo.toml
+      - name: Validate candidate, publish all assets together, verify public bytes
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import base64, hashlib, json, os, re, subprocess as sp, tempfile, zipfile
+          from pathlib import Path
+          repo = os.environ['GH_REPO']
+          api_base = 'repos/' + repo
+          sha = os.environ['MERGE']
+          tag = 'v2.0.0'
+          run_id, artifact = 44613120194, 14573248074
+          digest = '673744648717cb9a5da65cd84073785ca4aae4ce60a7149422e3ac1e74d400b8'
+          exe = 'Watchman_2.0.0_x64-setup.exe'
+          sig = exe + '.sig'
+          manifest = 'latest.json'
+          names = [exe, sig, manifest]
+          url = f'https://github.com/{repo}/releases/download/{tag}/'
+          verifier = Path('migration/verify/target/release/watchman-verify-release').resolve()
+          def check(ok, reason):
+              if not ok: raise RuntimeError(reason)
+          def gh(*args): return sp.check_output(['gh', *map(str, args)])
+          def api(path, *args): return json.loads(gh('api',api_base+path,*args))
+          def refs(pattern): return sp.check_output(['git','ls-remote','--refs','origin',pattern]).decode().splitlines()
+          def releases():
+              return [r for page in json.loads(gh('api','--paginate','--slurp',api_base+'/releases?per_page=100')) for r in page]
+          def hash_(data): return hashlib.sha256(data).hexdigest()
+          def validate_files(d):
+              data = json.loads((d/manifest).read_bytes().decode('utf-8-sig'))
+              s = (d/sig).read_text().strip()
+              check(data['version']=='2.0.0' and data['platforms']=={'windows-x86_64': {'url':url+exe,'signature':s}}, 'Manifest/asset/signature mismatch')
+              decoded = d/'detached.minisig'
+              decoded.write_bytes(base64.b64decode(s, validate=True))
+              sp.run([verifier,d/exe,decoded],check=True)
+          check(api('/pulls/8')['merge_commit_sha']==sha and api('/pulls/8')['merged'], 'Wrong merge commit')
+          info = api(f'/actions/artifacts/{artifact}')
+          check(info['id']==artifact and info['name']=='watchman-2.0.0-staged' and not info['expired'] and info['workflow_run']['id']==run_id and info['workflow_run']['head_sha']==os.environ['TESTED'] and info['digest']=='sha256:'+digest, 'Artifact provenance mismatch')
+          check(api(f'/actions/runs/{run_id}')['conclusion']=='success','Staging run did not pass')
+          old_refs = refs('refs/tags/v1.*')
+          old_ids = {r['tag_name']:r['id'] for r in releases() if r['tag_name'].startswith('v1.') and not r['draft']}
+          check(len(old_ids)>=5 and api('/releases/latest')['tag_name']=='v1.0.5','Unexpected release baseline')
+          check(not refs('refs/tags/'+tag) and not any(r['tag_name']==tag for r in releases()),'v2.0.0 tag/release conflict')
+          with tempfile.TemporaryDirectory() as tmp:
+              d=Path(tmp); z=d/'candidate.zip'
+              z.write_bytes(gh('api',api_base+f'/actions/artifacts/{artifact}/zip'))
+              check(hash_(z.read_bytes())==digest,'Downloaded archive SHA-256 mismatch')
+              with zipfile.ZipFile(z) as archive:
+                  check(sorted(archive.namelist())==sorted(names+['Watchman.exe.sha256']), 'Unexpected archive contents')
+                  for name in names: (d/name).write_bytes(archive.read(name))
+              validate_files(d)
+              hashes={name:hash_((d/name).read_bytes()) for name in names}
+              print('Validated candidate file SHA-256s:', hashes,flush=True)
+              check(not refs('refs/tags/'+tag) and not any(r['tag_name']==tag for r in releases()),'Conflict before creating draft')
+              gh('release','create',tag,'--repo',repo,'--draft','--target',sha,'--title','Watchman v2.0.0','--notes',
+                 'Watchman is now a native Windows C++ application. This x64 installer upgrades the per-machine v1 installation. Existing SQLite history and supported settings are preserved; history JSON files remain untouched and are not imported. The installer is signed for the Watchman updater.',
+                 *[d/name for name in names])
+              candidates=[r for r in releases() if r['tag_name']==tag]
+              check(len(candidates)==1 and candidates[0]['draft'] and not candidates[0]['prerelease'] and candidates[0]['target_commitish']==sha,'Ambiguous or incorrect draft release')
+              rid=candidates[0]['id']
+              assets=api(f'/releases/{rid}/assets')
+              check(sorted(a['name'] for a in assets)==sorted(names),'Draft asset conflict')
+              for a in assets:
+                  check(a['state']=='uploaded' and hash_(gh('api',api_base+f"/releases/assets/{a['id']}",'-H','Accept: application/octet-stream'))==hashes[a['name']], 'Uploaded draft bytes differ: '+a['name'])
+              check(not refs('refs/tags/'+tag), 'Tag conflict before activating release')
+              # Publishing this new draft creates the tag at its validated target.
+              live=api(f'/releases/{rid}','--method','PATCH','-F','draft=false','-F','prerelease=false','-f','make_latest=true')
+              check(live['id']==rid and not live['draft'] and not live['prerelease'] and api('/releases/latest')['id']==rid,'Release is not stable Latest')
+              check(refs('refs/tags/'+tag)==[sha+'\trefs/tags/'+tag], 'Release tag target mismatch')
+              public=d/'public'; public.mkdir()
+              for name in names:
+                  # Read the manifest via the production updater URL, unauthenticated.
+                  address = f'https://github.com/{repo}/releases/latest/download/latest.json' if name==manifest else url+name
+                  sp.run(['curl','--fail','--silent','--show-error','--location','--proto','=https','--proto-redir','=https','--output',public/name,address],check=True)
+                  check(hash_((public/name).read_bytes())==hashes[name],'Public byte mismatch: '+name)
+              validate_files(public)
+              remaining={r['tag_name']:r['id'] for r in releases() if r['tag_name'].startswith('v1.') and not r['draft']}
+              check(refs('refs/tags/v1.*')==old_refs and remaining==old_ids,'v1 releases/tags changed')
+              with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
+                  print(f"Published and verified {live['html_url']} at `{sha}` from artifact {artifact}.\n",file=out)
+                  for name,h in hashes.items(): print(f'- `{name}`: `{h}`',file=out)
+              print('Public verification passed:',live['html_url'])
