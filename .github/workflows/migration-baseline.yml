@@ -1,0 +1,21 @@
+name: Migration baseline (released v1.0.5)
+on:
+  pull_request:
+    paths:
+      - 'migration/**'
+      - '.github/workflows/migration-baseline.yml'
+permissions:
+  contents: read
+jobs:
+  legacy-install:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify and install the released per-machine baseline
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./migration/Test-LegacyInstall.ps1
