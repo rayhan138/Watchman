@@ -38,8 +38,8 @@ Notes
   stop when hidden/minimized/inactive. Monitoring and enabled widgets continue.
   Inactive-tab snapshots are not copied unnecessarily. No measured MB saving is
   claimed; the reported 20-30 MB footprint is already modest.
-- Settings use the current user's Registry. History uses APPDATA\Watchman\watchman.db.
-  This is not an isolated profile; back up important history before testing.
+- Settings use the current user's Registry. History uses APPDATA\Watchman.Native\watchman.db.
+  Original v1 data is preserved separately. Test only on disposable profiles.
 - Startup defaults on for new settings; an existing saved off choice is respected.
   Keep the EXE in its final folder so Windows startup points at the intended path.
 - Double-click the floating monitor or taskbar widget to open Data > Last 7 Days.

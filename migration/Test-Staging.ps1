@@ -31,6 +31,11 @@ try {
     }
     Start-Sleep 2
     Probe 0
+    New-Item "$dir/redirect-test" -ItemType File | Out-Null
+    Probe 2
+    Remove-Item "$dir/redirect-test"
+    $feed.platforms.PSObject.Properties.Remove('windows-x86_64'); Save-Feed; Probe 2
+    $feed.platforms | Add-Member -NotePropertyName 'windows-x86_64' -NotePropertyValue $entry
     $feed.version = '1.0.5'; Save-Feed; Probe 3
     $feed.version = '2.0.0'
     $url = $entry.url; $entry.url = 'http://localhost/unsigned'; Save-Feed; Probe 2

@@ -1,64 +1,42 @@
-# 2.0 migration staging — incomplete, do not release
+# Watchman 2.0.0 migration candidate — staging only
 
-The native source of record is `rayhan138/watchman-c-` at
-`3b04d7d9446c6efa2a11d6b35aea019e5f7685a0`. Read access is required to proceed.
-Do not bump the Tauri project's version as a workaround. The repository's
-existing tag-triggered/manual v1 release job **publishes**; do not dispatch it
-or push a tag to stage this migration.
+Do not publish, tag, set Latest, change the production feed, or merge the draft PR as part of staging.
 
-## Baseline and artifact gate
+## Provenance and package
 
-* The updater configs under `src-tauri/tauri.conf.json` in tags v1.0.1–v1.0.5
-  contain the same full minisign public key. The v1.0.5 tag points to
-  `2e490a181ce7eee09a38a13c65c375489b47a01c`; its config blob is
-  `6f5f4b542b9e5f5681c6b7fe740b5c4f35bd2536`. That config specifies a
-  per-machine NSIS installation and passive updater mode.
-* The migration baseline PR job uses a fresh Windows runner. It downloads
-  assets from **that tag**, checks the x64 manifest against the detached
-  signature, verifies the actual installer with the pinned v1 key, checks
-  rejection of a one-byte mutation, installs silently, and logs the installer
-  hash and uninstall entry. This does **not** test an upgrade to v2.
-* `New-StagedFeed.ps1 -ArtifactDirectory <staging-directory>` is a local-only
-  packaging gate for CI after building and signing: it requires the final
-  x64 installer and its Tauri-format `.sig`. The generated `latest.json`
-  names the intended immutable v2 asset URL. It creates no tag, release or
-  network resource. A staging server must use a separate test manifest/URL.
-  The offline Rust verifier is tooling, not part of the installed app.
+The supplied GitHub archive's root name and ZIP comment identify `rayhan138/watchman-c-@3b04d7d9446c6efa2a11d6b35aea019e5f7685a0`; the decoded ZIP SHA-256 is `bac1be3f7991de5785db66cc63569c0da123d075c1ab05bb57e85e10c6a11ab7`. Application code, SQLite amalgamation, RC, icon, logo, fonts/licenses, build inputs and tests are in `native/`. The import excludes agent metadata and the upstream release workflow. `third_party/nlohmann` is the MIT-licensed single header from v3.12.0 added for JSON parsing.
 
-## Required before approval (not demonstrated by the baseline job)
+`Build-Native.ps1` builds/tests x64 MSVC Release and uses the locked Tauri CLI **bundle only** command on the prebuilt C++ executable. `src-tauri/native-package.json` reuses the old per-machine NSIS identity/install path, uninstall registration, shortcut behavior, running-process check, and `/P /UPDATE /R` restart-as-user contract. It skips WebView2 and replaces the v1 resource list. The post-install hook deletes known loose v1 probe files, not unknown user files. The installer does not remove a shared Windows WebView2 runtime. Per-user registration and migration happen when that user launches the new app, not by scanning profiles from an elevated installer. Existing v1 `--minimized` startup commands are understood and rewritten to the native form.
 
-1. Import the pinned native tree with resources/fonts; inspect the resulting
-   executable, dependencies and native settings/history formats. Document a
-   field-by-field mapping based on those formats; do not guess native keys.
-2. Exercise the replacement NSIS on a running, installed v1.0.5, including
-   passive updater arguments, non-default installation path, shutdown, one
-   non-elevated restart, a single uninstall entry, shortcuts and per-user
-   startup on/off. Test elevation with a different administrator account.
-3. Back up each real user's `%APPDATA%\Watchman` before first native writes,
-   **as that user**, not the elevating administrator. Preserve `settings.json`,
-   `watchman.db` (and sidecars), `history.json`, backups and unknown files.
-   Quiesce all writers before copying; fail without changing originals on
-   error. Validate SQLite integrity and per-date byte totals on copies.
-   Exercise JSON-only, mixed, missing, corrupt and repeated migration; test
-   preservation of unknown settings and avoid counting overlapping days twice.
-4. Independently exercise installed v1-to-v2 and native-to-native update paths
-   on disposable Windows using controlled HTTPS staging (no production feed
-   changes). Require user consent, a newer version and signature verification
-   of the exact executable launched. Reject corrupt/unsigned payloads, wrong
-   platform, replay/downgrade, untrusted redirects and failed downloads. Do not
-   ship a trust-key or feed override for testing.
-5. Use existing signing secrets only in approved CI, never PR jobs. Retain
-   installer, signature, manifest, hashes and test logs as private staging
-   artifacts or in appropriately access-controlled storage, not a release.
+## Data contract
 
-## Recovery rehearsal
+* Source: `%APPDATA%\Watchman`. New active history: `%APPDATA%\Watchman.Native\watchman.db`. The legacy tree is not reused for writes. On first launch, after acquiring the instance guard, the app stages a full copy under a uniquely named sibling directory (rejects reparse points and locked data). It copies the DB plus sidecars from that snapshot to a **working** DB and integrity-checks it. A completed staging directory is renamed into place. `original-v1` inside it is the backup, not a live DB. Allow space for the snapshot **and** working database. Other Tauri identifier-specific app/WebView directories are untouched.
+* `history.json.records[YYYY-MM-DD]` contains `upload`/`download` bytes. Missing/unparseable JSON can fall back to `history.json.bak`. A SQLite transaction takes the maximum **per direction per day**, not the sum of overlapping sources. Extra tables, app rows and unknown files are retained. A complete profile is not re-imported. Bad DB integrity, invalid history values/dates, both JSON sources unreadable, disk full, or a conflicting destination stop migration; no silent empty history. Incomplete `Watchman.Migrating-*` directories can be inspected offline.
+* Native settings are written to `HKCU\Software\Watchman`, without replacing existing native values. Registry writes are individually idempotent, not one cross-file/registry transaction. If interrupted, retry before manually editing imported registry values.
 
-Snapshot the disposable machine before upgrading. Record v1 paths, startup
-state and uninstall registration; save the verified v1.0.5 installer. If the
-candidate fails, stop Watchman, retain a separate copy of post-upgrade data,
-remove the candidate without deleting user data, reinstall the verified v1
-installer, then restore the complete quiescent pre-upgrade data directory for
-each user (do not mix SQLite files and sidecars from different snapshots).
-Verify history totals, settings, startup state and one working shortcut before
-resuming normal use. Revert the VM snapshot if registration or data cannot be
-restored. This is a recovery **plan**, not evidence of a successful rollback.
+| v1 settings.json | Native setting |
+|---|---|
+| `startOnBoot`, `unitModeBits`, `hideGauges` | Autostart, UnitModeBits, HideHardwareGauges |
+| `theme` = dark/light/system | Theme = 0/1/2 |
+| `dataLimit`, `dataLimitEnabled` | DataLimitBytes (zero when disabled) |
+| `widgetSettings.mode` = full/network-only/system-only | WidgetMode = 0/1/2 |
+| `notifications.enabled`, `highUsageWarnings` | Combined alerts toggle |
+| `notifications.warningSettings` | Traffic toggle/threshold and MB/GB unit, memory toggle/percent, CPU/GPU/disk/mainboard temperature toggles and thresholds |
+| `memoryWarningEnabled`, `memoryWarningThreshold` | Fallback when nested memory settings absent |
+
+Not translated: focus theme; other widget styling, order and individual visibility controls; speed-test results and server selection; period start; active profiles; connection/data/slow-network notifications and sounds; network-health, monitoring intervals, troubleshooter and export presets; unknown fields. They remain in the original JSON and snapshot. Native defaults apply where there is no equivalent or a scalar is outside its supported range. Legacy browser-side state is not imported. The native app's optional temperature backend differs from v1's bundled PowerShell/DLL probe.
+
+## Update trust and staging
+
+The full public key is identical in tags v1.0.1–v1.0.5. v1.0.5 is `2e490a181ce7eee09a38a13c65c375489b47a01c` (updater config blob `6f5f4b542b9e5f5681c6b7fe740b5c4f35bd2536`). Native Tools → Check for updates uses WinHTTP/TLS, a fixed production feed, bounded downloads, restricted HTTPS redirects, a strictly newer numeric version, and the exact x64 tag/asset URL. It prompts before download/install. The native verifier checks the **bytes and signed filename** with the pinned key; PE product version must also match. The executable is locked against writing/deletion through launch. There is no production command-line feed/key override. Run the updater unelevated; NSIS requests elevation. Verification is updater trust, **not Authenticode**. SmartScreen may still prompt. A successfully handed-off installer can remain under the user's temp directory.
+
+`release-windows.yml` on this branch is **manual, artifact-only** (`contents: read`); it no longer publishes on tags. Only its signing step receives the existing secrets, not a PR job. `New-StagedFeed.ps1` verifies before creating `latest.json` in a fresh staging directory; the final URL deliberately will not work until a separately approved release. Do not dispatch the *old main-branch workflow* to stage this candidate. Keep the three assets from the **same successful run**; never substitute a rebuilt EXE for a signed one.
+
+`Test-LegacyInstall.ps1` checks genuine v1 assets and a tampered copy. `Test-Upgrade.ps1` starts installed v1, upgrades via NSIS, and checks path/registration, restarted process, native executable hash, startup and shortcut, retained SQLite and JSON, old backup-only recovery, idempotence and uninstall. Signed staging downloads the exact CI artifact on a separate Windows runner. `Test-Staging.ps1` serves a **copy** of the manifest with only its URL changed over localhost HTTPS; a separate build of the native update code (lower current version and loopback-only channel) checks accepted and rejected responses and launches the verified installer. No production DNS override, replacement signing trust, or production feed write. The stock v1 UI is not redirected to staging.
+
+## Recovery and limitations
+
+1. Before rollout, snapshot the VM or independently back up the user's data while Watchman is stopped. Record install path, Run state, native settings if any and daily totals; cache and verify the v1.0.5 installer/signature.
+2. On failure, stop Watchman, retain both data trees (including SQLite `-wal`/`-shm`) and any interrupted staging copy. Do not delete user data in the uninstaller. Uninstall v2, then reinstall the verified v1 binary at the original path. v1 should find its untouched original directory. If restoration is necessary, restore the **whole** quiescent directory from `original-v1` or the external backup. Never mix sidecars across snapshots. v2-only traffic after migration is not automatically merged back.
+3. Launch v1 as the real user; check totals, settings, shortcuts and per-user startup. Before retrying v2 after rollback, archive the completed native profile and any imported native registry values if a fresh migration is needed. Do not overwrite newer data without comparing both histories. Revert the VM snapshot if recovery is uncertain.
+4. Hosted Windows checks do not substitute for manual UAC with a different admin, multiple logged-on users, interactive cancel/restart, non-default install paths, interrupted power/disk writes, and real Win10/11 desktops. Machine uninstall cannot clear another user's HKCU Run value. Look for stale Run entries on shared machines. The inherited NSIS v1 fallback can force-stop a running process; unsaved in-memory samples cannot be recovered from a disk backup. Rollback to v1 is explicit, not an automatic feed downgrade.

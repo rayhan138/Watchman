@@ -149,7 +149,7 @@ int Exercise(const std::filesystem::path& output) {
     GetEnvironmentVariableW(L"WATCHMAN_SMOKE_DISPOSABLE", disposable, static_cast<DWORD>(std::size(disposable)));
     Require(std::wstring(disposable) == L"1", "Runtime smoke requires the disposable-runner wrapper");
     const auto appdata = output / L"engine-appdata";
-    const auto database_path = appdata / L"Watchman" / L"watchman.db";
+    const auto database_path = appdata / L"Watchman.Native" / L"watchman.db";
     Require(!std::filesystem::exists(database_path), "Refusing to reuse an existing runtime-smoke database");
     std::filesystem::create_directories(appdata);
     Require(SetEnvironmentVariableW(L"APPDATA", appdata.c_str()) != FALSE, "Could not isolate APPDATA");

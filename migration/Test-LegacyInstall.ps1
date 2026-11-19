@@ -1,4 +1,5 @@
 # Disposable Windows runner only. Does not read latest/download or publish anything.
+param([switch]$NonDefaultPath)
 $ErrorActionPreference = 'Stop'
 $dir = New-Item -ItemType Directory (Join-Path $env:RUNNER_TEMP 'watchman-v1-baseline')
 $name = 'Watchman_1.0.5_x64-setup.exe'
@@ -22,15 +23,19 @@ $verify = Join-Path $crate 'target/release/watchman-verify-release.exe'
 if ($LASTEXITCODE) { throw 'Untrusted installer' }
 $bad = [IO.File]::ReadAllBytes($setup)
 $bad[-1] = $bad[-1] -bxor 1
-[IO.File]::WriteAllBytes("$setup.bad", $bad)
-& $verify "$setup.bad" "$setup.minisig"
+$tamper = New-Item (Join-Path $dir tampered) -ItemType Directory
+[IO.File]::WriteAllBytes((Join-Path $tamper $name), $bad)
+& $verify (Join-Path $tamper $name) "$setup.minisig"
 if ($LASTEXITCODE -eq 0) { throw 'Corrupted installer passed verification' }
 Get-FileHash $setup | Format-List
-$p = Start-Process $setup -ArgumentList '/S' -Wait -PassThru
+# NSIS /D must be last and unquoted even with spaces. Keep machine installs ACL-protected.
+$argsLine = if ($NonDefaultPath) { "/S /D=$env:ProgramFiles\Watchman Acceptance" } else { '/S' }
+$p = Start-Process $setup -ArgumentList $argsLine -Wait -PassThru
 if ($p.ExitCode -ne 0) { throw "v1.0.5 install failed: $($p.ExitCode)" }
 $entries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
     Where-Object { $_.DisplayName -eq 'Watchman' })
 if ($entries.Count -ne 1 -or $entries[0].DisplayVersion -ne '1.0.5') { throw 'Unexpected machine uninstall registration' }
+if ($NonDefaultPath -and $entries[0].InstallLocation.Trim('"') -ne "$env:ProgramFiles\Watchman Acceptance") { throw 'Custom v1 path was not used' }
 $entries | Format-List PSPath, DisplayVersion, InstallLocation, UninstallString
 exit 0

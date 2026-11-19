@@ -12,7 +12,12 @@ if ($LASTEXITCODE) {
 }
 $PSNativeCommandUseErrorActionPreference = $true
 ctest --test-dir builds/native -C Release --output-on-failure --timeout 45
-cargo build --locked --release --manifest-path migration/verify/Cargo.toml
+# The installed verifier must not require a separate Visual C++ runtime.
+$previousRustflags = $env:RUSTFLAGS
+try {
+    $env:RUSTFLAGS = '-C target-feature=+crt-static'
+    cargo build --locked --release --manifest-path migration/verify/Cargo.toml
+} finally { $env:RUSTFLAGS = $previousRustflags }
 $null = New-Item src-tauri/target/release -ItemType Directory -Force
 Copy-Item builds/native/Release/Watchman.exe src-tauri/target/release/watchman.exe
 Copy-Item migration/verify/target/release/watchman-verify-release.exe src-tauri/

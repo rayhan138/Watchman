@@ -40,7 +40,7 @@ struct LaunchOptions {
 inline LaunchOptions ParseArguments(const std::vector<std::wstring>& arguments) {
     LaunchOptions result;
     for (size_t index = 1; index < arguments.size(); ++index) {
-        if (arguments[index] == L"--startup") result.startup = true;
+        if (arguments[index] == L"--startup" || arguments[index] == L"--minimized") result.startup = true;
         else if (arguments[index] == L"--replace-pid" && index + 1 < arguments.size()) {
             const auto& text = arguments[++index];
             uint64_t value = 0;

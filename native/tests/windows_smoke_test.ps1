@@ -441,7 +441,7 @@ try {
     Check 'Skipping the deferred tour saves completion' ((Read-Setting 'WelcomeTourVersion' 0) -eq 1)
     Stop-App $script:app $script:main
     $script:main = [IntPtr]::Zero
-    $appDb = Join-Path $env:APPDATA 'Watchman\watchman.db'
+    $appDb = Join-Path $env:APPDATA 'Watchman.Native\watchman.db'
     Check 'Real EXE creates persistent history at isolated APPDATA' (Test-Path $appDb)
     if (Test-Path $appDb) {
         & $RuntimeProbe --inspect-db $appDb | Set-Content (Join-Path $OutputDirectory 'application-database.jsonl')

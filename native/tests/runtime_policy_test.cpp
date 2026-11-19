@@ -22,6 +22,7 @@ int main() {
         LocalFree(argv);
         Check(arguments.size() == 2 && arguments[0] == path, "Startup command must round-trip a spaced path");
         Check(WatchmanRuntime::ParseArguments(arguments).startup, "Decoded startup launch must hide the main window");
+        Check(WatchmanRuntime::ParseArguments({path,L"--minimized"}).startup, "v1 autostart argument must stay quiet until Run is rewritten");
         Check(!WatchmanRuntime::ParseArguments({path}).startup, "Normal launch must show the main window");
         Check(!WatchmanRuntime::ParseArguments({L"C:\\--startup\\Watchman.exe", L"--startup-other"}).startup,
             "Flags must not match substrings in paths or other flags");

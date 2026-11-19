@@ -32,8 +32,11 @@ Require ($v1.HasExited) 'Old app did not stop'
 $new = Entry
 Require ($old.PSPath -eq $new.PSPath -and $new.DisplayVersion -eq '2.0.0') 'Wrong uninstall identity'
 Require ((Get-FileHash $app).Hash -eq (Get-Content builds/staged/Watchman.exe.sha256).Trim()) 'Installed executable is not the MSVC build'
+$baseline = "$env:RUNNER_TEMP/watchman-v1-baseline/Watchman_1.0.5_x64-setup.exe"
+& (Join-Path (Split-Path $app) 'watchman-verify-release.exe') $baseline "$baseline.minisig"
 for ($i=0; $i -lt 60 -and !(Test-Path "$native/migration-v2.complete"); $i++) { Start-Sleep 1 }
 Require (Test-Path "$native/migration-v2.complete") 'Restart/first launch did not migrate data'
+Require (!(Test-Path (Join-Path (Split-Path $app) 'vendor/libre-hardware-monitor/LibreHardwareMonitorLib.dll'))) 'Legacy sensor binaries left installed'
 Require (@(Get-Process watchman -ErrorAction Ignore).Count -eq 1) 'Expected one restarted Watchman'
 Require ((Get-ItemProperty 'HKCU:\Software\Watchman').UnitModeBits -eq 1) 'Settings were not imported'
 Require ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').Watchman -match 'watchman.exe" --startup$') 'Startup entry missing or invalid'
@@ -53,10 +56,29 @@ try {
     $older = New-Item "$env:APPDATA/Watchman" -ItemType Directory -Force
     '{"records":{"2020-02-29":{"upload":123,"download":987}}}' | Set-Content "$older/history.json.bak"
     'broken' | Set-Content "$older/history.json"
+    # Model a second Windows user with no native preferences (disposable HKCU only).
+    Remove-Item 'HKCU:\Software\Watchman' -Recurse
+    '{"startOnBoot":false,"notifications":{"warningSettings":{"gpuTempThreshold":91}}}' | Set-Content "$older/settings.json"
     Wait-App $app '--migrate-only'
     Wait-App $app '--migrate-only'
     python -c "import sqlite3,sys; assert sqlite3.connect(sys.argv[1]).execute('select upload_bytes,download_bytes from daily_traffic').fetchall()==[(123,987)]" "$env:APPDATA/Watchman.Native/watchman.db"
+    Require ((Get-ItemProperty 'HKCU:\Software\Watchman').WarningGpuTempThreshold -eq 91) 'Warning threshold lost'
+    $quiet = Start-Process $app -ArgumentList '--startup' -PassThru
+    for ($i=0; $i -lt 30 -and (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').Watchman; $i++) { Start-Sleep 1 }
+    Require (!$quiet.HasExited -and !(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').Watchman) 'Disabled startup not respected'
+    $quiet.Kill(); $quiet.WaitForExit()
+    $env:APPDATA = Join-Path $env:RUNNER_TEMP 'damaged-profile'
+    $bad = New-Item "$env:APPDATA/Watchman" -ItemType Directory -Force
+    'not SQLite' | Set-Content "$bad/watchman.db"
+    $before = (Get-FileHash "$bad/watchman.db").Hash
+    $failed = Start-Process $app -ArgumentList '--migrate-only' -PassThru -Wait
+    Require ($failed.ExitCode -ne 0 -and !(Test-Path "$env:APPDATA/Watchman.Native") -and (Get-FileHash "$bad/watchman.db").Hash -eq $before) 'Damaged history was silently replaced'
 } finally { $env:APPDATA = $real }
 Wait-App $new.UninstallString.Trim('"') '/S'
 for ($i=0; $i -lt 30 -and (Test-Path $app); $i++) {Start-Sleep 1}
 Require (!(Test-Path $app) -and (Test-Path "$native/original-v1/history.json")) 'Uninstall removed data or left executable'
+# The v1 files were never modified: reinstall the already verified v1 release.
+Wait-App "$env:RUNNER_TEMP/watchman-v1-baseline/Watchman_1.0.5_x64-setup.exe" "/S /D=$(Split-Path $app)"
+Require ((Entry).DisplayVersion -eq '1.0.5' -and (Test-Path $app)) 'Rollback registration failed'
+python -c "import sqlite3,sys; assert (707,808) in sqlite3.connect(sys.argv[1]).execute('select upload_bytes,download_bytes from daily_traffic').fetchall()" "$profileDir/watchman.db"
+"Verified rollback installation and original daily totals. Native history retained separately." | Write-Output

@@ -30,3 +30,8 @@ try {
 } finally {
     $out.Dispose()
 }
+foreach ($asset in $installer, "$installer.sig", (Join-Path $dir 'latest.json')) {
+    $hash = (Get-FileHash $asset).Hash
+    Write-Output "$hash  $([IO.Path]::GetFileName($asset))"
+    if ($env:GITHUB_STEP_SUMMARY) { Add-Content $env:GITHUB_STEP_SUMMARY "- $([IO.Path]::GetFileName($asset)): ``$hash``" }
+}

@@ -36,7 +36,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ./migration/Test-LegacyInstall.ps1
+          ./migration/Test-LegacyInstall.ps1 -NonDefaultPath
           cmake -S native -B builds/native -A x64 -DBUILD_TESTING=ON
           cmake --build builds/native --config Release --target WatchmanUpdateProtocolProbe
       - name: Test staged signed bytes, upgrade, older data and uninstall
