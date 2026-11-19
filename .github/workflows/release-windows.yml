@@ -1,100 +1,56 @@
-name: Release Windows
-
+name: Stage signed Windows candidate (no publication)
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
-
+    inputs:
+      existing_run:
+        description: 'Optional: retest signed artifact from this staging run, without rebuilding or signing'
+        required: false
+        type: string
+permissions:
+  contents: read
 jobs:
-  release-windows:
-    name: Build and publish Windows release
-    runs-on: windows-latest
-    permissions:
-      contents: write
-
+  stage:
+    if: inputs.existing_run == ''
+    runs-on: windows-2022
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        shell: pwsh
-        run: |
-          rustup default stable
-          rustc --version
-          cargo --version
-
-      - name: Install NSIS
-        shell: pwsh
-        run: |
-          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
-            choco install nsis -y --no-progress
-          }
-
-          $nsisPath = "${env:ProgramFiles(x86)}\NSIS"
-          if (Test-Path $nsisPath) {
-            Add-Content -Path $env:GITHUB_PATH -Value $nsisPath
-          }
-
-      - name: Install dependencies
-        run: npm ci --no-audit --no-fund
-
-      - name: Build signed release
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - run: ./migration/Build-Native.ps1
+      - name: Sign final installer
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri:build
-
-      - name: Create updater feed
-        shell: pwsh
-        run: |
-          $version = (Get-Content package.json | ConvertFrom-Json).version
-          $tag = "v$version"
-          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_x64-setup.exe" |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-
-          if (-not $installer) {
-            throw "Windows installer was not found."
-          }
-
-          $signaturePath = "$($installer.FullName).sig"
-          if (-not (Test-Path $signaturePath)) {
-            throw "Updater signature was not found: $signaturePath"
-          }
-
-          $signature = (Get-Content -Raw $signaturePath).Trim()
-          $assetUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$($installer.Name)"
-          $feed = [ordered]@{
-            version = $version
-            notes = "Update level: optional`n`nSee the release notes for details."
-            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-            platforms = [ordered]@{
-              "windows-x86_64" = [ordered]@{
-                signature = $signature
-                url = $assetUrl
-              }
-            }
-          }
-
-          $feed | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 latest.json
-
-      - name: Publish GitHub release
-        shell: pwsh
+        run: ./node_modules/.bin/tauri.cmd signer sign builds/staged/Watchman_2.0.0_x64-setup.exe
+      - name: Verify and create offline v1-compatible feed
+        run: ./migration/New-StagedFeed.ps1 builds/staged
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watchman-2.0.0-staged
+          path: builds/staged/
+          if-no-files-found: error
+  independent-upgrade:
+    needs: stage
+    if: ${{ !cancelled() && (needs.stage.result == 'success' || (inputs.existing_run != '' && needs.stage.result == 'skipped')) }}
+    permissions:
+      actions: read
+      contents: read
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/download-artifact@v4
+        with:
+          name: watchman-2.0.0-staged
+          path: builds/staged
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.existing_run || github.run_id }}
+      - name: Install trusted v1.0.5 and build isolated protocol probe
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $version = (Get-Content package.json | ConvertFrom-Json).version
-          $tag = "v$version"
-          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_x64-setup.exe" |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          $signaturePath = "$($installer.FullName).sig"
-          $notes = "Update level: optional`n`nSee the assets below to download and install Watchman."
-
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $installer.FullName $signaturePath latest.json --clobber
-          } else {
-            gh release create $tag $installer.FullName $signaturePath latest.json --target $env:GITHUB_SHA --title "Watchman $tag" --notes $notes
-          }
+          ./migration/Test-LegacyInstall.ps1 -NonDefaultPath
+          cmake -S native -B builds/native -A x64 -DBUILD_TESTING=ON
+          cmake --build builds/native --config Release --target WatchmanUpdateProtocolProbe
+      - name: Test staged signed bytes, upgrade, older data and uninstall
+        run: ./migration/Test-Staging.ps1

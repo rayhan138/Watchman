@@ -9,6 +9,8 @@
 
 # Watchman
 
+**2.0.0 staging branch:** The app in `native/` is C++/Win32. [Migration notes, acceptance evidence and rollback](migration/README.md). The release link below still points to the public release; it does not distribute this candidate.
+
 Watchman is a lightweight Windows network monitor that helps you see what your PC is doing with your internet in real time.
 
 It shows live download and upload speed, per-app bandwidth activity, traffic history, connection health, system usage, and a compact taskbar widget in one clean desktop app.
@@ -44,10 +46,9 @@ The goal is not to be a heavy network tool. Watchman is made to be small, useful
 - M-Lab speed test
 - CSV export for saved traffic history
 - Compact taskbar widget
-- Light, dark, and focus themes
+- Light, dark, and Windows system themes
 - Local-first data storage
 - Update checking
-- Feedback button
 
 ---
 
@@ -68,18 +69,18 @@ Watchman stores traffic history locally on your PC.
 Main history database:
 
 ```text
-%APPDATA%\Watchman\watchman.db
+%APPDATA%\Watchman.Native\watchman.db
 ```
 
 Example Windows path:
 
 ```text
-C:\Users\<your-name>\AppData\Roaming\Watchman\watchman.db
+C:\Users\<your-name>\AppData\Roaming\Watchman.Native\watchman.db
 ```
 
 Watchman uses a local SQLite database for saved traffic history. This data is used for the Data tab, charts, and CSV export.
 
-Your traffic history stays on your own computer.
+The 2.0.0 migration keeps SQLite history from v1 and earlier native builds. Without a database it starts empty; it never imports `history.json` or `history.json.bak`. Those files are retained, and settings migration is unchanged. A completed native profile is not reset.
 
 ---
 
@@ -92,7 +93,6 @@ Watchman is designed as a local-first desktop app.
 - Traffic history is stored locally
 - The app does not need your personal login data
 - Update checks only contact the GitHub release channel
-- The feedback button opens an external feedback form only when you click it
 
 Some Windows network information may come from system commands or Windows APIs. Watchman uses this information to show connection type, adapter details, speed, and connection health inside the app.
 
@@ -100,41 +100,17 @@ Some Windows network information may come from system commands or Windows APIs. 
 
 ## Development Setup
 
-### Prerequisites
-
-Install these before running the app locally:
-
-- Node.js
-- Rust
-- Cargo
-- Tauri prerequisites for Windows
-- Bun or npm
-
-### Install Dependencies
+On x64 Windows, install Visual Studio 2022 Desktop development with C++, the Windows SDK, and CMake. Build the native executable and tests:
 
 ```powershell
-npm install
+cmake -S native -B builds/native -A x64
+cmake --build builds/native --config Release
+ctest --test-dir builds/native -C Release --output-on-failure
 ```
 
-### Run in Development Mode
+For the complete installer, run `./migration/Build-Native.ps1` under PowerShell 7 with Rust/Cargo, Node/npm and network access for packaging tools. Output: `builds/staged/Watchman_2.0.0_x64-setup.exe`. This is **unsigned** until the separate staging signing workflow runs. The C++ binary embeds its logo, icon and fonts. The native signature verifier is installed beside it. Tauri's CLI runs only on the packaging host to reuse the v1 NSIS contract. It does not build the app or install WebView2.
 
-```powershell
-npm run tauri:dev
-```
-
-### Build the App
-
-```powershell
-npm run tauri:build
-```
-
-Build output is created by Tauri under:
-
-```text
-src-tauri\target\release\bundle\
-```
-
----
+`src/` and `src-tauri/` retain the v1 reference implementation. Do not run the v1 build command to produce v2 artifacts.
 
 ## Contributing
 
@@ -154,8 +130,8 @@ Basic contribution flow:
 git clone https://github.com/rayhan138/Watchman.git
 cd Watchman
 git checkout -b feature/your-change
-npm install
-npm run tauri:dev
+cmake -S native -B builds/native -A x64
+cmake --build builds/native --config Debug
 ```
 
 After making changes, commit and push your branch, then open a pull request.
