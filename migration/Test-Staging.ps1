@@ -19,15 +19,17 @@ Save-Feed
 $cert = "$env:RUNNER_TEMP/localhost.pem"
 $key = "$env:RUNNER_TEMP/localhost.key"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout $key -out $cert -days 1 -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost' *> $null
-certutil -user -addstore Root $cert
+# CurrentUser Root import can open an unattended trust-confirmation dialog.
+# This VM is disposable; use the local-machine store and remove this certificate in finally.
+certutil -f -addstore Root $cert
 $server = Start-Process python -ArgumentList @('migration/staging_server.py', $dir, $cert, $key) -PassThru
 try {
     $probe = 'builds/native/Release/WatchmanUpdateProtocolProbe.exe'
     Copy-Item migration/verify/target/release/watchman-verify-release.exe (Split-Path $probe) -Force
     function Probe($expected){
         $PSNativeCommandUseErrorActionPreference = $false
-        & $probe
-        if($LASTEXITCODE -ne $expected){throw "Probe returned $LASTEXITCODE instead of $expected"}
+        $result = & $probe 2>&1
+        if($LASTEXITCODE -ne $expected){throw "Probe returned $LASTEXITCODE instead of ${expected}: $result"}
     }
     Start-Sleep 2
     Probe 0
@@ -49,6 +51,6 @@ try {
 } finally {
     Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
     $thumb = [Security.Cryptography.X509Certificates.X509Certificate2]::new($cert).Thumbprint
-    Remove-Item "Cert:\CurrentUser\Root\$thumb" -ErrorAction SilentlyContinue
+    Remove-Item "Cert:\LocalMachine\Root\$thumb" -ErrorAction SilentlyContinue
     Remove-Item $key -ErrorAction SilentlyContinue
 }

@@ -1,9 +1,16 @@
 name: Stage signed Windows candidate (no publication)
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      existing_run:
+        description: 'Optional: retest signed artifact from this staging run, without rebuilding or signing'
+        required: false
+        type: string
 permissions:
   contents: read
 jobs:
   stage:
+    if: inputs.existing_run == ''
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +30,10 @@ jobs:
           if-no-files-found: error
   independent-upgrade:
     needs: stage
+    if: ${{ !cancelled() && (needs.stage.result == 'success' || (inputs.existing_run != '' && needs.stage.result == 'skipped')) }}
+    permissions:
+      actions: read
+      contents: read
     runs-on: windows-2022
     timeout-minutes: 20
     steps:
@@ -32,6 +43,8 @@ jobs:
         with:
           name: watchman-2.0.0-staged
           path: builds/staged
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.existing_run || github.run_id }}
       - name: Install trusted v1.0.5 and build isolated protocol probe
         env:
           GH_TOKEN: ${{ github.token }}
