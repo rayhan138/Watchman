@@ -21,3 +21,23 @@ jobs:
           name: watchman-2.0.0-staged
           path: builds/staged/
           if-no-files-found: error
+  independent-upgrade:
+    needs: stage
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/download-artifact@v4
+        with:
+          name: watchman-2.0.0-staged
+          path: builds/staged
+      - name: Install trusted v1.0.5 and build isolated protocol probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./migration/Test-LegacyInstall.ps1
+          cmake -S native -B builds/native -A x64 -DBUILD_TESTING=ON
+          cmake --build builds/native --config Release --target WatchmanUpdateProtocolProbe
+      - name: Test staged signed bytes, upgrade, older data and uninstall
+        run: ./migration/Test-Staging.ps1

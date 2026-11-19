@@ -1,4 +1,4 @@
-//! Offline staging tool only. The signature argument is the decoded minisign text.
+//! Native updater and staging verifier. The signature argument is the decoded minisign text.
 use minisign_verify::{PublicKey, Signature};
 use std::{env, error::Error, fs};
 
@@ -13,5 +13,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let key = PublicKey::from_base64(KEY)?;
     let sig = Signature::decode(&fs::read_to_string(&args[1])?)?;
     key.verify(&fs::read(&args[0])?, &sig, true)?;
+    let name = std::path::Path::new(&args[0]).file_name().and_then(|n| n.to_str()).ok_or("Invalid filename")?;
+    if sig.trusted_comment().split_once("\tfile:").map(|(_, file)| file) != Some(name) {
+        return Err("Signature belongs to a different installer filename".into());
+    }
     Ok(())
 }

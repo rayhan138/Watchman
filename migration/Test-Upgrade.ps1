@@ -1,5 +1,6 @@
 # Only on a freshly provisioned Windows runner, immediately after Test-LegacyInstall.
-param([string]$Setup = 'builds/staged/Watchman_2.0.0_x64-setup.exe')
+param([string]$Setup = 'builds/staged/Watchman_2.0.0_x64-setup.exe', [string]$ProtocolProbe)
+trap { Write-Host "::error::$($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)"; exit 1 }
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 function Require($ok,$message){ if (!$ok) { throw $message } }
@@ -26,11 +27,11 @@ $v1 = Start-Process $app -PassThru
 Start-Sleep -Seconds 8
 Require (!$v1.HasExited) 'Released v1 is not running'
 # The v1 updater uses the passive/update/restart contract; wait for installer, not its restarted child.
-Wait-App $Setup '/P /UPDATE /R'
+if ($ProtocolProbe) { Wait-App $ProtocolProbe '--install' } else { Wait-App $Setup '/P /UPDATE /R' }
 Require ($v1.HasExited) 'Old app did not stop'
 $new = Entry
 Require ($old.PSPath -eq $new.PSPath -and $new.DisplayVersion -eq '2.0.0') 'Wrong uninstall identity'
-Require ((Get-FileHash $app).Hash -eq (Get-FileHash builds/native/Release/Watchman.exe).Hash) 'Installed executable is not the MSVC build'
+Require ((Get-FileHash $app).Hash -eq (Get-Content builds/staged/Watchman.exe.sha256).Trim()) 'Installed executable is not the MSVC build'
 for ($i=0; $i -lt 60 -and !(Test-Path "$native/migration-v2.complete"); $i++) { Start-Sleep 1 }
 Require (Test-Path "$native/migration-v2.complete") 'Restart/first launch did not migrate data'
 Require (@(Get-Process watchman -ErrorAction Ignore).Count -eq 1) 'Expected one restarted Watchman'

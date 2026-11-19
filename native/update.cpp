@@ -4,6 +4,8 @@
 #include <winhttp.h>
 #include <wincrypt.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <iostream>
 #include <objbase.h>
 #include <filesystem>
 #include <fstream>
@@ -21,8 +23,18 @@ struct Close { void operator()(HANDLE h)const {if(h && h!=INVALID_HANDLE_VALUE) 
 using Handle=std::unique_ptr<void,Close>;
 void check(bool ok,const char* what){if(!ok)throw std::runtime_error(what);}
 std::atomic_bool checking{false};
+#ifdef WATCHMAN_PROTOCOL_PROBE
+// Separate CTest/tooling target, never linked into or distributed with Watchman.
+const std::wstring base=L"https://localhost:45443/releases/";
+constexpr INTERNET_PORT port=45443;
+constexpr std::array<unsigned,3> current{1,0,5};
+bool allowed(const std::wstring& host){return host==L"localhost";}
+#else
 const std::wstring base=L"https://github.com/rayhan138/Watchman/releases/";
+constexpr INTERNET_PORT port=443;
 constexpr std::array<unsigned,3> current{2,0,0};
+bool allowed(const std::wstring& host){return host==L"github.com"||host==L"release-assets.githubusercontent.com"||host==L"objects.githubusercontent.com";}
+#endif
 std::wstring wide(const std::string& ascii){return {ascii.begin(),ascii.end()};}
 // Explicit redirect loop. Never follow HTTP, a non-GitHub host, credentials or a custom port.
 Bytes download(std::wstring url,size_t limit){
@@ -30,11 +42,11 @@ Bytes download(std::wstring url,size_t limit){
     check(!!session,"Cannot initialize HTTPS");WinHttpSetTimeouts(session.get(),10000,10000,15000,30000);
     for(int hop=0;hop<6;++hop){
         URL_COMPONENTS u{sizeof(u)};u.dwHostNameLength=u.dwUrlPathLength=u.dwExtraInfoLength=u.dwUserNameLength=u.dwPasswordLength=DWORD(-1);
-        check(WinHttpCrackUrl(url.c_str(),0,0,&u)&&u.nScheme==INTERNET_SCHEME_HTTPS && u.nPort==443 && !u.dwUserNameLength&&!u.dwPasswordLength,"Invalid HTTPS destination");
+        check(WinHttpCrackUrl(url.c_str(),0,0,&u)&&u.nScheme==INTERNET_SCHEME_HTTPS && u.nPort==port && !u.dwUserNameLength&&!u.dwPasswordLength,"Invalid HTTPS destination");
         std::wstring host(u.lpszHostName,u.dwHostNameLength), path(u.lpszUrlPath,u.dwUrlPathLength);
-        check(host==L"github.com"||host==L"release-assets.githubusercontent.com"||host==L"objects.githubusercontent.com","Unexpected update redirect host");
+        check(allowed(host),"Unexpected update redirect host");
         if(u.dwExtraInfoLength)path.append(u.lpszExtraInfo,u.dwExtraInfoLength);
-        Internet conn(WinHttpConnect(session.get(),host.c_str(),443,0),WinHttpCloseHandle);
+        Internet conn(WinHttpConnect(session.get(),host.c_str(),port,0),WinHttpCloseHandle);
         Internet req(WinHttpOpenRequest(conn.get(),L"GET",path.c_str(),nullptr,nullptr,nullptr,WINHTTP_FLAG_SECURE),WinHttpCloseHandle);
         DWORD policy=WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
         check(req&&WinHttpSetOption(req.get(),WINHTTP_OPTION_REDIRECT_POLICY,&policy,sizeof(policy))&&WinHttpSendRequest(req.get(),nullptr,0,nullptr,0,0,0)&&WinHttpReceiveResponse(req.get(),nullptr),"Could not retrieve update (HTTPS)");
@@ -71,12 +83,19 @@ void verify(const fs::path& setup,const fs::path& sig,const std::array<unsigned,
     DWORD unused;DWORD size=GetFileVersionInfoSizeW(setup.c_str(),&unused);Bytes info(size);VS_FIXEDFILEINFO* v=nullptr;UINT len=0;
     check(size&&GetFileVersionInfoW(setup.c_str(),0,size,info.data())&&VerQueryValueW(info.data(),L"\\",(void**)&v,&len)&&len>=sizeof(*v)&&v->dwSignature==0xfeef04bd && v->dwProductVersionMS==MAKELONG(expected[1],expected[0]) && v->dwProductVersionLS==MAKELONG(0,expected[2]),"Signed installer version does not match manifest");
 }
-void run(HWND owner){
+int run(HWND owner,bool install){
     auto feed=download(base+L"latest/download/latest.json",64*1024);auto j=nlohmann::json::parse(feed);auto version=j.at("version").get<std::string>();auto v=parse_version(version);
-    if(v<=current){MessageBoxW(owner,L"No newer stable version is available.",L"Watchman update",MB_OK);return;}
+    if(v<=current){
+#ifndef WATCHMAN_PROTOCOL_PROBE
+        MessageBoxW(owner,L"No newer stable version is available.",L"Watchman update",MB_OK);
+#endif
+        return 3;
+    }
     auto& entry=j.at("platforms").at("windows-x86_64");auto filename=L"Watchman_"+wide(version)+L"_x64-setup.exe";auto url=base+L"download/v"+wide(version)+L"/"+filename;
     check(wide(entry.at("url").get<std::string>())==url,"Unexpected update asset URL");
-    if(MessageBoxW(owner,(L"Download and install Watchman "+wide(version)+L"? Watchman will restart.").c_str(),L"Watchman update",MB_YESNO|MB_DEFBUTTON2)!=IDYES)return;
+#ifndef WATCHMAN_PROTOCOL_PROBE
+    if(MessageBoxW(owner,(L"Download and install Watchman "+wide(version)+L"? Watchman will restart.").c_str(),L"Watchman update",MB_YESNO|MB_DEFBUTTON2)!=IDYES)return 3;
+#endif
     auto encoded=entry.at("signature").get<std::string>();DWORD count=0;
     check(!encoded.empty()&&encoded.size()<16384&&CryptStringToBinaryA(encoded.c_str(),(DWORD)encoded.size(),CRYPT_STRING_BASE64,nullptr,&count,nullptr,nullptr),"Invalid signature encoding");
     Bytes signature(count);check(CryptStringToBinaryA(encoded.c_str(),(DWORD)encoded.size(),CRYPT_STRING_BASE64,signature.data(),&count,nullptr,nullptr),"Invalid signature encoding");
@@ -86,11 +105,25 @@ void run(HWND owner){
     Handle directory(CreateFileW(stage.dir.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr));
     Handle lock(CreateFileW(setup.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr));
     check(directory.get()!=INVALID_HANDLE_VALUE&&lock.get()!=INVALID_HANDLE_VALUE,"Cannot lock staged installer");verify(setup,sig,v);
+    if(!install)return 0;
     SHELLEXECUTEINFOW launch{sizeof(launch)};launch.fMask=SEE_MASK_NOCLOSEPROCESS|SEE_MASK_NOASYNC;launch.lpVerb=L"open";launch.lpFile=setup.c_str();launch.lpParameters=L"/P /UPDATE /R";launch.nShow=SW_SHOWNORMAL;
-    check(ShellExecuteExW(&launch),"Installer was not started");Handle child(launch.hProcess);stage.launched=true;PostMessageW(owner,WatchmanWindowLifecycle::ExitMessage,0,0);
+    check(ShellExecuteExW(&launch),"Installer was not started");Handle child(launch.hProcess);stage.launched=true;
+#ifdef WATCHMAN_PROTOCOL_PROBE
+    DWORD result=1;check(WaitForSingleObject(child.get(),120000)==WAIT_OBJECT_0&&GetExitCodeProcess(child.get(),&result)&&result==0,"Installer failed");
+#else
+    PostMessageW(owner,WatchmanWindowLifecycle::ExitMessage,0,0);
+#endif
+    return 0;
 }
 }
 void CheckForUpdate(HWND owner){
     if(checking.exchange(true))return;
-    std::thread([owner]{try{if(IsUserAnAdmin())throw std::runtime_error("Restart Watchman without administrator privileges to check for updates.");run(owner);}catch(const std::exception& e){MessageBoxA(owner,e.what(),"Watchman update",MB_ICONWARNING);}checking=false;}).detach();
+    std::thread([owner]{try{if(IsUserAnAdmin())throw std::runtime_error("Restart Watchman without administrator privileges to check for updates.");run(owner,true);}catch(const std::exception& e){MessageBoxA(owner,e.what(),"Watchman update",MB_ICONWARNING);}checking=false;}).detach();
 }
+
+#ifdef WATCHMAN_PROTOCOL_PROBE
+int main(int argc,char** argv){
+    try {return run(nullptr, argc==2 && std::string(argv[1])=="--install");}
+    catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 2;}
+}
+#endif
