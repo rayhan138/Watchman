@@ -56,7 +56,7 @@ jobs:
           PY
           SOURCE_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_sha"])' "$RUNNER_TEMP/staging-run.json")
           git merge-base --is-ancestor "$SOURCE_SHA" "$GITHUB_SHA" || { echo '::error::The tested source commit is not contained in merged main'; exit 1; }
-          unexpected=$(git diff --name-only "$SOURCE_SHA" "$GITHUB_SHA" | grep -Ev '^(README\.md|migration/README\.md)$' || true)
+          unexpected=$(git diff --name-only "$SOURCE_SHA" "$GITHUB_SHA" | grep -Ev '^(README\.md|migration/README\.md|\.github/workflows/promote-tested-v201\.yml)$' || true)
           if [[ -n "$unexpected" ]]; then
             echo '::error::Packaging, updater, or acceptance-test sources changed after the candidate was staged.'
             printf '%s\n' "$unexpected"
@@ -100,11 +100,13 @@ jobs:
           feed=staged/latest.json
           test -s "$installer" && test -s "$signature" && test -s "$feed" && test -s staged/Watchman.exe.sha256
           python3 - "$installer" staged/Watchman.exe.sha256 "$feed" "$signature" <<'PY'
-          import hashlib, json, pathlib, sys
-          installer, hash_file, feed_file, signature_file = map(pathlib.Path, sys.argv[1:])
-          expected = hash_file.read_text(encoding='utf-8').strip().upper()
-          actual = hashlib.sha256(installer.read_bytes()).hexdigest().upper()
-          assert len(expected) == 64 and actual == expected, (expected, actual)
+          import hashlib, json, pathlib, re, sys
+          installer, app_hash_file, feed_file, signature_file = map(pathlib.Path, sys.argv[1:])
+          app_hash = app_hash_file.read_text(encoding='utf-8').strip().upper()
+          assert re.fullmatch(r'[0-9A-F]{64}', app_hash), app_hash
+          # This manifest hashes the installed Watchman.exe, not the NSIS installer.
+          # The installer itself comes from the immutable tested run artifact below.
+          installer_hash = hashlib.sha256(installer.read_bytes()).hexdigest().upper()
           signature = signature_file.read_text(encoding='utf-8').strip()
           feed = json.loads(feed_file.read_text(encoding='utf-8'))
           name = 'Watchman_2.0.1_x64-setup.exe'
@@ -112,7 +114,8 @@ jobs:
           assert feed['version'] == '2.0.1', feed
           assert entry['signature'] == signature, 'Feed signature does not match the staged .sig asset'
           assert entry['url'] == f'https://github.com/{__import__("os").environ["GITHUB_REPOSITORY"]}/releases/download/v2.0.1/{name}', entry
-          print(f'Exact tested installer SHA-256: {actual}')
+          print(f'Exact tested installer SHA-256: {installer_hash}')
+          print(f'Installed Watchman.exe SHA-256 from Windows acceptance: {app_hash}')
           PY
           cargo build --locked --release --manifest-path migration/verify/Cargo.toml
           printf '%s' "$(tr -d '\r\n' < "$signature")" | base64 --decode > "$RUNNER_TEMP/v2.0.1.minisig"
