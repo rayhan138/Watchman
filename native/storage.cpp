@@ -1,4 +1,5 @@
 #include "storage.h"
+#include "history_files.h"
 #include "sqlite3.h"
 #include <algorithm>
 #include <ctime>
@@ -275,6 +276,8 @@ bool TrafficStorage::OpenDatabase() {
         return false;
     }
 
+    try { CheckHistoryFiles(database_path_); }
+    catch (const std::exception& e) { last_error_ = e.what(); return false; }
     sqlite3* candidate = nullptr;
     const int result = sqlite3_open16(database_path_.c_str(), &candidate);
     if (!CheckResult(candidate, result, SQLITE_OK, "Open history database")) {

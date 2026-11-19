@@ -1,5 +1,7 @@
 # Watchman SQLite History Migration Plan
 
+> Historical v1/Tauri plan only. Watchman 2.0.0 **does not import JSON history**. See [the native migration contract](../migration/README.md).
+
 ## Goal
 
 Move Watchman's traffic history storage from a growing JSON file to a local SQLite database so daily history is more stable, safer to query, and easier to extend later.

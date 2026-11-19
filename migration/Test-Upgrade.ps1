@@ -21,7 +21,9 @@ $profileDir = Join-Path $env:APPDATA 'Watchman'
 $native = Join-Path $env:APPDATA 'Watchman.Native'
 $null = New-Item $profileDir -ItemType Directory -Force
 '{"theme":"light","startOnBoot":true,"unitModeBits":true,"hideGauges":true,"futureField":123}' | Set-Content "$profileDir/settings.json"
-'{"records":{"2025-01-01":{"upload":707,"download":808}}}' | Set-Content "$profileDir/history.json"
+# Seed SQLite directly: v1.0.5 itself could import history JSON before upgrade.
+python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('create table daily_traffic(date TEXT PRIMARY KEY, upload_bytes INTEGER NOT NULL DEFAULT 0, download_bytes INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)'); c.execute('insert into daily_traffic values (?,?,?,?)', ('2025-01-01',707,808,'original')); c.commit(); c.close()" "$profileDir/watchman.db"
+'{"records":{}}' | Set-Content "$profileDir/history.json"
 'Stay intact' | Set-Content "$profileDir/unknown.txt"
 $v1 = Start-Process $app -PassThru
 Start-Sleep -Seconds 8
@@ -49,6 +51,7 @@ Require ($links.Count -eq 1) 'Expected one Start menu shortcut'
 Require ((New-Object -ComObject WScript.Shell).CreateShortcut($links[0].FullName).TargetPath -eq $app) 'Wrong shortcut target'
 Stop-Process -Name watchman -Force
 Wait-Process -Name watchman -Timeout 15 -ErrorAction SilentlyContinue
+python "$PSScriptRoot/test_history_policy.py" $app
 # Isolate file fixtures; this job owns the entire disposable user and registry.
 $real = $env:APPDATA
 try {
@@ -61,7 +64,7 @@ try {
     '{"startOnBoot":false,"notifications":{"warningSettings":{"gpuTempThreshold":91}}}' | Set-Content "$older/settings.json"
     Wait-App $app '--migrate-only'
     Wait-App $app '--migrate-only'
-    python -c "import sqlite3,sys; assert sqlite3.connect(sys.argv[1]).execute('select upload_bytes,download_bytes from daily_traffic').fetchall()==[(123,987)]" "$env:APPDATA/Watchman.Native/watchman.db"
+    python -c "import sqlite3,sys; assert sqlite3.connect(sys.argv[1]).execute('select upload_bytes,download_bytes from daily_traffic').fetchall()==[]" "$env:APPDATA/Watchman.Native/watchman.db"
     Require ((Get-ItemProperty 'HKCU:\Software\Watchman').WarningGpuTempThreshold -eq 91) 'Warning threshold lost'
     $quiet = Start-Process $app -ArgumentList '--startup' -PassThru
     for ($i=0; $i -lt 30 -and (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').Watchman; $i++) { Start-Sleep 1 }

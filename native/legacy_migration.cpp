@@ -4,7 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <limits>
+#include "history_files.h"
 #include "sqlite3.h"
 #include "scoped_handle.h"
 #include "third_party/nlohmann/json.hpp"
@@ -114,20 +114,11 @@ void migrate_settings(const Json &s)
     if (w.contains("trafficUnit") && (w["trafficUnit"] == "GB" || w["trafficUnit"] == "MB"))
         dw(L"WarningTrafficGB", w["trafficUnit"] == "GB");
 }
-bool calendar_day(const std::string &day)
-{
-    if (day.size() != 10 || day[4] != '-' || day[7] != '-')
-        return false;
-    for (size_t i = 0; i < day.size(); ++i)
-        if (i != 4 && i != 7 && (day[i] < '0' || day[i] > '9'))
-            return false;
-    int y = std::stoi(day.substr(0, 4)), m = std::stoi(day.substr(5, 2)), d = std::stoi(day.substr(8));
-    int days[] = {31, 28 + (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)), 31, 30, 31, 30, 31, 31, 30, 31, 30,
-                  31};
-    return y > 0 && m >= 1 && m <= 12 && d >= 1 && d <= days[m - 1];
-}
 void prepare_history(const fs::path &stage, const fs::path &backup)
 {
+    // Both v1 and older C++ builds stored SQLite here. History JSON in the
+    // snapshot is archival only; never interpret it or reconcile its rows.
+    CheckHistoryFiles(backup / L"watchman.db");
     for (auto name : {L"watchman.db", L"watchman.db-wal", L"watchman.db-shm", L"watchman.db-journal"})
         if (fs::exists(backup / name))
             fs::copy_file(backup / name, stage / name);
@@ -151,52 +142,11 @@ void prepare_history(const fs::path &stage, const fs::path &backup)
                     std::string(reinterpret_cast<const char *>(sqlite3_column_text(check.get(), 0))) == "ok",
                 "Damaged SQLite history");
     }
-    exec("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS daily_traffic(date TEXT PRIMARY KEY,upload_bytes "
-         "INTEGER NOT NULL DEFAULT 0,download_bytes INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL)");
-    auto path = backup / L"history.json", bak = backup / L"history.json.bak";
-    if (fs::exists(path) || fs::exists(bak))
-    {
-        Json j;
-        try
-        {
-            j = read_json(path);
-        }
-        catch (const std::exception &)
-        {
-            j = read_json(bak);
-        }
-        const auto &rows = j.at("records");
-        require(rows.is_object(), "Invalid JSON history");
-        // The older native schema has no timestamp: TrafficStorage normally adds it.
-        auto columns =
-            stmt("SELECT count(*) FROM pragma_table_info('daily_traffic') WHERE name='updated_at'");
-        require(sqlite3_step(columns.get()) == SQLITE_ROW, "Cannot inspect history schema");
-        bool old = sqlite3_column_int(columns.get(), 0) == 0;
-        columns.reset();
-        if (old)
-            exec("ALTER TABLE daily_traffic ADD COLUMN updated_at TEXT NOT NULL DEFAULT "
-                 "'1970-01-01T00:00:00Z'");
-        auto insert = stmt("INSERT INTO daily_traffic(date,upload_bytes,download_bytes,updated_at) "
-                           "VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(date) DO UPDATE SET "
-                           "upload_bytes=max(upload_bytes,excluded.upload_bytes), "
-                           "download_bytes=max(download_bytes,excluded.download_bytes)");
-        for (const auto &[day, record] : rows.items())
-        {
-            require(calendar_day(day), "Invalid JSON history date");
-            require(record.is_object(), "Invalid JSON history record");
-            sqlite3_bind_text(insert.get(), 1, day.c_str(), -1, SQLITE_TRANSIENT);
-            int index = 2;
-            for (auto field : {"upload", "download"})
-            {
-                auto n = record.value(field, Json(uint64_t{0}));
-                require(n.is_number_unsigned() && n.get<uint64_t>() <= INT64_MAX, "Invalid traffic total");
-                sqlite3_bind_int64(insert.get(), index++, n.get<int64_t>());
-            }
-            require(sqlite3_step(insert.get()) == SQLITE_DONE, "Cannot import daily traffic");
-            sqlite3_reset(insert.get());
-        }
-    }
-    exec("COMMIT");
+    if (!fs::exists(backup / L"watchman.db"))
+        exec("CREATE TABLE daily_traffic(date TEXT PRIMARY KEY,upload_bytes INTEGER NOT NULL DEFAULT 0,"
+             "download_bytes INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL)");
+    // For an existing database leave all tables/rows to TrafficStorage's
+    // normal additive schema checks. Never rebuild from a different source.
 }
 } // namespace
 void PrepareNativeProfile()
@@ -221,7 +171,7 @@ void PrepareNativeProfile()
         // writer makes CreateFile fail; never quietly copy a live, inconsistent DB.
         std::vector<Watchman::ScopedHandle> locks;
         for (auto name : {L"watchman.db", L"watchman.db-wal", L"watchman.db-shm", L"watchman.db-journal",
-                          L"settings.json", L"history.json"})
+                          L"settings.json"})
         {
             if (fs::exists(legacy / name))
             {

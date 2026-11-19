@@ -25,8 +25,8 @@ BEGIN
   BLOCK "040904b0"
   BEGIN
    VALUE "ProductName", "Watchman\0"
-   VALUE "FileVersion", "2.0.0\0"
-   VALUE "ProductVersion", "2.0.0\0"
+   VALUE "FileVersion", WATCHMAN_VERSION_TEXT
+   VALUE "ProductVersion", WATCHMAN_VERSION_TEXT
   END
  END
  BLOCK "VarFileInfo"

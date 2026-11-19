@@ -80,7 +80,7 @@ C:\Users\<your-name>\AppData\Roaming\Watchman.Native\watchman.db
 
 Watchman uses a local SQLite database for saved traffic history. This data is used for the Data tab, charts, and CSV export.
 
-Your traffic history stays on your own computer.
+The 2.0.0 migration keeps SQLite history from v1 and earlier native builds. Without a database it starts empty; it never imports `history.json` or `history.json.bak`. Those files are retained, and settings migration is unchanged. A completed native profile is not reset.
 
 ---
 

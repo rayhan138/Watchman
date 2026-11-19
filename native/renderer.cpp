@@ -6649,11 +6649,19 @@ void AppRenderer::DrawSettingsModal(D2D1_SIZE_F rt_size, const DashboardSnapshot
 
     const float header_bottom = my + 62.0f;
     const auto replay = WatchmanWelcome::ReplayButton(mx, my, mw);
+    // Reserve the badge's width even at the 360-DIP minimum modal width.
+    const auto badge = D2D1::RectF(replay.left - 68.0f, my + 21.0f, replay.left - 10.0f, my + 45.0f);
+    constexpr wchar_t version[] = L"v" WATCHMAN_VERSION_TEXT;
     render_target_->DrawText(
         L"SETTINGS", 8, format_dashboard_value_,
-        D2D1::RectF(mx + 22.0f, my + 14.0f, replay.left - 12.0f, my + 51.0f),
+        D2D1::RectF(mx + 22.0f, my + 14.0f, badge.left - 5.0f, my + 51.0f),
         brush_text_primary_
     );
+    const auto pill = D2D1::RoundedRect(badge, 12.0f, 12.0f);
+    render_target_->FillRoundedRectangle(pill, brush_popup_bg_);
+    render_target_->DrawRoundedRectangle(pill, brush_chart_grid_, 1.0f);
+    render_target_->DrawText(version, static_cast<UINT32>(std::size(version) - 1), format_limit_button_,
+        badge, brush_text_primary_);
     const auto replay_rect = D2D1::RectF(replay.left, replay.top, replay.right, replay.bottom);
     render_target_->FillRoundedRectangle(D2D1::RoundedRect(replay_rect, 8.0f, 8.0f),
         IsPointInside(replay_rect, mouse_x_, mouse_y_) ? brush_active_ : brush_popup_bg_);
