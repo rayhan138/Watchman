@@ -1,0 +1,11 @@
+{
+  "version": "2.0.0",
+  "bundle": {
+    "resources": ["watchman-verify-release.exe", "Inter-License.txt", "JetBrainsMono-OFL.txt", "NunitoSans-OFL.txt"],
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": {"type": "skip"}
+    }
+  }
+}

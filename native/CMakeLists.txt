@@ -111,8 +111,8 @@ set_target_properties(Watchman PROPERTIES
 install(TARGETS Watchman RUNTIME DESTINATION .)
 install(FILES PORTABLE_README.txt DESTINATION .)
 set(CPACK_PACKAGE_NAME "Watchman")
-set(CPACK_PACKAGE_VERSION "2.0.1")
-set(CPACK_PACKAGE_FILE_NAME "Watchman-2.0.1-win64-portable")
+set(CPACK_PACKAGE_VERSION "2.0.0")
+set(CPACK_PACKAGE_FILE_NAME "Watchman-2.0.0-win64-portable")
 set(CPACK_GENERATOR "ZIP")
 include(CPack)
 

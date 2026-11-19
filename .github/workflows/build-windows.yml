@@ -1,54 +1,26 @@
-name: Build Windows
-
+name: Native Windows candidate
 on:
-  push:
-    branches:
-      - main
-      - "codex/**"
-      - "release/**"
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
-
+permissions:
+  contents: read
 jobs:
-  build-windows:
-    name: Build Windows installer
-    runs-on: windows-latest
-
+  native:
+    runs-on: windows-2022
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        shell: pwsh
-        run: |
-          rustup default stable
-          rustc --version
-          cargo --version
-
-      - name: Install NSIS
-        shell: pwsh
-        run: |
-          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
-            choco install nsis -y --no-progress
-          }
-
-          $nsisPath = "${env:ProgramFiles(x86)}\NSIS"
-          if (Test-Path $nsisPath) {
-            Add-Content -Path $env:GITHUB_PATH -Value $nsisPath
-          }
-
-      - name: Install dependencies
-        run: npm ci --no-audit --no-fund
-
-      - name: Build Watchman
-        run: npm run tauri:build:nosign
-
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - name: Build, test and package x64 C++ application
+        run: ./migration/Build-Native.ps1
+      - uses: actions/upload-artifact@v4
         with:
-          name: watchman-windows-x64
-          path: |
-            src-tauri/target/release/bundle/nsis/*.exe
+          name: unsigned-native-candidate
+          path: builds/staged/*.exe
           if-no-files-found: error
+      - name: Install genuine signed v1.0.5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./migration/Test-LegacyInstall.ps1
+      - name: Exercise native upgrade
+        run: ./migration/Test-Upgrade.ps1

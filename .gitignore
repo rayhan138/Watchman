@@ -69,3 +69,6 @@ my conversion with ai*.txt
 docs/
 design/
 brand/
+/src-tauri/watchman-verify-release.exe
+/src-tauri/*-OFL.txt
+/src-tauri/Inter-License.txt
