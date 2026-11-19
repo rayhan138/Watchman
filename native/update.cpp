@@ -1,4 +1,5 @@
 #include "update.h"
+#include "version.h"
 #include "window_lifecycle.h"
 #include "third_party/nlohmann/json.hpp"
 #include <winhttp.h>
@@ -37,9 +38,19 @@ void check(bool ok, const char *what)
 std::atomic_bool checking{false};
 #ifdef WATCHMAN_PROTOCOL_PROBE
 // Separate CTest/tooling target, never linked into or distributed with Watchman.
+#ifndef WATCHMAN_PROTOCOL_PROBE_MAJOR
+#error "Protocol probes must declare their baseline app version"
+#endif
+#ifndef WATCHMAN_PROTOCOL_PROBE_MINOR
+#error "Protocol probes must declare their baseline app version"
+#endif
+#ifndef WATCHMAN_PROTOCOL_PROBE_PATCH
+#error "Protocol probes must declare their baseline app version"
+#endif
 const std::wstring base = L"https://localhost:45443/releases/";
 constexpr INTERNET_PORT port = 45443;
-constexpr std::array<unsigned, 3> current{1, 0, 5};
+constexpr std::array<unsigned, 3> current{WATCHMAN_PROTOCOL_PROBE_MAJOR, WATCHMAN_PROTOCOL_PROBE_MINOR,
+                                          WATCHMAN_PROTOCOL_PROBE_PATCH};
 bool allowed(const std::wstring &host)
 {
     return host == L"localhost";
@@ -47,7 +58,8 @@ bool allowed(const std::wstring &host)
 #else
 const std::wstring base = L"https://github.com/rayhan138/Watchman/releases/";
 constexpr INTERNET_PORT port = 443;
-constexpr std::array<unsigned, 3> current{2, 0, 0};
+constexpr std::array<unsigned, 3> current{WATCHMAN_VERSION_MAJOR, WATCHMAN_VERSION_MINOR,
+                                          WATCHMAN_VERSION_PATCH};
 bool allowed(const std::wstring &host)
 {
     return host == L"github.com" || host == L"release-assets.githubusercontent.com" ||
@@ -61,7 +73,7 @@ std::wstring wide(const std::string &ascii)
 // Explicit redirect loop. Never follow HTTP, a non-GitHub host, credentials or a custom port.
 Bytes download(std::wstring url, size_t limit)
 {
-    Internet session(WinHttpOpen(L"Watchman/2.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, nullptr, nullptr, 0),
+    Internet session(WinHttpOpen(L"Watchman/" WATCHMAN_VERSION_WTEXT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, nullptr, nullptr, 0),
                      WinHttpCloseHandle);
     check(!!session, "Cannot initialize HTTPS");
     WinHttpSetTimeouts(session.get(), 10000, 10000, 15000, 30000);

@@ -1,6 +1,7 @@
 {
-  "version": "2.0.0",
+  "version": "2.0.1",
   "bundle": {
+    "publisher": "Noman Dhoni",
     "resources": [
       "watchman-verify-release.exe",
       "Inter-License.txt",

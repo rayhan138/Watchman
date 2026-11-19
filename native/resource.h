@@ -1,6 +1,6 @@
 #pragma once
 
-#define WATCHMAN_VERSION_TEXT "2.0.0"
+#include "version.h"
 
 #define IDI_WATCHMAN_APP 101
 #define IDR_WATCHMAN_LOGO 102

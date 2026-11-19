@@ -1,12 +1,12 @@
-# Watchman 2.0.0 migration candidate — staging only
+# Watchman 2.0.1 publisher hotfix — candidate
 
-Do not publish, tag, set Latest, change the production feed, or merge the draft PR as part of staging.
+The published v2.0.0 release remains stable Latest while this candidate is built and tested. Do not publish or promote v2.0.1 unless both independent disposable-Windows upgrade tests pass on the exact same signed artifact.
 
 ## Provenance and package
 
 The supplied GitHub archive's root name and ZIP comment identify `rayhan138/watchman-c-@3b04d7d9446c6efa2a11d6b35aea019e5f7685a0`; the decoded ZIP SHA-256 is `bac1be3f7991de5785db66cc63569c0da123d075c1ab05bb57e85e10c6a11ab7`. Application code, SQLite amalgamation, RC, icon, logo, fonts/licenses, build inputs and tests are in `native/`. The import excludes agent metadata and the upstream release workflow. `third_party/nlohmann` is the MIT-licensed single header from v3.12.0 added for JSON parsing.
 
-`Build-Native.ps1` builds/tests x64 MSVC Release and uses the locked Tauri CLI **bundle only** command on the prebuilt C++ executable. `src-tauri/native-package.json` reuses the old per-machine NSIS identity/install path, uninstall registration, shortcut behavior, running-process check, and `/P /UPDATE /R` restart-as-user contract. It skips WebView2 and replaces the v1 resource list. The post-install hook deletes known loose v1 probe files, not unknown user files. The installer does not remove a shared Windows WebView2 runtime. Per-user registration and migration happen when that user launches the new app, not by scanning profiles from an elevated installer. Existing v1 `--minimized` startup commands are understood and rewritten to the native form.
+`Build-Native.ps1` builds/tests x64 MSVC Release and uses the locked Tauri CLI **bundle only** command on the prebuilt C++ executable. `src-tauri/native-package.json` sets publisher `Noman Dhoni` and reuses the old per-machine NSIS uninstall key, shortcut behavior, running-process check, and `/P /UPDATE /R` restart-as-user contract. Tauri derives a second install-location key from the publisher, so `native-hooks.nsh` preserves a non-default v1.0.5/v2.0.0 path from the old `Software\blinkeye\Watchman` key when the new publisher key is absent, without changing the `Uninstall\Watchman` identity or making a second install. The NSIS hook restores `$INSTDIR` and its output path before copying files. The executable PE `CompanyName`, PE version, Settings badge, native updater version, installer DisplayVersion and staged feed are checked for consistency. The package skips WebView2 and replaces the v1 resource list. The post-install hook deletes known loose v1 probe files, not unknown user files. The installer does not remove a shared Windows WebView2 runtime. Per-user registration and migration happen when that user launches the new app, not by scanning profiles from an elevated installer. Existing v1 `--minimized` startup commands are understood and rewritten to the native form.
 
 ## Data contract
 
@@ -31,17 +31,25 @@ Not translated: focus theme; other widget styling, order and individual visibili
 
 The full public key is identical in tags v1.0.1–v1.0.5. v1.0.5 is `2e490a181ce7eee09a38a13c65c375489b47a01c` (updater config blob `6f5f4b542b9e5f5681c6b7fe740b5c4f35bd2536`). Native Tools → Check for updates uses WinHTTP/TLS, a fixed production feed, bounded downloads, restricted HTTPS redirects, a strictly newer numeric version, and the exact x64 tag/asset URL. It prompts before download/install. The native verifier checks the **bytes and signed filename** with the pinned key; PE product version must also match. The executable is locked against writing/deletion through launch. There is no production command-line feed/key override. Run the updater unelevated; NSIS requests elevation. Verification is updater trust, **not Authenticode**. SmartScreen may still prompt. A successfully handed-off installer can remain under the user's temp directory.
 
-`release-windows.yml` on this branch is **manual, artifact-only** (`contents: read`); it no longer publishes on tags. Only its signing step receives the existing secrets, not a PR job. `New-StagedFeed.ps1` verifies before creating `latest.json` in a fresh staging directory; the final URL deliberately will not work until a separately approved release. Do not dispatch the *old main-branch workflow* to stage this candidate. Keep the three assets from the **same successful run**; never substitute a rebuilt EXE for a signed one.
+`release-windows.yml` on this branch is **manual, artifact-only** (`contents: read`); it does not create releases or change the production feed. Only its signing step receives the existing signing secrets, not a PR job. `New-StagedFeed.ps1` verifies the signed installer before creating `latest.json` in a fresh staging directory. The workflow's separate Windows runners test the exact staged artifact from both v1.0.5 and v2.0.0; publishing remains gated on both passing. Keep the installer, `.sig`, feed and installed-executable hash from the **same successful run**; never substitute a rebuilt EXE for a signed one.
 
-`Test-LegacyInstall.ps1` checks genuine v1 assets and a tampered copy. `Test-Upgrade.ps1` starts installed v1, upgrades via NSIS, and checks path/registration, restarted process, native executable hash, startup and shortcut, retained SQLite and untouched JSON, fresh history for JSON-only profiles, idempotence and uninstall. Signed staging downloads the exact CI artifact on a separate Windows runner. `Test-Staging.ps1` serves a **copy** of the manifest with only its URL changed over localhost HTTPS; a separate build of the native update code (lower current version and loopback-only channel) checks accepted and rejected responses and launches the verified installer. No production DNS override, replacement signing trust, or production feed write. The stock v1 UI is not redirected to staging.
+`Test-LegacyInstall.ps1` checks genuine v1 assets and a tampered copy. `Test-StableInstall.ps1` verifies and installs the immutable public v2.0.0 baseline at a non-default path. The v1 and v2 upgrade tests verify the same uninstall registration, exact publisher and PE `CompanyName`, custom path, restarted process, startup, settings, profile files and SQLite records. `Test-Staging.ps1` serves a **copy** of the manifest with only its URL changed over localhost HTTPS; version-specific isolated builds of the native updater check accepted and rejected responses and launch the signed candidate. No production DNS override, replacement signing trust, or production feed write is used. Neither the released v1 nor v2.0.0 application is redirected to staging.
 
-## Acceptance evidence
+## Previous release baseline evidence (v2.0.0)
 
-Use the [new signed staging artifact](https://github.com/rayhan138/Watchman/actions/runs/44613120194/artifacts/14573248074) built from `a8e6314e4ea27fe79270f4f7fc6be59e8674188a`. It supersedes the earlier 2.0.0 staging build, which imported history JSON. The Settings header shows **v2.0.0**; because both candidates have the same version, identify this build by its artifact ID and hash, not by the badge alone.
+The [signed v2.0.0 release baseline](https://github.com/rayhan138/Watchman/releases/tag/v2.0.0) is immutable and remains stable Latest until the v2.0.1 acceptance gate completes. Its tested artifact was built from `a8e6314e4ea27fe79270f4f7fc6be59e8674188a`; the Settings header showed **v2.0.0**. This baseline's tests and hashes are retained below for provenance.
 
 * [Build, CTest, CI signing and verification against released v1 trust](https://github.com/rayhan138/Watchman/actions/runs/44613120194/job/135874628219): passed. Archive SHA-256: `673744648717cb9a5da65cd84073785ca4aae4ce60a7149422e3ac1e74d400b8` (ZIP, not EXE). The archive contains the installer, `.sig`, staged `latest.json` and expected installed app hash.
 * [Independent signed-byte acceptance on disposable Windows](https://github.com/rayhan138/Watchman/actions/runs/44613120194/job/135876263116): passed. The second runner upgraded installed v1.0.5 from a non-default path via controlled HTTPS, tested settings, startup, shortcuts, uninstall and rollback. Installed-executable fixtures checked daily/per-app SQLite from an earlier C++ schema with committed WAL data, valid conflicting JSON, fresh empty history with JSON only, untouched originals/backups, survival of an existing native-only row, and refusal to replace corrupt/truncated/orphaned history. The production feed was not redirected or modified.
 * [Default-path v1.0.5 upgrade on Windows](https://github.com/rayhan138/Watchman/actions/runs/44613128680/job/135874648427): passed.
+
+## v2.0.1 acceptance evidence
+
+**Not yet run.** The candidate has not been built, signed, or tested yet. Do not publish unless both independent Windows jobs pass on one identical staged artifact:
+
+* v1.0.5 → v2.0.1: [pending]
+* v2.0.0 → v2.0.1: [pending]
+* Staged installer, matching `.sig`, feed, executable hash and artifact provenance: [pending]
 
 ## Recovery and limitations
 
