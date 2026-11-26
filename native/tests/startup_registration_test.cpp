@@ -79,7 +79,7 @@ public:
         if (result.error) std::cout << "Observed result error=0x" << std::hex << result.error << std::dec << ", operation=" << static_cast<unsigned>(result.operation) << '\n';
         return result;
     }
-    void WriteLegacy(const std::wstring& command = L"\"C:\\Previous Watchman Folder\\Watchman.exe\" --startup") {
+    void WriteLegacy(const std::wstring& command = L"\"C:\\Watchman Startup Test Folder\\Watchman.exe\" --startup") {
         Write(scope.run_key, L"Watchman", REG_SZ, command.c_str(), static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
     }
     bool HasLegacy() {
@@ -176,7 +176,7 @@ void Exercise() {
 
     result = fixture.ApplyRequest(false, true);
     Check(result.status == Status::Disabled && !result.error && !fixture.Task(), "Could not clear startup fixture before v1 migration case");
-    fixture.WriteLegacy(L"\"C:\\Previous Watchman Folder\\Watchman.exe\" --minimized");
+    fixture.WriteLegacy(L"C:\\Watchman Startup Test Folder\\Watchman.exe --minimized");
     result = fixture.ApplyRequest(true);
     Check(result.status == Status::TaskReady && !result.error && fixture.Task() && !fixture.HasLegacy(),
           "Tauri v1 --minimized Run command was not migrated to the native task");
@@ -211,6 +211,15 @@ void Exercise() {
     result = fixture.ApplyRequest(true, true);
     Check(result.status == Status::TaskReady && !result.error && !fixture.HasLegacy(), "Explicit saved On did not migrate a disabled/unknown legacy record");
     Check(fixture.ApprovalState() == 0x7FFF, "Explicit On altered Windows' global/approval settings");
+
+    fixture.WriteLegacy(L"C:\\Other Tool\\Watchman.exe --minimized");
+    result = fixture.ApplyRequest(true, true);
+    Check(result.error == conflict_error && fixture.Task() && fixture.HasLegacy(),
+          "A same-named Run executable at a different path was treated as Watchman-owned");
+    fixture.WriteLegacy();
+    result = fixture.ApplyRequest(true, true);
+    Check(result.status == Status::TaskReady && !result.error && !fixture.HasLegacy(),
+          "Could not safely clean the exact current-install Run command");
 
     fixture.PutForeignSource();
     const auto foreign_xml = Xml(fixture.Task().Get());

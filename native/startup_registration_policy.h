@@ -64,6 +64,31 @@ inline std::wstring WorkingDirectory(const std::wstring& path) {
     return path.substr(0, slash == 2 ? 3 : slash);
 }
 
+// Tauri v1's Windows auto-launch plugin wrote `current_exe + " --minimized"`
+// without quoting paths that contain spaces. The native predecessor used
+// `--startup`, sometimes quoted. Parse only these exact one-argument contracts;
+// the Windows backend additionally matches the result to this install's EXE.
+inline bool ExtractLegacyStartupExecutable(const std::wstring& command, std::wstring& executable) {
+    executable.clear();
+    const auto extract = [&](const wchar_t* argument) {
+        std::wstring suffix = L" ";
+        suffix += argument;
+        if (command.size() <= suffix.size() ||
+            command.compare(command.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
+
+        std::wstring candidate = command.substr(0, command.size() - suffix.size());
+        if (candidate.empty()) return false;
+        if (candidate.front() == L'"') {
+            if (candidate.size() < 2 || candidate.back() != L'"') return false;
+            candidate = candidate.substr(1, candidate.size() - 2);
+        }
+        if (candidate.empty() || candidate.find(L'"') != std::wstring::npos) return false;
+        executable = candidate;
+        return true;
+    };
+    return extract(L"--startup") || extract(L"--minimized");
+}
+
 class Backend {
 public:
     virtual ~Backend() = default;

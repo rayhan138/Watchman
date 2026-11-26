@@ -75,6 +75,23 @@ void Policy() {
     Check(WorkingDirectory(enabled.executable) == L"E:\\Watchman TEST 02\\11\\Watchman-win64\\dist", "Working directory must match the portable EXE");
     Check(WorkingDirectory(L"relative.exe").empty(), "Relative working directory accepted");
     {
+        const std::wstring legacy_executable = L"C:\\Program Files\\Watchman Acceptance\\watchman.exe";
+        const std::wstring quote = L"\"";
+        std::wstring parsed;
+        Check(ExtractLegacyStartupExecutable(legacy_executable + L" --minimized", parsed) && parsed == legacy_executable,
+            "Unquoted Tauri v1 Run command with spaces was not parsed literally");
+        Check(ExtractLegacyStartupExecutable(quote + legacy_executable + quote + L" --startup", parsed) &&
+            parsed == legacy_executable, "Quoted native Run command was not parsed");
+        Check(!ExtractLegacyStartupExecutable(legacy_executable + L" --minimized --extra", parsed),
+            "Legacy parser accepted extra command arguments");
+        Check(!ExtractLegacyStartupExecutable(legacy_executable + L" --quiet", parsed),
+            "Legacy parser accepted an unknown startup argument");
+        Check(!ExtractLegacyStartupExecutable(quote + legacy_executable + L" --minimized", parsed),
+            "Legacy parser accepted an unterminated quote");
+        Check(!ExtractLegacyStartupExecutable(legacy_executable + L" --minimized ", parsed),
+            "Legacy parser accepted trailing command text");
+    }
+    {
         Fake fake; fake.legacy = {true, true, false};
         const auto result = Apply(fake, enabled);
         Check(result.status == Status::TaskReady && !result.error && result.changed, "Legacy migration did not succeed");

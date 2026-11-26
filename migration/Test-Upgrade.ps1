@@ -25,6 +25,11 @@ $oldEntryPath = $old.PSPath
 $oldInstallPath = $old.InstallLocation.Trim('"')
 $app = Join-Path (Split-Path $old.UninstallString.Trim('"')) 'watchman.exe'
 Require ((Split-Path $app) -eq $oldInstallPath) 'Baseline install location and uninstaller path disagree'
+# The released Tauri v1 plugin opens this key instead of creating it; seed a clean
+# per-user Run key so this acceptance test exercises the legacy registration.
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$null = New-Item $runKey -Force
+Require ($null -eq (Get-WatchmanRunCommand)) 'Fresh runner already had a Watchman Run value'
 $profileDir = Join-Path $env:APPDATA 'Watchman'
 $native = Join-Path $env:APPDATA 'Watchman.Native'
 $null = New-Item $profileDir -ItemType Directory -Force
@@ -37,7 +42,7 @@ $v1 = Start-Process $app -PassThru
 Start-Sleep -Seconds 8
 Require (!$v1.HasExited) 'Released v1 is not running'
 $legacyStartup = Get-WatchmanRunCommand
-Require ($legacyStartup -match 'watchman.exe" --minimized$') 'v1.0.5 did not create its expected --minimized Run command'
+Require ($legacyStartup -ieq "$app --minimized") 'v1.0.5 did not create its expected unquoted Tauri --minimized Run command'
 Require ($null -eq (Get-WatchmanStartupTask)) 'A Task Scheduler registration existed before the v1 upgrade'
 # The v1 updater uses the passive/update/restart contract; wait for installer, not its restarted child.
 if ($ProtocolProbe) { Wait-App $ProtocolProbe '--install' } else { Wait-App $Setup '/P /UPDATE /R' }

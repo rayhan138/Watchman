@@ -2,7 +2,6 @@
 
 #include <windows.h>
 #include <taskschd.h>
-#include <shellapi.h>
 #include <sddl.h>
 #include <wrl/client.h>
 #include "scoped_handle.h"
@@ -123,7 +122,7 @@ RawValue QueryValue(const std::wstring& path) {
     CheckWin32(opened);
     return QueryValue(key.Get());
 }
-bool LegacyCommandIsOwned(const RawValue& value) {
+bool LegacyCommandIsOwned(const RawValue& value, const std::wstring& expected_executable) {
     if ((value.type != REG_SZ && value.type != REG_EXPAND_SZ) || value.bytes.size() < sizeof(wchar_t) ||
         value.bytes.size() % sizeof(wchar_t) != 0) return false;
     std::wstring command(value.bytes.size() / sizeof(wchar_t), L'\0');
@@ -138,19 +137,15 @@ bool LegacyCommandIsOwned(const RawValue& value) {
         if (ExpandEnvironmentStringsW(command.c_str(), expanded.data(), needed) != needed) return false;
         command = expanded.data();
     }
-    int count = 0;
-    LPWSTR* raw = CommandLineToArgvW(command.c_str(), &count);
-    if (!raw) return false;
-    const std::unique_ptr<LPWSTR, decltype(&LocalFree)> arguments(raw, LocalFree);
-    if (count != 2) return false;
-    // The shipped Tauri v1 installer registered --minimized; earlier native
-    // builds may already use --startup. Recognize only these exact quiet-start
-    // contracts before replacing the Run entry with the native task.
-    const std::wstring argument = raw[1];
-    if (argument != L"--startup" && argument != L"--minimized") return false;
-    const std::wstring executable = raw[0];
-    if (!ValidExecutablePath(executable)) return false;
-    return Equal(executable.substr(executable.find_last_of(L'\\') + 1), L"Watchman.exe");
+    // Match the exact installed executable, not merely a basename. Tauri v1
+    // wrote paths without quotes even when Program Files contained spaces, so
+    // CommandLineToArgvW would split that known legacy value incorrectly.
+    std::wstring executable;
+    if (!ExtractLegacyStartupExecutable(command, executable) ||
+        !ValidExecutablePath(executable) || !ValidExecutablePath(expected_executable) ||
+        !Equal(executable, expected_executable)) return false;
+    const auto slash = executable.find_last_of(L'\\');
+    return slash != std::wstring::npos && Equal(executable.substr(slash + 1), L"Watchman.exe");
 }
 bool ApprovalDisallowsAutomaticMigration(const RawValue& value) {
     if (!value.present) return false;
@@ -181,7 +176,7 @@ public:
         return Guard([&] {
             legacy_ = QueryValue(config_.legacy_key);
             state.present = legacy_.present;
-            state.owned = legacy_.present && LegacyCommandIsOwned(legacy_);
+            state.owned = legacy_.present && LegacyCommandIsOwned(legacy_, config_.executable);
             if (state.owned && request_.enabled && !request_.explicit_change)
                 state.externally_disabled = ApprovalDisallowsAutomaticMigration(QueryValue(config_.approval));
         });
@@ -286,7 +281,7 @@ public:
             CheckWin32(opened);
             const auto current = QueryValue(key.Get());
             if (!current.present) return;
-            if (!(current == legacy_) || !LegacyCommandIsOwned(current)) CheckWin32(ERROR_RETRY);
+            if (!(current == legacy_) || !LegacyCommandIsOwned(current, config_.executable)) CheckWin32(ERROR_RETRY);
             const LONG removed = RegDeleteValueW(key.Get(), L"Watchman");
             if (removed != ERROR_FILE_NOT_FOUND) CheckWin32(removed);
         });
@@ -467,7 +462,7 @@ Result ApplyWithConfiguration(Request request, Configuration configuration) noex
         const auto error = Guard([&] {
             configuration.sid = CurrentUserSid();
             if (configuration.name.empty()) configuration.name = task_prefix + configuration.sid;
-            if (request.enabled && request.executable.empty()) {
+            if (request.executable.empty()) {
                 std::vector<wchar_t> path(32768);
                 const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
                 if (!length) CheckWin32(GetLastError());
