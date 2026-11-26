@@ -75,6 +75,33 @@ void TestMeasurementScopeAndAggregation() {
     Check(ExtractJsonObject(LR"({"AppInfo":{"note":"brace } and escaped \" quote","NumBytes":1}})", L"AppInfo", object), "braces inside strings");
 }
 
+void TestUploadReceiverTcpInfo() {
+    using namespace network_test;
+    double speed = 0, rtt = 0;
+    const auto tcp = LR"({"TCPInfo":{"BytesReceived":10000000,"BytesSent":999999999,"BytesAcked":777777777,"ElapsedTime":2000000,"MinRTT":2500}})";
+    UpdateMeasurement(tcp, speed, rtt);
+    Near(speed, 0, "download must not use the server's receive direction");
+    UpdateMeasurement(tcp, speed, rtt, true);
+    Near(speed, 40, "upload accepts modern NDT7 receiver TCPInfo bytes/microseconds without AppInfo");
+    Near(rtt, 2.5, "TCP receiver metadata retains RTT conversion");
+    UpdateMeasurement(LR"({"TCPInfo":{"BytesReceived":15000000,"ElapsedTime":4000000}})", speed, rtt, true);
+    Near(speed, 30, "later cumulative receiver sample replaces, never sums previous rates");
+    UpdateMeasurement(LR"({"AppInfo":{"NumBytes":1000000,"ElapsedTime":1000000},"TCPInfo":{"BytesReceived":999999999,"ElapsedTime":1}})", speed, rtt, true);
+    Near(speed, 8, "application receiver data takes precedence when both sources are available");
+    for (const auto* invalid : {
+        LR"({"TCPInfo":{"BytesSent":999999,"BytesAcked":999999,"ElapsedTime":1}})",
+        LR"({"TCPInfo":{"BytesReceived":-10,"ElapsedTime":1}})",
+        LR"({"TCPInfo":{"BytesReceived":10,"ElapsedTime":0}})",
+        LR"({"TCPInfo":{"BytesReceived":10,"ElapsedTime":1e999}})",
+        LR"({"Other":{"TCPInfo":{"BytesReceived":100,"ElapsedTime":1}}})",
+        LR"({"TCPInfo":{"nested":{"BytesReceived":100,"ElapsedTime":1}}})" }) {
+        UpdateMeasurement(invalid, speed, rtt, true);
+        Near(speed, 8, "wrong-direction, invalid or nested impostor TCP data must not erase or fabricate receiver confirmation");
+    }
+    const auto result = FinishTransfer(true, 2000000, 1, speed, {});
+    Check(result.receiver_confirmed && result.state == TransferState::Complete, "receiver TCPInfo supports an honestly confirmed result");
+}
+
 void TestFragmentAssembly() {
     using namespace network_test;
     MeasurementText text;
@@ -119,6 +146,7 @@ int main() {
         TestUnitsAndSources();
         TestPartialAndFailedResults();
         TestMeasurementScopeAndAggregation();
+        TestUploadReceiverTcpInfo();
         TestFragmentAssembly();
         TestIcmpAndWorkerCleanup();
         std::cout << "Network protocol/result tests passed (no network or database access)\n";

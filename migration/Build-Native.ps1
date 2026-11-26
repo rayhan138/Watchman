@@ -14,7 +14,7 @@ $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
 if ($package.version -cne $nativeVersion) { throw "Native and NSIS package versions must match ($nativeVersion)" }
 if ($config.version -cne '1.0.5') { throw 'Keep the historical Tauri app configuration at 1.0.5; the native package override owns the executable version' }
 if ($package.bundle.publisher -cne 'Noman Dhoni') { throw 'NSIS publisher must be exactly Noman Dhoni' }
-cmake -S native -B builds/native -A x64 -DBUILD_TESTING=ON
+cmake -S native -B builds/native -A x64 -DBUILD_TESTING=ON -DWATCHMAN_BUILD_RUNTIME_SMOKE=ON
 $PSNativeCommandUseErrorActionPreference = $false
 cmake --build builds/native --config Release --parallel 4 2>&1 | Tee-Object builds/compile.log
 if ($LASTEXITCODE) {
@@ -23,6 +23,20 @@ if ($LASTEXITCODE) {
 }
 $PSNativeCommandUseErrorActionPreference = $true
 ctest --test-dir builds/native -C Release --output-on-failure --timeout 45
+if ($env:GITHUB_ACTIONS -eq 'true') {
+    # The task registration must also work from a real standard (non-admin) token.
+    & ./native/tests/startup_registration_standard_user.ps1 `
+        -Executable builds/native/Release/StartupRegistrationTest.exe `
+        -ReportPath builds/native/startup-standard-user-tests.txt
+    # Exercise the actual desktop, startup migration, profile files, and production engine
+    # on this disposable GitHub-hosted Windows runner before signing the installer.
+    & ./native/tests/windows_smoke_test.ps1 `
+        -Executable builds/native/Release/Watchman.exe `
+        -RuntimeProbe builds/native/Release/WatchmanRuntimeSmoke.exe `
+        -OutputDirectory builds/smoke-results
+} else {
+    Write-Warning 'Skipped standard-user account and interactive desktop smoke checks; these destructive/interactive checks run only on disposable GitHub Actions Windows runners.'
+}
 # The installed verifier must not require a separate Visual C++ runtime.
 $previousRustflags = $env:RUSTFLAGS
 try {

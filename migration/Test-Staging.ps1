@@ -1,8 +1,9 @@
 # Runs on a disposable VM; TLS certificate is only for localhost, NOT an updater signing key.
 param(
-    [ValidateSet('1.0.5','2.0.0')][string]$CurrentVersion = '1.0.5',
+    [ValidateSet('1.0.5','2.0.0','2.0.1')][string]$CurrentVersion = '1.0.5',
     [string]$ProbePath = 'builds/native/Release/WatchmanUpdateProtocolProbe.exe',
-    [string]$UpgradeScript = 'migration/Test-Upgrade.ps1'
+    [string]$UpgradeScript = 'migration/Test-Upgrade.ps1',
+    [ValidateSet('2.0.0','2.0.1')][string]$UpgradeBaselineVersion
 )
 trap { Write-Host "::error::$($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)"; exit 1 }
 $ErrorActionPreference = 'Stop'
@@ -53,7 +54,11 @@ try {
     Probe 2
     Copy-Item $original $asset -Force
     # Real installed baseline; the staging probe launches the locked, verified candidate.
-    & $UpgradeScript -ProtocolProbe $probe
+    if ($UpgradeBaselineVersion) {
+        & $UpgradeScript -ProtocolProbe $probe -BaselineVersion $UpgradeBaselineVersion
+    } else {
+        & $UpgradeScript -ProtocolProbe $probe
+    }
 } finally {
     Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
     $thumb = [Security.Cryptography.X509Certificates.X509Certificate2]::new($cert).Thumbprint

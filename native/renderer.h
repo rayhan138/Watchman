@@ -5,15 +5,26 @@
 #include <array>
 #include <climits>
 #include <memory>
+#include <optional>
+#include <tuple>
+#include <utility>
 #include <vector>
 #include "ui_style.h"
 #include "settings_text_layout.h"
 #include "warnings_settings_layout.h"
 #include "welcome_tour.h"
+#include "update_policy.h"
+#include "update_presentation.h"
 #include "floating_monitor_layout.h"
+#include "floating_monitor_text.h"
 #include "bundled_fonts.h"
 #include "taskbar_widget_mode.h"
+#include "widget_runtime.h"
+#include "widget_recovery_policy.h"
+#include "live_readings.h"
 #include "runtime_policy.h"
+#include "ui_responsiveness.h"
+#include "main_graphics_policy.h"
 #include "warning_policy.h"
 #include "snapshots.h"
 #include "metrics.h"
@@ -54,15 +65,53 @@ public:
                 const NetworkSnapshot& net_snap, 
                 const AppActivitySnapshot& app_snap,
                 const TrafficHistorySnapshot& hist_snap,
-                const SpeedTestResult& speed_res,
-                int speed_prog,
-                double speed_live,
-                const std::wstring& speed_stat,
-                bool speed_running,
+                const SpeedTestSnapshot& speed,
                 const DiagnosticsSnapshot& diagnostics_snap);
 
     // Render the borderless Desktop Widget
     void RenderWidget(HWND hwnd, const DashboardSnapshot& dash_snap);
+    bool NeedsAnimationFrame() const { return main_animation_active_; }
+    bool MainGraphicsUnavailable() const { return FAILED(main_initialization_error_); }
+    void AllowWidgetGpuRetry(bool allowed) { widget_gpu_retry_allowed_ = allowed; }
+    // Reset host/device state without touching dashboard resources/settings.
+    void ResetWidgetHost();
+    void InvalidateWidgetFrame();
+    const WatchmanWidgetRuntime::PaintResult& GetWidgetPaintResult() const { return widget_paint_result_; }
+    void SetRuntimeStatus(const std::wstring& text) { runtime_status_ = text; }
+#ifdef WATCHMAN_RENDER_TESTING
+    void SetWidgetFaultsForTest(bool composition, DWORD layered_error = 0, DWORD selection_error = 0) {
+        test_fail_composition_ = composition;
+        test_layered_error_ = layered_error;
+        test_selection_error_ = selection_error;
+    }
+    void SetWidgetTimeForTest(uint64_t now) { test_widget_time_ = now; }
+    uint64_t WidgetGpuRetryAtForTest() const { return widget_gpu_retry_.Next(); }
+    unsigned CompositionAttemptsForTest() const { return test_composition_attempts_; }
+    uint64_t WidgetSubmissionsForTest() const { return test_widget_submissions_; }
+    uint64_t FloatingSubmissionsForTest() const { return test_floating_submissions_; }
+    const std::vector<DWORD>& FloatingPixelsForTest() const { return test_floating_pixels_; }
+    void SetFloatingColorsForTest(COLORREF color) {
+        floating_monitor_text_color_ = floating_monitor_upload_color_ = floating_monitor_download_color_ =
+            floating_monitor_cpu_color_ = floating_monitor_memory_color_ = color;
+    }
+    uint64_t MainPaintsForTest() const { return test_main_paints_; }
+    uint64_t SettingsWritesForTest() const { return test_settings_writes_; }
+    bool MainResourcesInitializedForTest() const { return main_resources_initialized_; }
+    void SetMainGraphicsFaultsForTest(HRESULT initialization, HRESULT target = S_OK) {
+        test_main_initialization_error_ = initialization; test_main_target_error_ = target;
+    }
+    void SetMainTimeForTest(uint64_t now) { test_main_time_ = now; }
+    void CompleteWelcomeForTest() {
+        welcome_tour_.Activate(WatchmanWelcome::Control::Skip);
+        welcome_tour_.LoadSeenVersion(WatchmanWelcome::version); // No Registry writes in an owned fixture.
+    }
+    uint64_t MainGraphicsRetryAtForTest() const { return main_graphics_retry_.Next(); }
+    unsigned MainInitializationAttemptsForTest() const { return test_main_initialization_attempts_; }
+    unsigned MainTargetAttemptsForTest() const { return test_main_target_attempts_; }
+    unsigned MainFallbackPaintsForTest() const { return test_main_fallback_paints_; }
+    void FollowSpeedCardForTest() { reveal_speed_test_ = true; }
+    bool SpeedCardVisibleForTest() const { return test_speed_card_visible_; }
+#endif
     // Render the independent always-available floating monitor surface.
     void RenderFloatingMonitor(HWND hwnd, HDC hdc, const DashboardSnapshot& dash_snap);
 
@@ -80,6 +129,16 @@ public:
     void OfferWelcomeTour(bool interactive);
     void OpenWelcomeTour();
     bool HandleWelcomeTourKeyDown(WPARAM key, bool shift);
+
+    void SetUpdateResult(const WatchmanUpdates::Result& result);
+    const WatchmanUpdates::Notice& Updates() const { return update_notice_; }
+    void MarkUpdateNotified();
+    void OfferUpdatePrompt(bool interactive, bool force = false);
+    bool IsUpdatePromptOpen() const { return update_prompt_open_; }
+    bool HandleUpdatePromptKeyDown(HWND hwnd, WPARAM key, bool shift);
+    bool TakeUpdateCheckRequest() { return std::exchange(update_check_requested_, false); }
+    void SetUpdateActionStatus(const std::wstring& status) { update_action_status_ = status; }
+
 
     // Set theme mode and update palette brushes
     void SetTheme(ThemeMode mode);
@@ -125,12 +184,18 @@ public:
     }
     bool IsFloatingMonitorEnabled() const { return floating_monitor_enabled_; }
     void SetFloatingMonitorEnabled(bool enable);
+    bool IsFloatingMonitorCpuShown() const { return floating_monitor_show_cpu_; }
+    bool IsFloatingMonitorMemoryShown() const { return floating_monitor_show_memory_; }
+    void SetFloatingMonitorCpuShown(bool show);
+    void SetFloatingMonitorMemoryShown(bool show);
     bool IsFloatingMonitorAlwaysOnTop() const { return floating_monitor_always_on_top_; }
     bool IsFloatingMonitorPositionLocked() const { return floating_monitor_lock_position_; }
     bool IsFloatingMonitorClickThrough() const { return floating_monitor_click_through_; }
     int GetFloatingMonitorOpacity() const { return floating_monitor_opacity_; }
     int GetFloatingMonitorFontSize() const { return floating_monitor_font_size_; }
     void SetFloatingMonitorFontSize(int size);
+    FloatingMonitorText::Weight GetFloatingMonitorTextWeight() const { return floating_monitor_text_weight_; }
+    void SetFloatingMonitorTextWeight(FloatingMonitorText::Weight weight);
     bool IsFloatingMonitorBackgroundTransparent() const { return floating_monitor_transparent_background_; }
     void SetFloatingMonitorPositionLocked(bool locked);
     void SetFloatingMonitorAlwaysOnTop(bool enabled);
@@ -182,6 +247,7 @@ public:
         // Opening Data always starts at Last 7 Days, even if Data is already open.
         SetDataRangeIndex(WatchmanRuntime::DataRangeOnTabOpen(tab == ActiveTab::Data, data_range_idx_));
         if (active_tab_ != tab) {
+            if (tab != ActiveTab::Network) reveal_speed_test_ = false;
             active_tab_ = tab;
             RestartContentAnimation();
             if (tab == ActiveTab::Data) {
@@ -202,6 +268,10 @@ public:
     void SaveSettings();
 
 private:
+    bool main_resources_initialized_ = false;
+    HRESULT main_initialization_error_ = S_OK;
+    WatchmanUi::MainGraphicsRetry main_graphics_retry_;
+    bool main_editor_suspended_ = false;
     ID2D1Factory* d2d_factory_ = nullptr;
     ID2D1HwndRenderTarget* render_target_ = nullptr;
     ID2D1HwndRenderTarget* widget_render_target_ = nullptr;
@@ -219,6 +289,8 @@ private:
     IDWriteTextFormat* format_titlebar_button_ = nullptr;
     IDWriteTextFormat* format_status_ = nullptr;
     IDWriteTextFormat* format_status_mono_ = nullptr;
+    IDWriteTextFormat* format_update_footer_ = nullptr;
+    IDWriteTextFormat* format_update_version_ = nullptr;
     IDWriteTextFormat* format_values_ = nullptr;
     IDWriteTextFormat* format_mono_ = nullptr;
     IDWriteTextFormat* format_chart_tick_ = nullptr;
@@ -230,6 +302,10 @@ private:
     IDWriteTextFormat* format_welcome_button_ = nullptr;
     IDWriteTextFormat* format_floating_preview_ = nullptr;
     IDWriteTextFormat* format_dashboard_value_ = nullptr;
+    IDWriteTextFormat* format_settings_version_ = nullptr;
+    IDWriteTextLayout* settings_version_layout_ = nullptr;
+    float settings_version_text_width_ = 0;
+    float settings_title_text_width_ = 0;
     IDWriteTextFormat* format_dashboard_gauge_ = nullptr;
     IDWriteTextFormat* format_data_period_ = nullptr;
     IDWriteTextFormat* format_data_filter_ = nullptr;
@@ -332,6 +408,11 @@ private:
     UIStyle::ColorPalette palette_;
     
     // UI layout/toggles
+    WatchmanUpdates::Notice update_notice_;
+    bool update_prompt_open_ = false, update_prompt_requested_ = false;
+    bool update_check_requested_ = false, update_footer_visible_ = false;
+    int update_focus_ = 1; // close, download, later
+    std::wstring update_action_status_, update_download_error_;
     WatchmanWelcome::Tour welcome_tour_;
     bool welcome_keyboard_focus_ = false;
     float welcome_scroll_ = 0, welcome_scroll_max_ = 0;
@@ -341,6 +422,7 @@ private:
     bool settings_open_ = false;
     bool speed_consent_open_ = false;
     bool speed_details_open_ = false;
+    bool reveal_speed_test_ = false;
     float speed_details_scroll_ = 0.0f;
     float speed_details_scroll_max_ = 0.0f;
     SpeedTestResult speed_details_result_{};
@@ -411,6 +493,8 @@ private:
     bool widget_enabled_ = true;
     TaskbarWidgetMode widget_mode_ = TaskbarWidgetMode::All;
     bool floating_monitor_enabled_ = false;
+    bool floating_monitor_show_cpu_ = FloatingMonitorLayout::default_show_cpu;
+    bool floating_monitor_show_memory_ = FloatingMonitorLayout::default_show_memory;
     bool floating_monitor_always_on_top_ = true;
     bool floating_monitor_lock_position_ = false;
     bool floating_monitor_click_through_ = false;
@@ -421,8 +505,11 @@ private:
     COLORREF floating_monitor_text_color_ = CLR_INVALID;
     COLORREF floating_monitor_upload_color_ = CLR_INVALID;
     COLORREF floating_monitor_download_color_ = CLR_INVALID;
+    COLORREF floating_monitor_cpu_color_ = CLR_INVALID;
+    COLORREF floating_monitor_memory_color_ = CLR_INVALID;
 
     int floating_monitor_font_size_ = FloatingMonitorLayout::default_font_size;
+    FloatingMonitorText::Weight floating_monitor_text_weight_ = FloatingMonitorText::default_weight;
     int floating_monitor_x_ = INT_MIN;
     int floating_monitor_y_ = INT_MIN;
 
@@ -450,6 +537,8 @@ private:
         TaskbarWidgetMode widget_mode = TaskbarWidgetMode::All;
         std::wstring network_adapter_id;
         bool floating_monitor_enabled = false;
+        bool floating_monitor_show_cpu = FloatingMonitorLayout::default_show_cpu;
+        bool floating_monitor_show_memory = FloatingMonitorLayout::default_show_memory;
         bool floating_monitor_always_on_top = true;
         bool floating_monitor_lock_position = false;
         bool floating_monitor_click_through = false;
@@ -460,10 +549,37 @@ private:
         COLORREF floating_monitor_text_color = CLR_INVALID;
         COLORREF floating_monitor_upload_color = CLR_INVALID;
         COLORREF floating_monitor_download_color = CLR_INVALID;
+        COLORREF floating_monitor_cpu_color = CLR_INVALID;
+        COLORREF floating_monitor_memory_color = CLR_INVALID;
 
         int floating_monitor_font_size = FloatingMonitorLayout::default_font_size;
+        FloatingMonitorText::Weight floating_monitor_text_weight = FloatingMonitorText::default_weight;
+        friend bool operator==(const PreferencesDraft& a, const PreferencesDraft& b) {
+            return std::tie(a.autostart_enabled, a.use_bits_per_second, a.hide_hardware_gauges, a.theme,
+                a.monthly_data_limit_bytes, a.alerts_enabled, a.traffic_warning_enabled, a.traffic_warning_threshold,
+                a.traffic_warning_gigabytes, a.memory_warning_enabled, a.memory_warning_threshold, a.cpu_temp_warning_enabled,
+                a.cpu_temp_warning_threshold, a.gpu_temp_warning_enabled, a.gpu_temp_warning_threshold, a.disk_temp_warning_enabled,
+                a.disk_temp_warning_threshold, a.mainboard_temp_warning_enabled, a.mainboard_temp_warning_threshold, a.widget_enabled,
+                a.widget_mode, a.network_adapter_id, a.floating_monitor_enabled, a.floating_monitor_show_cpu, a.floating_monitor_show_memory, a.floating_monitor_always_on_top,
+                a.floating_monitor_lock_position, a.floating_monitor_click_through, a.floating_monitor_transparent_background, a.floating_monitor_opacity,
+                a.floating_monitor_display_device, a.floating_monitor_text_color, a.floating_monitor_upload_color, a.floating_monitor_download_color,
+                a.floating_monitor_cpu_color, a.floating_monitor_memory_color,
+                a.floating_monitor_font_size, a.floating_monitor_text_weight) ==
+                   std::tie(b.autostart_enabled, b.use_bits_per_second, b.hide_hardware_gauges, b.theme,
+                b.monthly_data_limit_bytes, b.alerts_enabled, b.traffic_warning_enabled, b.traffic_warning_threshold,
+                b.traffic_warning_gigabytes, b.memory_warning_enabled, b.memory_warning_threshold, b.cpu_temp_warning_enabled,
+                b.cpu_temp_warning_threshold, b.gpu_temp_warning_enabled, b.gpu_temp_warning_threshold, b.disk_temp_warning_enabled,
+                b.disk_temp_warning_threshold, b.mainboard_temp_warning_enabled, b.mainboard_temp_warning_threshold, b.widget_enabled,
+                b.widget_mode, b.network_adapter_id, b.floating_monitor_enabled, b.floating_monitor_show_cpu, b.floating_monitor_show_memory, b.floating_monitor_always_on_top,
+                b.floating_monitor_lock_position, b.floating_monitor_click_through, b.floating_monitor_transparent_background, b.floating_monitor_opacity,
+                b.floating_monitor_display_device, b.floating_monitor_text_color, b.floating_monitor_upload_color, b.floating_monitor_download_color,
+                b.floating_monitor_cpu_color, b.floating_monitor_memory_color,
+                b.floating_monitor_font_size, b.floating_monitor_text_weight);
+        }
     };
     PreferencesDraft preferences_draft_{};
+    struct SavedPreferences { PreferencesDraft values; int x, y; };
+    std::optional<SavedPreferences> saved_preferences_;
     bool preferences_dirty_ = false;
     bool preferences_apply_requested_ = false;
     bool floating_monitor_reset_position_requested_ = false;
@@ -494,6 +610,10 @@ private:
 
     // Graph data (last 60 seconds)
     std::vector<SpeedSample> speed_history_;
+    WatchmanLiveReadings::SampleGate chart_sample_gate_;
+    bool main_animation_active_ = true;
+    WatchmanUi::FrameClock animation_clock_;
+    float animation_alpha_ = 1.0f;
     
     // Smooth Animation states (interpolated variables)
     float anim_dl_speed_ = 0.0f;
@@ -509,6 +629,7 @@ private:
     ULONGLONG content_animation_started_ms_ = 0;
     float data_chart_progress_ = 1.0f;
     float data_limit_progress_ = 0.0f;
+    bool data_limit_animating_ = false;
     ULONGLONG data_chart_animation_started_ms_ = 0;
     D2D1_SIZE_F render_size_ = { UIStyle::WINDOW_WIDTH, UIStyle::WINDOW_HEIGHT };
     float content_scroll_offsets_[5]{};
@@ -516,7 +637,29 @@ private:
 
     std::unique_ptr<TaskbarWidgetCompositor> widget_compositor_;
     bool widget_composition_failed_ = false;
-    
+    bool widget_gpu_retry_allowed_ = true;
+    WatchmanWidgetRuntime::GpuRetryPolicy widget_gpu_retry_;
+    WatchmanUi::WidgetFirstFrame widget_first_frame_;
+    WatchmanWidgetRuntime::PaintResult widget_paint_result_{};
+    std::wstring runtime_status_;
+#ifdef WATCHMAN_RENDER_TESTING
+    bool test_fail_composition_ = false;
+    DWORD test_layered_error_ = 0;
+    DWORD test_selection_error_ = 0;
+    unsigned test_composition_attempts_ = 0;
+    uint64_t test_widget_submissions_ = 0;
+    uint64_t test_widget_time_ = 0;
+    uint64_t test_floating_submissions_ = 0, test_main_paints_ = 0, test_settings_writes_ = 0;
+    std::vector<DWORD> test_floating_pixels_;
+    bool test_speed_card_visible_ = false;
+    HRESULT test_main_initialization_error_ = S_OK, test_main_target_error_ = S_OK;
+    uint64_t test_main_time_ = 0;
+    unsigned test_main_initialization_attempts_ = 0, test_main_target_attempts_ = 0, test_main_fallback_paints_ = 0;
+#endif
+
+    uint64_t MainGraphicsTime() const;
+    void ReleaseMainDeviceIndependentResources();
+    void DrawMainGraphicsFallback(HWND hwnd);
     HRESULT CreateDeviceIndependentResources();
     HRESULT CreateDeviceResources(HWND hwnd);
     void UpdatePaletteBrushes();
@@ -541,7 +684,7 @@ private:
     void DrawDashboard(D2D1_SIZE_F rt_size, const DashboardSnapshot& dash_snap, const NetworkSnapshot& net_snap, const TrafficHistorySnapshot& hist_snap);
     void DrawData(D2D1_SIZE_F rt_size, const TrafficHistorySnapshot& hist_snap);
     void DrawAppMonitor(D2D1_SIZE_F rt_size, const AppActivitySnapshot& app_snap);
-    void DrawNetworkHealth(D2D1_SIZE_F rt_size, const NetworkSnapshot& net_snap, const DashboardSnapshot& dash_snap, const SpeedTestResult& speed_res, int speed_prog, double speed_live, const std::wstring& speed_stat, bool speed_running);
+    void DrawNetworkHealth(D2D1_SIZE_F rt_size, const NetworkSnapshot& net_snap, const DashboardSnapshot& dash_snap, const SpeedTestSnapshot& speed);
     void DrawTools(
         D2D1_SIZE_F rt_size,
         const TrafficHistorySnapshot& hist_snap,
@@ -550,6 +693,10 @@ private:
     void DrawSettingsModal(D2D1_SIZE_F rt_size, const DashboardSnapshot& dash_snap);
     WarningsSettingsLayout GetMeasuredWarningsLayout(float left, float right, float top, float scroll = 0);
     void DrawSpeedDialog(D2D1_SIZE_F rt_size);
+    void DrawUpdatePrompt(D2D1_SIZE_F rt_size);
+    void DismissUpdatePrompt();
+    void OpenUpdateDownload(HWND hwnd);
+    void RememberUpdateMarker(const wchar_t* name);
     void DrawWelcomeTour(D2D1_SIZE_F rt_size);
     void DrawWelcomeMonitorPreviews(const WatchmanWelcome::Rect& area);
     void ActivateWelcomeControl(WatchmanWelcome::Control control);

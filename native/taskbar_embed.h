@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include "widget_runtime.h"
 
 struct TaskbarPlacement {
     int x;
@@ -24,9 +25,22 @@ extern "C" {
     // Returns 1 only when both layout and widget cleanup are complete (or unnecessary).
     // A 0 requires retry, including while the widget is disabled/hidden.
     int tm_restore_taskbar_layout();
+    WatchmanWidgetRuntime::Result tm_get_widget_result();
+    // Clear cached shell handles only after old reservations/parenting have
+    // been restored. Failure remains pending and must be retried.
+    int tm_reset_taskbar_binding();
     int tm_set_widget_context_menu_open(void* owner_hwnd, int open);
     int tm_set_widget_command_target(void* target_hwnd, unsigned int context_menu_message, unsigned int history_message);
     int tm_take_widget_context_menu_request();
     int tm_take_widget_double_click_request();
     int tm_should_widget_be_visible(void* widget_hwnd, void* main_hwnd, int* visible);
 }
+
+#ifdef WATCHMAN_TASKBAR_TESTING
+// In-process tests use only windows they own, never the real Explorer taskbar.
+void tm_use_taskbar_for_test(HWND taskbar);
+HWND tm_input_widget_for_test();
+void tm_use_foreground_for_test(HWND foreground);
+void tm_fail_next_parent_for_test(DWORD error);
+void tm_fail_next_position_for_test(DWORD error, unsigned calls_before_failure = 0);
+#endif

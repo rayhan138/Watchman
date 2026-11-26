@@ -160,19 +160,33 @@ inline bool ExtractJsonNumber(const std::wstring& json, const std::wstring& key,
     return true;
 }
 
-inline void UpdateMeasurement(const std::wstring& message, double& server_mbps, double& min_rtt_ms) {
+inline void UpdateMeasurement(const std::wstring& message, double& server_mbps, double& min_rtt_ms,
+    bool upload_receiver = false) {
     std::wstring app_info;
     double bytes = 0.0;
     double elapsed_us = 0.0;
+    bool application_sample = false;
     if (ExtractJsonObject(message, L"AppInfo", app_info) &&
         ExtractJsonNumber(app_info, L"NumBytes", bytes) &&
         ExtractJsonNumber(app_info, L"ElapsedTime", elapsed_us)) {
         const double speed = GoodputMbps(bytes, elapsed_us / 1'000'000.0);
-        if (speed > 0.0) server_mbps = speed; // Latest cumulative sample, never a sum.
+        if (speed > 0.0) {
+            server_mbps = speed; // Latest cumulative sample, never a sum.
+            application_sample = true;
+        }
     }
     std::wstring tcp_info;
     double raw_rtt = 0.0;
     if (!ExtractJsonObject(message, L"TCPInfo", tcp_info)) return;
+    // Current ndt-server publishes receiver TCPInfo, often without AppInfo.
+    // Only upload can use the server's BytesReceived; BytesSent/BytesAcked or
+    // client-direction download counters must never confirm an upload result.
+    if (upload_receiver && !application_sample &&
+        ExtractJsonNumber(tcp_info, L"BytesReceived", bytes) &&
+        ExtractJsonNumber(tcp_info, L"ElapsedTime", elapsed_us)) {
+        const double speed = GoodputMbps(bytes, elapsed_us / 1'000'000.0);
+        if (speed > 0.0) server_mbps = speed;
+    }
     if (!ExtractJsonNumber(tcp_info, L"MinRTT", raw_rtt) || raw_rtt <= 0.0) {
         ExtractJsonNumber(tcp_info, L"RTT", raw_rtt);
     }

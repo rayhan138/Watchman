@@ -1,4 +1,6 @@
 #pragma once
+#include "history_profile.h"
+#include "traffic_export.h"
 #include <windows.h>
 #include <cstdint>
 #include <map>
@@ -8,32 +10,11 @@
 
 struct sqlite3; // Forward declaration of SQLite database structure
 
-struct TrafficRecord {
-    std::wstring date; // Format: YYYY-MM-DD
-    uint64_t rx_bytes = 0;
-    uint64_t tx_bytes = 0;
-};
-
 struct AppTrafficRecord {
     std::wstring app_name;
     uint64_t rx_bytes = 0;
     uint64_t tx_bytes = 0;
     uint64_t last_seen = 0; // Unix timestamp
-};
-
-enum class TrafficExportPeriod {
-    Daily,
-    Weekly,
-    Monthly,
-    Yearly,
-};
-
-struct TrafficExportOptions {
-    TrafficExportPeriod period = TrafficExportPeriod::Monthly;
-    // Daily and weekly exports are scoped to YYYY-MM.
-    std::wstring month;
-    // Monthly and yearly exports are scoped to one calendar year.
-    int year = 0;
 };
 
 struct TrafficExportResult {
@@ -47,7 +28,11 @@ public:
     TrafficStorage();
     // Explicit paths never resolve APPDATA; useful for isolated history tests.
     explicit TrafficStorage(const std::wstring& database_path, int busy_timeout_ms = 5000);
+    explicit TrafficStorage(const WatchmanHistory::Selection& profile, int busy_timeout_ms = 5000);
     ~TrafficStorage();
+    const std::wstring& GetDatabaseFilePath() const { return database_path_; }
+    WatchmanHistory::Profile GetProfileKind() const { return profile_.profile; }
+    std::wstring GetProfileDescription() const { return WatchmanHistory::Description(profile_); }
 
     bool SaveSessionTraffic(uint64_t delta_rx_bytes, uint64_t delta_tx_bytes);
     bool SaveAppTraffic(const std::wstring& app_name, uint64_t delta_rx, uint64_t delta_tx);
@@ -62,6 +47,9 @@ public:
 
     // Retrieves all total daily records
     std::vector<TrafficRecord> LoadHistory();
+    // Checked whole-history read. A failed/partial query never replaces the
+    // caller's last good history with an apparently empty database.
+    bool LoadHistory(std::vector<TrafficRecord>& records);
 
     // Aggregates daily records into YYYY-MM buckets for the yearly chart.
     std::vector<TrafficRecord> LoadMonthlyHistory();
@@ -77,19 +65,20 @@ public:
     // Retrieves today's total traffic for a given application
     uint64_t GetAppTotalTrafficToday(const std::wstring& app_name);
 
-    // Mirrors Watchman's Tauri export contract. Reports are written as UTF-8
-    // CSV files to the user's Downloads folder and contain readable and raw
-    // byte totals for the selected saved-history range.
+    // Excel-ready five-column reports in Downloads: binary MB/GB numbers,
+    // friendly period labels and summaries, UTF-8 BOM and CRLF line endings.
+    // This only reads history; it never changes stored byte totals.
     TrafficExportResult ExportTrafficCsv(const TrafficExportOptions& options);
 
 private:
     sqlite3* db_ = nullptr;
     std::mutex storage_mutex_;
     std::wstring database_path_;
+    WatchmanHistory::Selection profile_;
     int busy_timeout_ms_ = 5000;
     std::string last_error_;
 
-    static std::wstring GetDatabasePath();
+    static WatchmanHistory::Selection GetDefaultProfile();
     bool OpenDatabase();
     void CloseDatabase();
     bool CheckResult(sqlite3* db, int result, int expected, const char* operation);

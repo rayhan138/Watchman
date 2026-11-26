@@ -97,11 +97,11 @@ struct Layout {
 };
 inline Layout GetLayout(float width, float height) {
     const float card_width = (std::min)(480.0f, (std::max)(1.0f, width - 32.0f));
-    const float card_height = (std::min)(540.0f, (std::max)(1.0f, height - 32.0f));
+    const float card_height = (std::min)(550.0f, (std::max)(1.0f, height - 32.0f));
     const float x = (width - card_width) / 2, y = (height - card_height) / 2;
     const float pad = card_width < 380 ? 20.0f : 28.0f;
     const float right = x + card_width - pad, left = x + pad;
-    const float art_height = card_height >= 500 ? 80.0f : card_height >= 400 ? 48.0f : 0.0f;
+    const float art_height = card_height >= 500 ? 90.0f : card_height >= 400 ? 48.0f : 0.0f;
     Layout layout;
     layout.card = {x, y, x + card_width, y + card_height};
     layout.brand = {left, y + 22, right - 76, y + 46};
@@ -128,9 +128,10 @@ inline MonitorPreviews GetMonitorPreviews(const Rect& area) {
     const auto taskbar = TaskbarWidgetLayout::PreferredSize(TaskbarWidgetMode::All, false, 36, 96);
     const int floating_width = FloatingMonitorLayout::Width(FloatingMonitorLayout::default_font_size);
     const float group_width = static_cast<float>(taskbar.width + 20 + floating_width);
-    const float scale = (std::max)(0.0f, (std::min)({1.0f, (Width(area) - 16) / group_width, Height(area) / 64}));
+    const float group_height = (std::max)(24.0f + taskbar.height, 26.0f + FloatingMonitorLayout::Height());
+    const float scale = (std::max)(0.0f, (std::min)({1.0f, (Width(area) - 16) / group_width, Height(area) / (group_height + 8)}));
     const float left = (area.left + area.right - group_width * scale) / 2;
-    const float top = (area.top + area.bottom - 56 * scale) / 2;
+    const float top = (area.top + area.bottom - group_height * scale) / 2;
     const auto bounds = [&](float x, float y, float w, float h) {
         return Rect{left + x * scale, top + y * scale, left + (x + w) * scale, top + (y + h) * scale};
     };

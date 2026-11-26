@@ -3,6 +3,7 @@ param([string]$Setup, [string]$ProtocolProbe)
 trap { Write-Host "::error::$($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)"; exit 1 }
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
+Import-Module "$PSScriptRoot/StartupAcceptance.psm1" -Force
 $version = (Get-Content src-tauri/native-package.json -Raw | ConvertFrom-Json).version
 if (!$Setup) { $Setup = "builds/staged/Watchman_${version}_x64-setup.exe" }
 function Require($ok,$message){ if (!$ok) { throw $message } }
@@ -24,6 +25,11 @@ $oldEntryPath = $old.PSPath
 $oldInstallPath = $old.InstallLocation.Trim('"')
 $app = Join-Path (Split-Path $old.UninstallString.Trim('"')) 'watchman.exe'
 Require ((Split-Path $app) -eq $oldInstallPath) 'Baseline install location and uninstaller path disagree'
+# The released Tauri v1 plugin opens this key instead of creating it; seed a clean
+# per-user Run key so this acceptance test exercises the legacy registration.
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$null = New-Item $runKey -Force
+Require ($null -eq (Get-WatchmanRunCommand)) 'Fresh runner already had a Watchman Run value'
 $profileDir = Join-Path $env:APPDATA 'Watchman'
 $native = Join-Path $env:APPDATA 'Watchman.Native'
 $null = New-Item $profileDir -ItemType Directory -Force
@@ -35,6 +41,13 @@ python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('create
 $v1 = Start-Process $app -PassThru
 Start-Sleep -Seconds 8
 Require (!$v1.HasExited) 'Released v1 is not running'
+Require ($null -eq (Get-WatchmanStartupTask)) 'A Task Scheduler registration existed before the v1 upgrade'
+# Seed the exact legacy Tauri v1 format on this disposable user. The released
+# app silently ignores autostart registration errors, so do not depend on a
+# clean hosted account already having a Run value.
+$legacyStartup = "$app --minimized"
+New-ItemProperty $runKey -Name Watchman -Value $legacyStartup -PropertyType String -Force | Out-Null
+Require ((Get-WatchmanRunCommand) -ieq $legacyStartup) 'Could not seed the exact unquoted Tauri v1 Run command'
 # The v1 updater uses the passive/update/restart contract; wait for installer, not its restarted child.
 if ($ProtocolProbe) { Wait-App $ProtocolProbe '--install' } else { Wait-App $Setup '/P /UPDATE /R' }
 Require ($v1.HasExited) 'Old app did not stop'
@@ -53,7 +66,7 @@ $defaultInstall = Join-Path $env:ProgramFiles 'Watchman'
 if ($defaultInstall -ne $installPath) { Require (!(Test-Path (Join-Path $defaultInstall 'watchman.exe'))) 'Update created a duplicate default-path installation' }
 $installedInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($app)
 Require ($installedInfo.CompanyName -ceq 'Noman Dhoni') 'Executable CompanyName is not exactly Noman Dhoni'
-Require ($installedInfo.FileVersion -ceq $version -and $installedInfo.ProductVersion -ceq $version) 'Executable PE version metadata is not 2.0.1'
+Require ($installedInfo.FileVersion -ceq $version -and $installedInfo.ProductVersion -ceq $version) 'Executable PE version metadata does not match the candidate version'
 Require ((Get-FileHash $app).Hash -eq (Get-Content builds/staged/Watchman.exe.sha256).Trim()) 'Installed executable is not the MSVC build'
 $baseline = "$env:RUNNER_TEMP/watchman-v1-baseline/Watchman_1.0.5_x64-setup.exe"
 & (Join-Path (Split-Path $app) 'watchman-verify-release.exe') $baseline "$baseline.minisig"
@@ -62,7 +75,17 @@ Require (Test-Path "$native/migration-v2.complete") 'Restart/first launch did no
 Require (!(Test-Path (Join-Path (Split-Path $app) 'vendor/libre-hardware-monitor/LibreHardwareMonitorLib.dll'))) 'Legacy sensor binaries left installed'
 Require (@(Get-Process watchman -ErrorAction Ignore).Count -eq 1) 'Expected one restarted Watchman'
 Require ((Get-ItemProperty 'HKCU:\Software\Watchman').UnitModeBits -eq 1) 'Settings were not imported'
-Require ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').Watchman -match 'watchman.exe" --startup$') 'Startup entry missing or invalid'
+Require ((Get-ItemProperty 'HKCU:\Software\Watchman').Autostart -eq 1) 'v1 startOnBoot preference was not imported'
+$startupReady = $false
+for ($i = 0; $i -lt 60; $i++) {
+    if ((Test-WatchmanStartupTask -Executable $app) -and $null -eq (Get-WatchmanRunCommand)) {
+        $startupReady = $true
+        break
+    }
+    Start-Sleep 1
+}
+Require $startupReady 'v1.0.5 --minimized startup was not migrated to a current-user sign-in task'
+Assert-WatchmanStartupTask -Executable $app
 foreach ($name in 'settings.json','history.json','unknown.txt','watchman.db') {
     Require ((Get-FileHash "$profileDir/$name").Hash -eq (Get-FileHash "$native/original-v1/$name").Hash) "Original $name changed"
 }
@@ -88,8 +111,8 @@ try {
     python -c "import sqlite3,sys; assert sqlite3.connect(sys.argv[1]).execute('select upload_bytes,download_bytes from daily_traffic').fetchall()==[]" "$env:APPDATA/Watchman.Native/watchman.db"
     Require ((Get-ItemProperty 'HKCU:\Software\Watchman').WarningGpuTempThreshold -eq 91) 'Warning threshold lost'
     $quiet = Start-Process $app -ArgumentList '--startup' -PassThru
-    for ($i=0; $i -lt 30 -and (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').Watchman; $i++) { Start-Sleep 1 }
-    Require (!$quiet.HasExited -and !(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').Watchman) 'Disabled startup not respected'
+    for ($i = 0; $i -lt 30 -and ($null -ne (Get-WatchmanStartupTask) -or $null -ne (Get-WatchmanRunCommand)); $i++) { Start-Sleep 1 }
+    Require (!$quiet.HasExited -and $null -eq (Get-WatchmanStartupTask) -and $null -eq (Get-WatchmanRunCommand)) 'Disabled startup was not respected'
     $quiet.Kill(); $quiet.WaitForExit()
     $env:APPDATA = Join-Path $env:RUNNER_TEMP 'damaged-profile'
     $bad = New-Item "$env:APPDATA/Watchman" -ItemType Directory -Force
@@ -98,9 +121,24 @@ try {
     $failed = Start-Process $app -ArgumentList '--migrate-only' -PassThru -Wait
     Require ($failed.ExitCode -ne 0 -and !(Test-Path "$env:APPDATA/Watchman.Native") -and (Get-FileHash "$bad/watchman.db").Hash -eq $before) 'Damaged history was silently replaced'
 } finally { $env:APPDATA = $real }
+# Re-enable startup so silent uninstall exercises the NSIS pre-uninstall cleanup.
+New-ItemProperty 'HKCU:\Software\Watchman' -Name Autostart -Value 1 -PropertyType DWord -Force | Out-Null
+$cleanupProbe = Start-Process $app -ArgumentList '--startup' -PassThru
+$cleanupReady = $false
+for ($i = 0; $i -lt 60; $i++) {
+    if ((Test-WatchmanStartupTask -Executable $app) -and $null -eq (Get-WatchmanRunCommand)) {
+        $cleanupReady = $true
+        break
+    }
+    Start-Sleep 1
+}
+Require $cleanupReady 'Could not prepare an owned startup task for uninstall cleanup verification'
+Assert-WatchmanStartupTask -Executable $app
+$cleanupProbe.Kill(); $cleanupProbe.WaitForExit()
 Wait-App $new.UninstallString.Trim('"') '/S'
-for ($i=0; $i -lt 30 -and (Test-Path $app); $i++) {Start-Sleep 1}
-Require (!(Test-Path $app) -and (Test-Path "$native/original-v1/history.json")) 'Uninstall removed data or left executable'
+for ($i = 0; $i -lt 30 -and (Test-Path $app); $i++) { Start-Sleep 1 }
+Require (!(Test-Path $app) -and (Test-Path "$native/original-v1/history.json") -and (Test-Path "$native/watchman.db")) 'Uninstall removed data or left executable'
+Assert-WatchmanStartupAbsent
 # The v1 files were never modified: reinstall the already verified v1 release.
 Wait-App "$env:RUNNER_TEMP/watchman-v1-baseline/Watchman_1.0.5_x64-setup.exe" "/S /D=$(Split-Path $app)"
 Require ((Entry).DisplayVersion -eq '1.0.5' -and (Test-Path $app)) 'Rollback registration failed'

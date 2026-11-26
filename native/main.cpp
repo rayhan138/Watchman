@@ -1,12 +1,15 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <dwmapi.h>
+#include <dbt.h>
 #include <objbase.h>
 #include <shellapi.h>
 #include <sddl.h>
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <iterator>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 #include "renderer.h"
@@ -24,6 +27,11 @@
 #include "resource.h"
 #include "runtime_policy.h"
 #include "window_lifecycle.h"
+#include "startup_diagnostics.h"
+#include "startup_registration.h"
+#include "tray_registration.h"
+#include "update_checker.h"
+#include "update_notification.h"
 
 
 // Window message handler declarations
@@ -55,11 +63,28 @@ HWND g_floating_monitor_hwnd = nullptr;
 // display the same network, CPU, and memory values for that interval.
 DashboardSnapshot g_display_dashboard_snapshot{};
 bool g_has_display_dashboard_snapshot = false;
+uint64_t g_dashboard_hidden_at_sample = 0;
+bool g_awaiting_hidden_widget_frame = false;
+#ifdef WATCHMAN_STARTUP_RECOVERY_TESTING
+std::atomic<bool> g_tray_ready_for_test{true};
+std::atomic<HANDLE> g_tray_entered_for_test{nullptr}, g_tray_release_for_test{nullptr};
+void WatchmanTrayReadyForTest(bool ready) { g_tray_ready_for_test = ready; }
+void WatchmanBlockTrayForTest(HANDLE entered, HANDLE release) {
+    g_tray_entered_for_test = entered;
+    g_tray_release_for_test = release;
+}
+#endif
 
 constexpr UINT WM_WATCHMAN_WIDGET_MENU = WM_APP + 10;
 constexpr UINT WM_WATCHMAN_WIDGET_DATA = WM_APP + 11;
 constexpr UINT WM_WATCHMAN_TRAY = WM_APP + 12;
 constexpr UINT WM_WATCHMAN_ACTIVATE = WM_APP + 13;
+constexpr UINT WM_WATCHMAN_RECOVER_WIDGET = WM_APP + 15;
+constexpr UINT WM_WATCHMAN_DISPLAY_RECOVERY = WM_APP + 16;
+static_assert(WM_WATCHMAN_DISPLAY_RECOVERY != WatchmanWindowLifecycle::ExitMessage &&
+    WM_WATCHMAN_DISPLAY_RECOVERY != WM_WATCHMAN_RECOVER_WIDGET, "Recovery messages must remain distinct");
+static_assert(WM_WATCHMAN_RECOVER_WIDGET != WatchmanWindowLifecycle::ExitMessage,
+    "Recovering a widget must never request application Exit");
 constexpr UINT TRAY_ICON_ID = 1;
 const UINT WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
 
@@ -67,7 +92,235 @@ namespace {
 
 HMONITOR GetSelectedFloatingMonitorDisplay();
 
-bool g_main_animation_timer_running = false;
+using WatchmanWidgetRuntime::Status;
+using WatchmanWidgetRuntime::Result;
+Result g_widget_result{};
+bool g_shutting_down = false;
+bool g_widget_cleanup_pending = false;
+bool g_widget_binding_reset_pending = true;
+WatchmanWidgetRuntime::RetrySchedule g_widget_retry;
+WatchmanWidgetRuntime::DisplayRecovery g_display_recovery;
+WatchmanTray::RetrySchedule g_tray_retry;
+std::unique_ptr<WatchmanTray::Worker> g_tray_worker;
+std::optional<bool> g_tray_last_logged;
+
+void CompleteTrayRegistration(WatchmanTray::Result result, uint64_t now) {
+    if (!g_tray_retry.Complete(result, now)) return;
+    if (!g_tray_last_logged || *g_tray_last_logged != result.ready) {
+        WatchmanStartupDiagnostics::Record("shell", result.ready ? "tray-ready" : "tray-unavailable");
+        g_tray_last_logged = result.ready;
+    }
+}
+
+void TickTrayRegistration(HWND hwnd, uint64_t now) {
+    if (g_shutting_down) return;
+    WatchmanTray::Result result;
+    if (g_tray_worker && g_tray_worker->Take(result)) CompleteTrayRegistration(result, now);
+    if (const auto generation = g_tray_retry.Begin(now)) {
+        try {
+            if (!g_tray_worker) g_tray_worker = std::make_unique<WatchmanTray::Worker>([hwnd] { return AddTrayIcon(hwnd); });
+            if (g_tray_worker->Request(generation)) return;
+        } catch (...) { /* Thread allocation failures use the same bounded retry. */ }
+        CompleteTrayRegistration({generation, false}, now);
+    }
+}
+WatchmanStartup::Worker g_startup_registration_worker(WatchmanStartup::ApplyForCurrentUser);
+WatchmanStartup::Result g_startup_registration_result{};
+uint64_t g_startup_registration_sequence = 0;
+bool g_startup_registration_pending = false;
+DWORD g_startup_registration_error = ERROR_SUCCESS;
+WatchmanUpdates::Worker g_update_worker(WatchmanUpdates::CheckOfficialRelease);
+WatchmanUpdates::Schedule g_update_schedule;
+bool g_update_manual_pending = false;
+bool g_update_balloon_active = false;
+uint64_t g_update_notification_retry = 0;
+
+void RequestUpdateCheck(bool manual) {
+#ifndef WATCHMAN_STARTUP_RECOVERY_TESTING
+    if (!g_renderer || g_shutting_down) return;
+    const auto now = GetTickCount64();
+    if (!g_update_schedule.Begin(now, manual)) {
+        if (manual) g_renderer->SetUpdateActionStatus(L"Please wait a minute before checking again.");
+        return;
+    }
+    try {
+        if (!g_update_worker.Request()) throw std::runtime_error("Update worker unavailable");
+        g_update_manual_pending = manual;
+        g_renderer->SetUpdateResult({WatchmanUpdates::Status::Checking, {}, 0});
+        WatchmanStartupDiagnostics::Record("updates", "check-started");
+    } catch (...) {
+        g_update_schedule.Complete(now, false);
+        g_renderer->SetUpdateResult({WatchmanUpdates::Status::Unavailable, {}, ERROR_NOT_ENOUGH_MEMORY});
+    }
+#else
+    (void)manual; // Owned-window tests must never perform a public HTTP check.
+#endif
+}
+
+void TickUpdates(HWND hwnd) {
+#ifndef WATCHMAN_STARTUP_RECOVERY_TESTING
+    if (!g_renderer || g_shutting_down) return;
+    const auto now = GetTickCount64();
+    const bool interactive = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
+    WatchmanUpdates::Result result;
+    if (g_update_worker.Take(result)) {
+        g_update_schedule.Complete(now, result.status != WatchmanUpdates::Status::Unavailable);
+        g_renderer->SetUpdateResult(result);
+        WatchmanStartupDiagnostics::Record("updates", result.status == WatchmanUpdates::Status::Available ? "available" :
+            result.status == WatchmanUpdates::Status::Unavailable ? "check-failed" : "checked", result.error);
+        if (g_update_manual_pending && result.status == WatchmanUpdates::Status::Available)
+            g_renderer->OfferUpdatePrompt(interactive, true);
+        g_update_manual_pending = false;
+    }
+    const auto& notice = g_renderer->Updates();
+    if (g_tray_retry.Ready() && g_renderer->IsAlertsEnabled() && notice.ShouldNotify() && now >= g_update_notification_retry && WatchmanVersion::Current()) {
+        if (WatchmanUpdates::SendNotification(hwnd, TRAY_ICON_ID, *notice.Available(), *WatchmanVersion::Current())) {
+            g_renderer->MarkUpdateNotified();
+            g_update_balloon_active = true;
+            WatchmanStartupDiagnostics::Record("updates", "notification-accepted");
+        } else g_update_notification_retry = now + 60000;
+    }
+    // No foreground/focus request here. A quiet launch can notify, but cannot
+    // pop up the dashboard or mark its unseen update prompt dismissed.
+    g_renderer->OfferUpdatePrompt(interactive);
+    if (g_update_schedule.Due(now)) RequestUpdateCheck(false);
+#else
+    (void)hwnd;
+#endif
+}
+
+
+std::wstring StartupRegistrationDescription() {
+    if (g_startup_registration_pending) return L"Startup: applying the saved preference in the background.";
+    const auto& result = g_startup_registration_result;
+    if (!g_startup_registration_sequence && !g_startup_registration_error) return L"Startup: not checked yet.";
+    switch (result.status) {
+    case WatchmanStartup::Status::TaskReady:
+        return L"Startup: current-user Task Scheduler sign-in task, normal privileges, no added trigger delay. "
+               L"The task is listed as Watchman Sign-in followed by your user SID. Windows still controls dispatch; "
+               L"a registered task does not prove when the widget becomes visible.";
+    case WatchmanStartup::Status::Disabled:
+        return L"Startup: off. Watchman's sign-in task and previous Run entry are absent.";
+    case WatchmanStartup::Status::ExternallyDisabled:
+        return result.operation == WatchmanStartup::Operation::ReadLegacy
+            ? L"Startup: the previous Run item is disabled in Windows, or its approval record is unrecognized. "
+              L"It was not replaced by an enabled task. To enable startup deliberately, save Off then On in General."
+            : L"Startup: disabled in Task Scheduler. Watchman did not re-enable it. "
+              L"To enable startup deliberately, save Off then On in General.";
+    default: {
+        wchar_t error[32]{};
+        swprintf_s(error, L"0x%08lX", static_cast<unsigned long>(g_startup_registration_error));
+        std::wstring text = L"Startup: could not ";
+        text += WatchmanStartup::OperationDescription(result.operation);
+        text += L" (error " + std::wstring(error) + L"). The saved preference has not been fully applied. ";
+        text += result.requested_enabled
+            ? L"The previous Run command is kept until a task has been registered and verified."
+            : L"Windows may still launch Watchman until the remaining startup registration can be removed.";
+        if (result.rollback_error) text += L" Restoring the previous task also failed (error " +
+            std::to_wstring(result.rollback_error) + L"); check Task Scheduler and Monitoring status before sign-out.";
+        return text;
+    }
+    }
+}
+
+void RequestStartupRegistration(bool enabled, bool explicit_change) {
+    try {
+        g_startup_registration_sequence = g_startup_registration_worker.Submit(enabled, explicit_change);
+        g_startup_registration_pending = g_startup_registration_sequence != 0;
+        if (!g_startup_registration_pending) throw std::runtime_error("Startup worker has stopped");
+        g_startup_registration_error = ERROR_SUCCESS;
+    } catch (...) {
+        g_startup_registration_sequence = 0;
+        g_startup_registration_pending = false;
+        g_startup_registration_error = static_cast<DWORD>(E_FAIL);
+        g_startup_registration_result = {};
+        g_startup_registration_result.requested_enabled = enabled;
+        g_startup_registration_result.error = g_startup_registration_error;
+        WatchmanStartupDiagnostics::Record("startup", "registration-failed", g_startup_registration_error);
+    }
+}
+
+void PollStartupRegistration(HWND hwnd) {
+    WatchmanStartup::Result result;
+    if (!g_startup_registration_worker.TakeResult(result) || result.sequence != g_startup_registration_sequence) return;
+    g_startup_registration_result = result;
+    g_startup_registration_error = result.error;
+    g_startup_registration_pending = false;
+    if (result.changed) WatchmanStartupDiagnostics::Record("startup", "registration-changed");
+    WatchmanStartupDiagnostics::Record("startup", WatchmanStartup::EventName(result.status), result.error);
+    if (result.rollback_error) WatchmanStartupDiagnostics::Record("startup", "rollback-failed", result.rollback_error);
+    if (IsWindow(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
+    if (result.error && result.explicit_change && !g_shutting_down) {
+        // This is a response to a user's saved change, never a sign-in popup.
+        // Keep the requested preference for a later retry instead of claiming
+        // an atomic rollback after a partially successful disable operation.
+        MessageBoxW(hwnd, StartupRegistrationDescription().c_str(), L"Watchman startup", MB_OK | MB_ICONWARNING);
+    }
+}
+
+bool IsWidgetHost(HWND hwnd) {
+    DWORD process = 0;
+    const DWORD thread = GetWindowThreadProcessId(hwnd, &process);
+    wchar_t name[64]{};
+    return IsWindow(hwnd) && process == GetCurrentProcessId() && thread == GetCurrentThreadId() &&
+        GetClassNameW(hwnd, name, static_cast<int>(std::size(name))) &&
+        wcscmp(name, L"WatchmanWidgetClass") == 0;
+}
+
+void SetWidgetResult(Result result) {
+    if (g_widget_result != result) {
+        g_widget_result = result;
+        WatchmanStartupDiagnostics::Record("widget", WatchmanWidgetRuntime::EventName(result.status), result.error);
+        if (IsWindow(g_main_hwnd)) InvalidateRect(g_main_hwnd, nullptr, FALSE);
+    }
+}
+
+std::wstring GetMonitoringStatus(bool detailed) {
+    std::wstring status;
+    if (g_engine) {
+        status = g_engine->GetStartupError();
+        if (status.empty() && !g_engine->IsReady()) status = L"Monitoring is starting...";
+        else if (status.empty() && g_display_dashboard_snapshot.sample_sequence == 0)
+            status = L"Services are ready; waiting for the first measurement.";
+    }
+    if (status.empty() && !g_display_dashboard_snapshot.history_read_error.empty())
+        status = L"History could not be read; last good data retained. See Monitoring status.";
+    if (status.empty() && g_startup_registration_error != ERROR_SUCCESS)
+        status = L"Windows startup registration needs attention. See Monitoring status.";
+    if (status.empty() && !g_startup_registration_pending &&
+        g_startup_registration_result.status == WatchmanStartup::Status::ExternallyDisabled)
+        status = L"Windows startup is disabled externally. See Monitoring status.";
+    const auto widget = g_widget_result;
+    if (detailed) {
+        if (status.empty()) status = L"Monitoring is running.";
+        status += L"\n\n";
+        status += WatchmanWidgetRuntime::Description(widget.status);
+        if (widget.error) status += L" Windows error: " + std::to_wstring(widget.error) + L".";
+        if (g_renderer && widget.status == Status::Ready) {
+            const auto paint = g_renderer->GetWidgetPaintResult();
+            status += paint.backend == WatchmanWidgetRuntime::Backend::Gdi
+                ? L"\nGraphics: compatible GDI fallback (frame accepted)."
+                : L"\nGraphics: DirectComposition (frame accepted).";
+        }
+        if (!g_display_dashboard_snapshot.history_profile_description.empty())
+            status += L"\n\n" + g_display_dashboard_snapshot.history_profile_description;
+        if (!g_display_dashboard_snapshot.history_read_error.empty())
+            status += L"\n" + g_display_dashboard_snapshot.history_read_error;
+        if (!g_display_dashboard_snapshot.history_save_error.empty())
+            status += L"\nUnsaved history: " + g_display_dashboard_snapshot.history_save_error;
+        status += L"\n\n" + StartupRegistrationDescription();
+        status += L"\n\nWatchman keeps trying when Windows is not ready or safe space is unavailable. "
+                  L"No Windows controls are covered.\n\nLocal diagnostics (no traffic/history contents):\n"
+                  L"%LOCALAPPDATA%\\Watchman\\startup-recovery.log";
+    } else if (status.empty() && widget.status != Status::Ready && widget.status != Status::Disabled &&
+               widget.status != Status::HiddenFullscreen) {
+        status = WatchmanWidgetRuntime::Description(widget.status);
+    }
+    return status;
+}
+
+unsigned g_main_animation_timer_interval = 0;
+bool g_pointer_redraw_pending = false;
 // Initial quiet sign-in / replacement display is not an interactive welcome.
 // Later tray/widget/second-launch restores may offer an unseen tour.
 bool g_welcome_presentation_ready = false;
@@ -75,12 +328,21 @@ bool g_welcome_presentation_ready = false;
 void UpdateMainUiActivity(HWND hwnd, bool visible, bool minimized, bool foreground) {
     const auto activity = WatchmanRuntime::GetMainUiActivity(visible, minimized, foreground);
     if (!activity.keep_graphics && g_renderer) g_renderer->ReleaseMainWindowResources();
-    if (activity.animate && !g_main_animation_timer_running) {
-        g_main_animation_timer_running = SetTimer(hwnd, 1, 16, nullptr) != 0;
-    } else if (!activity.animate && g_main_animation_timer_running) {
-        KillTimer(hwnd, 1);
-        g_main_animation_timer_running = false;
+    const bool live = g_renderer && g_renderer->GetActiveTab() == ActiveTab::Network &&
+        g_engine && g_engine->IsSpeedTestRunning();
+    const unsigned interval = WatchmanUi::FrameTimerInterval(visible, minimized, foreground,
+        g_renderer && g_renderer->NeedsAnimationFrame(), g_pointer_redraw_pending, live);
+    if (interval != g_main_animation_timer_interval) {
+        if (g_main_animation_timer_interval) KillTimer(hwnd, 1);
+        g_main_animation_timer_interval = interval && SetTimer(hwnd, 1, interval, nullptr) ? interval : 0;
     }
+}
+
+void RequestPointerRepaint(HWND hwnd) {
+    if (IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd) {
+        g_pointer_redraw_pending = true;
+        UpdateMainUiActivity(hwnd, true, false, true);
+    } else InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 void RefreshDisplayDashboardSnapshot() {
@@ -90,9 +352,14 @@ void RefreshDisplayDashboardSnapshot() {
 
     g_display_dashboard_snapshot = g_engine->GetDashboardSnapshot();
     g_has_display_dashboard_snapshot = true;
+    static bool recorded_first_sample = false;
+    if (!recorded_first_sample && g_display_dashboard_snapshot.sample_sequence != 0) {
+        recorded_first_sample = true;
+        WatchmanStartupDiagnostics::Record("backend", "first-measurement");
+    }
 }
 
-DashboardSnapshot GetDisplayDashboardSnapshot() {
+const DashboardSnapshot& GetDisplayDashboardSnapshot() {
     if (!g_has_display_dashboard_snapshot) {
         RefreshDisplayDashboardSnapshot();
     }
@@ -104,7 +371,7 @@ void EvaluateWarningNotifications(HWND hwnd) {
     static uint64_t last_sample = 0;
     static uint64_t retry_after_ms = 0;
     const auto& sample = g_display_dashboard_snapshot;
-    if (!g_renderer || sample.sample_sequence == 0 || sample.sample_sequence == last_sample) return;
+    if (!g_renderer || !g_tray_retry.Ready() || sample.sample_sequence == 0 || sample.sample_sequence == last_sample) return;
     last_sample = sample.sample_sequence;
     const auto preferences = g_renderer->GetWarningPreferences();
     const uint64_t now_ms = GetTickCount64();
@@ -140,6 +407,7 @@ void EvaluateWarningNotifications(HWND hwnd) {
     wcscpy_s(notification.szInfoTitle, L"Watchman warning");
     wcsncpy_s(notification.szInfo, text.c_str(), _TRUNCATE);
     if (Shell_NotifyIconW(NIM_MODIFY, &notification)) {
+        g_update_balloon_active = false;
         policy = std::move(candidate);
         retry_after_ms = 0;
     } else {
@@ -154,7 +422,9 @@ int GetFloatingMonitorPreferredWidth() {
 
 int GetFloatingMonitorPreferredHeight() {
     return FloatingMonitorLayout::Height(
-        g_renderer ? g_renderer->GetFloatingMonitorFontSize() : FloatingMonitorLayout::default_font_size);
+        g_renderer ? g_renderer->GetFloatingMonitorFontSize() : FloatingMonitorLayout::default_font_size,
+        g_renderer ? g_renderer->IsFloatingMonitorCpuShown() : FloatingMonitorLayout::default_show_cpu,
+        g_renderer ? g_renderer->IsFloatingMonitorMemoryShown() : FloatingMonitorLayout::default_show_memory);
 }
 
 POINT BoundFloatingMonitorPosition(POINT point, int width, int height) {
@@ -834,6 +1104,18 @@ void ShowWidgetContextMenu(HWND owner_hwnd) {
 }
 
 bool AddTrayIcon(HWND hwnd) {
+#ifdef WATCHMAN_STARTUP_RECOVERY_TESTING
+    // Unit tests exercise owned fake shell windows, not the real tray.
+    (void)hwnd;
+    const HANDLE entered = g_tray_entered_for_test.load(), release = g_tray_release_for_test.load();
+    if (entered && release) {
+        SetEvent(entered);
+        WaitForSingleObject(release, 10000);
+    }
+    return g_tray_ready_for_test.load();
+#endif
+    DWORD owner = 0;
+    if (!IsWindow(hwnd) || !GetWindowThreadProcessId(hwnd, &owner) || owner != GetCurrentProcessId()) return false;
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd;
@@ -848,6 +1130,10 @@ bool AddTrayIcon(HWND hwnd) {
 }
 
 void RemoveTrayIcon(HWND hwnd) {
+#ifdef WATCHMAN_STARTUP_RECOVERY_TESTING
+    (void)hwnd;
+    return;
+#endif
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd;
@@ -866,8 +1152,11 @@ void ShowFloatingMonitorContextMenu(HWND owner_hwnd, POINT position) {
         reset_position,
         settings,
         hide_monitor,
+        show_cpu,
+        show_memory,
         opacity_first = 3100,
-        font_size_first = 3300
+        font_size_first = 3300,
+        text_weight_first = 3400
     };
 
     HMENU menu = CreatePopupMenu();
@@ -876,6 +1165,9 @@ void ShowFloatingMonitorContextMenu(HWND owner_hwnd, POINT position) {
     auto append_toggle = [menu](UINT command, const wchar_t* label, bool checked) {
         AppendMenuW(menu, MF_STRING | (checked ? MF_CHECKED : 0), command, label);
     };
+    append_toggle(show_cpu, L"Show CPU usage", g_renderer->IsFloatingMonitorCpuShown());
+    append_toggle(show_memory, L"Show memory usage", g_renderer->IsFloatingMonitorMemoryShown());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     append_toggle(lock_position, L"Lock position", g_renderer->IsFloatingMonitorPositionLocked());
     append_toggle(always_on_top, L"Always on top", g_renderer->IsFloatingMonitorAlwaysOnTop());
     append_toggle(transparent_background, L"Transparent background", g_renderer->IsFloatingMonitorBackgroundTransparent());
@@ -906,7 +1198,21 @@ void ShowFloatingMonitorContextMenu(HWND owner_hwnd, POINT position) {
             AppendMenuW(font_size_menu, MF_STRING | (size == g_renderer->GetFloatingMonitorFontSize() ? MF_CHECKED : 0),
                         font_size_first + size, label.c_str());
         }
-        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(font_size_menu), L"Text size (Segoe UI Bold)");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(font_size_menu), L"Text size");
+    }
+
+    HMENU weight_menu = CreatePopupMenu();
+    if (weight_menu) {
+        UINT selected_index = 0;
+        for (size_t index = 0; index < FloatingMonitorText::weights.size(); ++index) {
+            const auto weight = FloatingMonitorText::weights[index];
+            const std::wstring label = std::wstring(FloatingMonitorText::Label(weight)) +
+                (weight == FloatingMonitorText::default_weight ? L" (default)" : L"");
+            AppendMenuW(weight_menu, MF_STRING, text_weight_first + static_cast<UINT>(index), label.c_str());
+            if (weight == g_renderer->GetFloatingMonitorTextWeight()) selected_index = static_cast<UINT>(index);
+        }
+        CheckMenuRadioItem(weight_menu, 0, static_cast<UINT>(FloatingMonitorText::weights.size() - 1), selected_index, MF_BYPOSITION);
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(weight_menu), L"Text weight");
     }
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -940,6 +1246,12 @@ void ShowFloatingMonitorContextMenu(HWND owner_hwnd, POINT position) {
     }
 
     switch (selected) {
+    case show_cpu:
+        g_renderer->SetFloatingMonitorCpuShown(!g_renderer->IsFloatingMonitorCpuShown());
+        break;
+    case show_memory:
+        g_renderer->SetFloatingMonitorMemoryShown(!g_renderer->IsFloatingMonitorMemoryShown());
+        break;
     case lock_position:
         g_renderer->SetFloatingMonitorPositionLocked(!g_renderer->IsFloatingMonitorPositionLocked());
         break;
@@ -956,6 +1268,10 @@ void ShowFloatingMonitorContextMenu(HWND owner_hwnd, POINT position) {
         g_renderer->SetFloatingMonitorEnabled(false);
         break;
     default:
+        if (selected >= text_weight_first && selected < text_weight_first + FloatingMonitorText::weights.size()) {
+            g_renderer->SetFloatingMonitorTextWeight(FloatingMonitorText::weights[selected - text_weight_first]);
+            break;
+        }
         if (selected >= font_size_first + FloatingMonitorLayout::minimum_font_size &&
             selected <= font_size_first + FloatingMonitorLayout::maximum_font_size) {
             g_renderer->SetFloatingMonitorFontSize(static_cast<int>(selected - font_size_first));
@@ -1037,6 +1353,7 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING | (widget_enabled ? MF_CHECKED : 0), 2002, widget_enabled ? L"Hide Taskbar Widget" : L"Show Taskbar Widget");
     AppendMenuW(menu, MF_STRING | (floating_enabled ? MF_CHECKED : 0), 2004, floating_enabled ? L"Hide Floating Monitor" : L"Show Floating Monitor");
     AppendMenuW(menu, MF_STRING, 2005, L"Floating monitor options...");
+    AppendMenuW(menu, MF_STRING, 2008, L"Monitoring status...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 2007, L"Run as administrator");
     AppendMenuW(menu, MF_STRING, 2006, L"Restart Watchman");
@@ -1076,6 +1393,9 @@ void ShowTrayMenu(HWND hwnd) {
     case 2005:
         ShowFloatingMonitorContextMenu(hwnd, cursor);
         break;
+    case 2008:
+        MessageBoxW(hwnd, GetMonitoringStatus(true).c_str(), L"Watchman monitoring status", MB_OK | MB_ICONINFORMATION);
+        break;
     case 2007:
         RestartWatchman(hwnd, true);
         break;
@@ -1091,31 +1411,6 @@ void ShowTrayMenu(HWND hwnd) {
 }
 
 
-
-LONG SetStartupRegistry(bool enable) {
-    std::wstring command;
-    if (enable) {
-        std::vector<wchar_t> path(32768);
-        const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-        if (length == 0) return GetLastError();
-        if (length >= path.size()) return ERROR_INSUFFICIENT_BUFFER;
-        command = WatchmanRuntime::StartupCommand(std::wstring(path.data(), length));
-        if (command.empty()) return ERROR_INVALID_NAME;
-    }
-    HKEY key = nullptr;
-    LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-        0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
-    if (result != ERROR_SUCCESS) return result;
-    if (enable) {
-        result = RegSetValueExW(key, L"Watchman", 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()),
-            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-    } else {
-        result = RegDeleteValueW(key, L"Watchman");
-        if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
-    }
-    RegCloseKey(key);
-    return result;
-}
 
 void ShowMainPage(ActiveTab tab) {
     if (!g_renderer || !g_main_hwnd) return;
@@ -1170,9 +1465,48 @@ private:
 };
 } // namespace
 
+void PresentMainWindowForLaunch(const WatchmanRuntime::LaunchOptions& launch, int show_command) {
+    g_tray_retry.Invalidate();
+    TickTrayRegistration(g_main_hwnd, GetTickCount64());
+    g_renderer->OfferWelcomeTour(WatchmanWelcome::IsInteractiveLaunch(launch.startup, launch.replace_pid));
+    // A missing/slow Explorer tray is not permission to open the dashboard.
+    // The widget already has its own host and safe shell recovery schedule.
+    if (!launch.startup) {
+        ShowWindow(g_main_hwnd, show_command);
+        UpdateWindow(g_main_hwnd);
+    }
+    WatchmanStartupDiagnostics::Record("window", launch.startup ? "quiet-start-hidden" : "interactive-launch-show");
+    g_welcome_presentation_ready = true;
+}
+
+void ShutdownWatchman() {
+    g_shutting_down = true;
+    tm_set_widget_command_target(nullptr, 0, 0);
+    tm_restore_taskbar_layout();
+    if (IsWindow(g_main_hwnd)) DestroyWindow(g_main_hwnd);
+    if (IsWidgetHost(g_widget_hwnd)) DestroyWindow(g_widget_hwnd);
+    if (IsWindow(g_floating_monitor_hwnd)) DestroyWindow(g_floating_monitor_hwnd);
+    delete g_engine; // Stop/join/flush is idempotent, including partial startup.
+    g_engine = nullptr;
+    delete g_renderer;
+    g_renderer = nullptr;
+    // A shell call can outlive its HWND. Join before the final delete so an
+    // in-flight add cannot recreate an orphan tray icon after removal. History
+    // is already flushed; no shell wait gates startup or widget presentation.
+    if (g_tray_worker) g_tray_worker->Stop();
+    if (g_main_hwnd) RemoveTrayIcon(g_main_hwnd);
+    // Monitoring/history are flushed before joining optional network work.
+    g_update_worker.Stop();
+    // Flush monitoring before joining an unrelated native registration RPC.
+    // Still drain the newest saved preference; never detach a COM worker.
+    g_startup_registration_worker.Stop();
+    PollStartupRegistration(nullptr);
+}
+
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
+    const uint64_t process_started_at_ms = GetTickCount64();
     int argument_count = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argument_count);
     std::vector<std::wstring> arguments;
@@ -1180,7 +1514,15 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         for (int index = 0; index < argument_count; ++index) arguments.emplace_back(argv[index]);
         LocalFree(argv);
     }
+    const bool uninstall_cleanup = std::find(arguments.begin(), arguments.end(), L"--uninstall-cleanup") != arguments.end();
+    if (uninstall_cleanup) {
+        // NSIS calls this before deleting the binary. Use the same ownership-
+        // checked backend as the UI toggle, without opening a window/profile.
+        const auto cleanup = WatchmanStartup::ApplyForCurrentUser({0, false, false, {}});
+        return cleanup.error ? 2 : 0;
+    }
     const auto launch = WatchmanRuntime::ParseArguments(arguments);
+    const bool migrate_only = std::find(arguments.begin(), arguments.end(), L"--migrate-only") != arguments.end();
     if (launch.replace_pid && launch.replace_pid != GetCurrentProcessId()) {
         HANDLE previous = OpenProcess(SYNCHRONIZE, FALSE, launch.replace_pid);
         if (previous) {
@@ -1213,7 +1555,9 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         return 1;
     }
 
-    const bool migrate_only = std::find(arguments.begin(), arguments.end(), L"--migrate-only") != arguments.end();
+    // Preserve the official native migration before any engine/storage work.
+    // The read-only history selector then uses this completed native profile;
+    // it must never replace the copy, backup, or migration-marker contract.
     try { PrepareNativeProfile(); }
     catch (const std::exception& error) {
         if (!migrate_only) MessageBoxA(nullptr, error.what(), "Watchman could not prepare this profile. Original files retained.", MB_ICONERROR);
@@ -1221,15 +1565,29 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     }
     if (migrate_only) return 0;
 
+    // Record only after owning the guard: duplicate launches must not open a
+    // competing stream and overwrite the running instance's transition log.
+    // Keep the original entry timestamp, including any replacement wait.
+    WatchmanStartupDiagnostics::RecordAt("process", launch.startup ? "quiet-launch" : "interactive-launch",
+                                         process_started_at_ms);
+
     // Initialize WinSock (needed for ping sockets and general networking)
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
     const HRESULT com_initialize_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     const bool com_initialized = SUCCEEDED(com_initialize_result);
+    WatchmanFonts::GdiRegistration bundled_gdi_fonts;
+    struct RuntimeCleanup {
+        bool com;
+        ~RuntimeCleanup() {
+            ShutdownWatchman();
+            WSACleanup();
+            if (com) CoUninitialize();
+        }
+    } runtime_cleanup{com_initialized};
 
     // GDI's layered taskbar fallback also uses the embedded fonts in memory.
     // DirectWrite owns its own explicit resource collection in each renderer.
-    WatchmanFonts::GdiRegistration bundled_gdi_fonts;
     if (FAILED(bundled_gdi_fonts.Initialize(hInstance))) {
         OutputDebugStringW(L"Watchman: could not register embedded fonts for the GDI fallback.\n");
     }
@@ -1238,14 +1596,9 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     // widget can appear without waiting for storage, app tracking, or WMI.
     g_renderer = new AppRenderer();
     g_renderer->LoadSettings();
-    const LONG startup_result = SetStartupRegistry(g_renderer->IsAutostartEnabled());
-    if (startup_result != ERROR_SUCCESS) {
-        const std::wstring message = L"Windows startup registration could not be updated (error "
-            + std::to_wstring(startup_result) + L"). Check Settings > General and Windows Startup apps.";
-        MessageBoxW(nullptr, message.c_str(), L"Watchman startup", MB_OK | MB_ICONWARNING);
-    }
-
-
+    // Startup reconciliation starts only after the widget/tray/loop are ready.
+    // Task Scheduler RPC and all registration I/O belong to a separate owner,
+    // not this pre-widget window-thread path. Existing saved Off is respected.
 
     // 1. Register Main Window Class
     WNDCLASSEXW wcex = {};
@@ -1281,28 +1634,9 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     wcex_floating.lpszClassName = L"WatchmanFloatingMonitorClass";
     RegisterClassExW(&wcex_floating);
 
-    // Create the tiny widget host before the heavier dashboard and services.
-    TaskbarMetrics widget_metrics{};
-    tm_get_taskbar_metrics(&widget_metrics);
-    const auto widget_size = GetWidgetPreferredSize(widget_metrics);
-    g_widget_hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        L"WatchmanWidgetClass",
-        L"Watchman Widget",
-        WS_POPUP,
-        0, 0,
-        widget_size.width, widget_size.height,
-        nullptr, nullptr, hInstance, nullptr
-    );
-    if (g_widget_hwnd) {
-        ApplyWidgetTaskbarMetrics(g_widget_hwnd, widget_metrics);
-        // Match TrafficMonitor's DirectComposition path: this starts as a
-        // normal transparent composition window, not a layered GDI popup.
-        tm_set_widget_layered_style(0);
-        tm_set_widget_manual_layered_paint(0);
-        tm_apply_widget_styles(g_widget_hwnd);
-        UpdateWidgetState(true);
-    }
+    // This creates/attaches a lightweight host even while the shell is still
+    // starting. Backend constructors never run on this window thread.
+    UpdateWidgetState(true);
 
     g_floating_monitor_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
@@ -1313,8 +1647,8 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         nullptr, nullptr, hInstance, nullptr
     );
 
-    // The engine itself runs asynchronously, but constructing its services can
-    // touch storage and diagnostics. Keep that work after the widget is shown.
+    // Construction and Start only publish lightweight state/create a worker.
+    // Storage, ETW, PDH and adapter setup run on that owned worker.
     g_engine = new WatchmanEngine();
     g_engine->SetNetworkAdapterId(g_renderer->GetNetworkAdapterId());
     g_engine->Start();
@@ -1361,22 +1695,13 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 
     ApplyMainWindowTheme(g_main_hwnd);
 
-    // Initialize Direct2D Renderer with Main Window
-    if (FAILED(g_renderer->Initialize(g_main_hwnd))) {
-        return FALSE;
-    }
+    // Main D2D/DWrite/fonts/logo are lazy: the first visible dashboard paint
+    // initializes them. A quiet sign-in needs only the independent widgets.
 
     // Only this payload-free restore message crosses the elevation boundary.
     ChangeWindowMessageFilterEx(g_main_hwnd, WM_WATCHMAN_ACTIVATE, MSGFLT_ALLOW, nullptr);
     if (WM_TASKBAR_CREATED) ChangeWindowMessageFilterEx(g_main_hwnd, WM_TASKBAR_CREATED, MSGFLT_ALLOW, nullptr);
-    const bool tray_ready = AddTrayIcon(g_main_hwnd);
-    g_renderer->OfferWelcomeTour(WatchmanWelcome::IsInteractiveLaunch(launch.startup, launch.replace_pid));
-    if (!launch.startup || !tray_ready) {
-        ShowWindow(g_main_hwnd, launch.startup ? SW_SHOWNORMAL : nCmdShow);
-        UpdateWindow(g_main_hwnd);
-    }
-
-    g_welcome_presentation_ready = true;
+    PresentMainWindowForLaunch(launch, nCmdShow);
 
     // Run initial widget state based on loaded settings
     UpdateWidgetState(true);
@@ -1390,102 +1715,144 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     // Match TrafficMonitor: quick shell-layout checks with no widget redraw.
     SetTimer(g_main_hwnd, 3, 100, nullptr);
 
+    WatchmanStartupDiagnostics::Record("ui", "message-loop-ready");
+    g_update_schedule = WatchmanUpdates::Schedule(GetTickCount64());
+    RequestStartupRegistration(g_renderer->IsAutostartEnabled(), false);
     // Main Message Loop
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
-    }
-
-    // Stop diagnostics and clean up
-    tm_restore_taskbar_layout();
-    g_engine->Stop();
-    delete g_engine;
-    
-    delete g_renderer;
-
-    WSACleanup();
-    if (com_initialized) {
-        CoUninitialize();
     }
 
     return static_cast<int>(msg.wParam);
 }
 
 void UpdateWidgetState(bool force_reembed) {
-    if (!g_widget_hwnd || !g_renderer) return;
+    if (!g_renderer || g_shutting_down) return;
+    struct RetryCompletion {
+        ~RetryCompletion() { g_widget_retry.Complete(g_widget_result, GetTickCount64()); }
+    } retry_completion;
+    const bool enabled = g_renderer->IsWidgetEnabled();
 
-    static bool was_enabled = false;
-    static bool cleanup_pending = false;
-    const bool is_enabled = g_renderer->IsWidgetEnabled();
-    TaskbarMetrics metrics{};
-    const bool has_metrics = tm_get_taskbar_metrics(&metrics) != 0;
-    const bool metrics_changed = has_metrics && ApplyWidgetTaskbarMetrics(g_widget_hwnd, metrics);
-
-    auto hide_widget = []() {
-        // Hiding before restoring the top-level style prevents a visible
-        // reparent at (0, 0) when the user changes the tray preference.
-        if (IsWindowVisible(g_widget_hwnd)) {
+    const auto hide_and_restore = [] {
+        if (IsWidgetHost(g_widget_hwnd) && IsWindowVisible(g_widget_hwnd)) {
             ShowWindow(g_widget_hwnd, SW_HIDE);
+            g_renderer->InvalidateWidgetFrame();
         }
-        cleanup_pending = tm_restore_taskbar_layout() == 0;
+        g_widget_cleanup_pending = tm_restore_taskbar_layout() == 0;
+    };
+    const auto hide_with_result = [&](Result result) {
+        hide_and_restore();
+        SetWidgetResult(g_widget_cleanup_pending ? tm_get_widget_result() : result);
     };
 
-    if (!is_enabled) {
-        if (was_enabled || cleanup_pending || IsWindowVisible(g_widget_hwnd)) {
-            hide_widget();
-        }
-        was_enabled = false;
+    // Disable and deliberate shutdown never create replacement windows.
+    if (!enabled) {
+        hide_with_result({Status::Disabled, 0});
         return;
     }
 
-    // Failed cleanup must finish before another embedding attempt, even if
-    // the widget was hidden or the user re-enabled it in the meantime.
-    if (cleanup_pending) {
-        hide_widget();
-        if (cleanup_pending) {
-            was_enabled = true;
+    if (!IsWidgetHost(g_widget_hwnd)) {
+        g_widget_hwnd = nullptr;
+        g_widget_binding_reset_pending = true;
+    }
+    if (g_widget_cleanup_pending || g_widget_binding_reset_pending) {
+        if (IsWidgetHost(g_widget_hwnd)) ShowWindow(g_widget_hwnd, SW_HIDE);
+        if (!tm_reset_taskbar_binding()) {
+            g_widget_cleanup_pending = true;
+            SetWidgetResult(tm_get_widget_result());
             return;
         }
+        g_widget_cleanup_pending = false;
+        g_widget_binding_reset_pending = false;
+        // New shell/new host needs a new graphics target, even when the
+        // dashboard sample is byte-for-byte identical to the previous frame.
+        g_renderer->ResetWidgetHost();
+        force_reembed = true;
     }
 
+    TaskbarMetrics metrics{};
+    const bool has_metrics = tm_get_taskbar_metrics(&metrics) != 0;
+    const Result metrics_result = tm_get_widget_result();
+    const bool host_ready = WatchmanWidgetRuntime::EnsureHost(g_widget_hwnd, enabled, g_shutting_down,
+        IsWidgetHost, [&] {
+            const auto size = GetWidgetPreferredSize(metrics);
+            const HWND host = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                L"WatchmanWidgetClass", L"Watchman Widget", WS_POPUP,
+                0, 0, size.width, size.height, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (host) WatchmanStartupDiagnostics::Record("widget", "host-created");
+            return host;
+        });
+    if (!host_ready) {
+        const DWORD error = GetLastError();
+        SetWidgetResult({Status::AttachFailed, error ? error : ERROR_INVALID_WINDOW_HANDLE});
+        return;
+    }
+    // Keep a local non-null HWND across native calls. A reentrant shell
+    // destruction may clear the global; never turn InvalidateRect(NULL) into
+    // a desktop-wide repaint or report the old surface as a ready new host.
+    const HWND host = g_widget_hwnd;
+    const bool metrics_changed = has_metrics && ApplyWidgetTaskbarMetrics(host, metrics);
     if (!has_metrics) {
-        hide_widget();
-        was_enabled = true;
+        hide_with_result(metrics_result);
         return;
     }
 
     int visible = 1;
-    const int visibility_result = tm_should_widget_be_visible(g_widget_hwnd, g_main_hwnd, &visible);
-    if (visibility_result != 0 && visible == 0) {
-        hide_widget();
-        was_enabled = true;
+    if (tm_should_widget_be_visible(host, g_main_hwnd, &visible) && !visible) {
+        hide_with_result({Status::HiddenFullscreen, 0});
         return;
     }
 
-    // The widget remains hidden until the native helper has made it a taskbar
-    // child. This is the piece that stops the show/hide flash.
+    const HWND old_parent = GetParent(host);
+    RECT old_rect{};
+    GetWindowRect(host, &old_rect);
     TaskbarPlacement placement{};
     const auto size = GetWidgetPreferredSize(metrics);
-    const bool embedded = tm_embed_widget(g_widget_hwnd, size.width, size.height, &placement) != 0;
-    // No top-level fallback: an uncertified gap must not cover native controls
-    // or turn the attached widget into a floating overlay. The timer retries.
-    if (!embedded) {
-        hide_widget();
-        was_enabled = true;
+    if (!tm_embed_widget(host, size.width, size.height, &placement)) {
+        const auto result = tm_get_widget_result(); // capture before cleanup
+        hide_with_result(result);
+        return;
+    }
+    if (!IsWidgetHost(host) || g_widget_hwnd != host) {
+        SetWidgetResult({Status::AttachFailed, ERROR_INVALID_WINDOW_HANDLE});
+        return;
+    }
+    const bool reparented = old_parent != GetParent(host);
+    const bool moved = old_rect.left != placement.x || old_rect.top != placement.y ||
+        old_rect.right - old_rect.left != placement.width || old_rect.bottom - old_rect.top != placement.height;
+    if (reparented) g_renderer->ResetWidgetHost();
+    if (!tm_apply_widget_styles(host)) {
+        hide_with_result(tm_get_widget_result());
         return;
     }
 
-    if (!IsWindowVisible(g_widget_hwnd)) {
-        InvalidateRect(g_widget_hwnd, nullptr, FALSE);
-        ShowWindow(g_widget_hwnd, SW_SHOWNOACTIVATE);
-        UpdateWindow(g_widget_hwnd);
-    } else if (force_reembed || metrics_changed) {
-        InvalidateRect(g_widget_hwnd, nullptr, FALSE);
+    const bool showing = !IsWindowVisible(host);
+    if (showing || force_reembed || metrics_changed || reparented || moved) {
+        g_renderer->InvalidateWidgetFrame();
+        InvalidateRect(host, nullptr, FALSE);
+        if (showing) ShowWindow(host, SW_SHOWNOACTIVATE);
+        // Obtain an actual checked submission, not just a pending WM_PAINT.
+        UpdateWindow(host);
     }
-
-    was_enabled = true;
+    if (!IsWidgetHost(host) || g_widget_hwnd != host) {
+        SetWidgetResult({Status::AttachFailed, ERROR_INVALID_WINDOW_HANDLE});
+        return;
+    }
+    const auto paint = g_renderer->GetWidgetPaintResult();
+    SetWidgetResult({paint.success ? Status::Ready : paint.backend == WatchmanWidgetRuntime::Backend::None
+        ? Status::WaitingForFrame : Status::RenderFailed, paint.error});
 }
+
+#ifdef WATCHMAN_STARTUP_RECOVERY_TESTING
+WatchmanWidgetRuntime::Result WatchmanWidgetStatusForTest() { return g_widget_result; }
+bool WatchmanTrayRegisteredForTest() { return g_tray_retry.Ready(); }
+bool WatchmanTrayPendingForTest() { return g_tray_retry.Pending(); }
+uint64_t WatchmanTrayRetryAtForTest() { return g_tray_retry.Next(); }
+void WatchmanTickTrayForTest(uint64_t now) { TickTrayRegistration(g_main_hwnd, now); }
+void WatchmanJoinTrayForTest() { if (g_tray_worker) g_tray_worker->Stop(); }
+#endif
 
 void UpdateFloatingMonitorState(bool reset_position) {
     if (!g_floating_monitor_hwnd || !g_renderer) {
@@ -1544,7 +1911,13 @@ void UpdateFloatingMonitorState(bool reset_position) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     static bool previous_press_was_welcome = false;
     if (WM_TASKBAR_CREATED && message == WM_TASKBAR_CREATED) {
-        if (!AddTrayIcon(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+        if (g_shutting_down) return 0;
+        // Explorer can broadcast before its tray is ready. Recover registration
+        // off-thread without opening, restoring, or focusing the dashboard.
+        g_tray_retry.Invalidate();
+        TickTrayRegistration(hwnd, GetTickCount64());
+        WatchmanStartupDiagnostics::Record("shell", "taskbar-created");
+        g_widget_binding_reset_pending = true;
         UpdateWidgetState(true);
         return 0;
     }
@@ -1565,6 +1938,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_KEYDOWN:
+        if (g_renderer && g_renderer->MainGraphicsUnavailable()) {
+            if (wParam == VK_ESCAPE) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return 0; // No keyboard actions on an invisible modal/page.
+        }
+        if (g_renderer && g_renderer->IsUpdatePromptOpen()) {
+            if ((static_cast<ULONG_PTR>(lParam) & (1ULL << 30)) == 0)
+                g_renderer->HandleUpdatePromptKeyDown(hwnd, wParam, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (g_renderer && g_renderer->IsWelcomeTourOpen()) {
             // Holding Enter/right arrow must not skip through several pages.
             if ((static_cast<ULONG_PTR>(lParam) & (1ULL << 30)) == 0) {
@@ -1585,7 +1968,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         break;
 
     case WM_CHAR:
-        if (g_renderer && g_renderer->IsWelcomeTourOpen()) return 0;
+        if (g_renderer && (g_renderer->MainGraphicsUnavailable() ||
+                g_renderer->IsUpdatePromptOpen() || g_renderer->IsWelcomeTourOpen())) return 0;
         if (g_renderer && g_renderer->HandleSettingsNumericCharacter(static_cast<wchar_t>(wParam))) {
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -1594,17 +1978,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
     case WM_TIMER:
         if (wParam == 1) {
-            // Keep the active main surface responsive for native UI animations;
-            // the taskbar widget still updates independently at 1 Hz.
             if (IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd) {
+                g_pointer_redraw_pending = false;
                 InvalidateRect(hwnd, nullptr, FALSE);
-            }
+            } else UpdateMainUiActivity(hwnd, IsWindowVisible(hwnd) != FALSE,
+                IsIconic(hwnd) != FALSE, GetForegroundWindow() == hwnd);
         }
         else if (wParam == 2) {
             // Metrics refresh timer is now handled by WatchmanEngine in the background!
             // Publish exactly one sample for both the main dashboard and the
             // taskbar widget, then let their paint messages consume that copy.
             RefreshDisplayDashboardSnapshot();
+            if (g_awaiting_hidden_widget_frame && !IsWindowVisible(hwnd) &&
+                g_display_dashboard_snapshot.sample_sequence > g_dashboard_hidden_at_sample && g_renderer)
+                g_renderer->InvalidateWidgetFrame(); // One new accepted sample after the visibility transition.
+            TickUpdates(hwnd);
             EvaluateWarningNotifications(hwnd);
             if (g_floating_monitor_hwnd && IsWindowVisible(g_floating_monitor_hwnd)) {
                 InvalidateRect(g_floating_monitor_hwnd, nullptr, FALSE);
@@ -1633,12 +2021,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
-            if (g_widget_hwnd && g_renderer->IsWidgetEnabled()) {
+            if (IsWidgetHost(g_widget_hwnd) && g_renderer->IsWidgetEnabled()) {
                 InvalidateRect(g_widget_hwnd, nullptr, FALSE);
             }
         }
         else if (wParam == 3) {
-            UpdateWidgetState(false);
+            PollStartupRegistration(hwnd);
+            const uint64_t now = GetTickCount64();
+            TickTrayRegistration(hwnd, now);
+            if (g_display_recovery.Due(now)) {
+                if (g_display_recovery.Consume()) {
+                    g_widget_binding_reset_pending = true;
+                    if (g_renderer) g_renderer->ReleaseMainWindowResources();
+                    if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                g_widget_retry.Wake();
+                UpdateWidgetState(true);
+                UpdateFloatingMonitorState(false);
+            } else if (g_widget_retry.Due(now)) UpdateWidgetState(false);
 
             if (tm_take_widget_context_menu_request()) {
                 PostMessageW(hwnd, WM_WATCHMAN_WIDGET_MENU, 0, 0);
@@ -1651,18 +2051,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     case WM_SHOWWINDOW:
         // WM_SHOWWINDOW precedes the visibility change, so use the requested state.
         UpdateMainUiActivity(hwnd, wParam != FALSE, IsIconic(hwnd) != FALSE, GetForegroundWindow() == hwnd);
-        if (wParam && g_welcome_presentation_ready && g_renderer) g_renderer->OfferWelcomeTour(true);
+        if (wParam && g_welcome_presentation_ready && g_renderer) {
+            g_renderer->OfferWelcomeTour(true);
+            g_renderer->OfferUpdatePrompt(GetForegroundWindow() == hwnd && !IsIconic(hwnd));
+        }
         break;
     case WM_ACTIVATE:
         UpdateMainUiActivity(hwnd, IsWindowVisible(hwnd) != FALSE, HIWORD(wParam) != 0,
             LOWORD(wParam) != WA_INACTIVE);
         if (LOWORD(wParam) != WA_INACTIVE) {
-            if (g_welcome_presentation_ready && g_renderer) g_renderer->OfferWelcomeTour(true);
+            if (g_welcome_presentation_ready && g_renderer) {
+                g_renderer->OfferWelcomeTour(true);
+                g_renderer->OfferUpdatePrompt(HIWORD(wParam) == 0);
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         break;
     case WM_CANCELMODE:
         EndMenu();
+        break;
+    case WM_WATCHMAN_RECOVER_WIDGET:
+        g_widget_retry.Wake();
+        UpdateWidgetState(true);
+        UpdateFloatingMonitorState(false);
+        break;
+    case WM_WATCHMAN_DISPLAY_RECOVERY:
+        g_display_recovery.Request(GetTickCount64(), true);
         break;
     case WM_WATCHMAN_WIDGET_MENU:
         ShowWidgetContextMenu(hwnd);
@@ -1684,45 +2098,49 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             
             if (g_renderer && g_engine && IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
                 const ActiveTab tab = g_renderer->GetActiveTab();
-                DashboardSnapshot dash = GetDisplayDashboardSnapshot();
-                NetworkSnapshot net = g_engine->GetNetworkSnapshot();
-                AppActivitySnapshot app;
-                TrafficHistorySnapshot hist;
-                SpeedTestResult speed_res;
-                int speed_prog = 0;
-                double speed_live = 0.0;
-                std::wstring speed_stat;
-                bool speed_running = false;
+                const auto& dash = GetDisplayDashboardSnapshot();
+                static uint64_t network_sequence = UINT64_MAX, app_sequence = UINT64_MAX, history_sequence = UINT64_MAX;
+                static NetworkSnapshot net;
+                static AppActivitySnapshot app;
+                static TrafficHistorySnapshot hist;
+                if (network_sequence != dash.sample_sequence) {
+                    net = g_engine->GetNetworkSnapshot(); network_sequence = dash.sample_sequence;
+                }
+                SpeedTestSnapshot speed;
                 DiagnosticsSnapshot diagnostics;
-                if (tab == ActiveTab::Apps) app = g_engine->GetAppActivitySnapshot();
-                if (tab == ActiveTab::Dashboard || tab == ActiveTab::Data || tab == ActiveTab::Tools) {
-                    hist = g_engine->GetTrafficHistorySnapshot();
+                if (tab == ActiveTab::Apps && app_sequence != dash.sample_sequence) {
+                    app = g_engine->GetAppActivitySnapshot(); app_sequence = dash.sample_sequence;
+                }
+                if ((tab == ActiveTab::Dashboard || tab == ActiveTab::Data || tab == ActiveTab::Tools) &&
+                    history_sequence != dash.sample_sequence) {
+                    hist = g_engine->GetTrafficHistorySnapshot(); history_sequence = dash.sample_sequence;
                 }
                 if (tab == ActiveTab::Network) {
-                    speed_res = g_engine->GetSpeedTestResult();
-                    speed_prog = g_engine->GetSpeedTestProgress();
-                    speed_live = g_engine->GetSpeedTestLiveSpeed();
-                    speed_stat = g_engine->GetSpeedTestStatus();
-                    speed_running = g_engine->IsSpeedTestRunning();
+                    speed = g_engine->GetSpeedTestSnapshot();
+                    static SpeedTestPhase shown_speed_phase = SpeedTestPhase::Idle;
+                    if (shown_speed_phase != speed.phase) {
+                        shown_speed_phase = speed.phase;
+                        // No endpoints, IPs, measurements or traffic totals in the log.
+                        WatchmanStartupDiagnostics::Record("speed-ui", SpeedTestPhaseName(speed.phase));
+                    }
                 }
                 if (tab == ActiveTab::Tools) diagnostics = g_engine->GetDiagnosticsSnapshot();
 
+                g_renderer->SetRuntimeStatus(GetMonitoringStatus(false));
                 g_renderer->Render(
                     hwnd,
                     dash,
                     net,
                     app,
                     hist,
-                    speed_res,
-                    speed_prog,
-                    speed_live,
-                    speed_stat,
-                    speed_running,
+                    speed,
                     diagnostics
                 );
             }
             
             EndPaint(hwnd, &ps);
+            UpdateMainUiActivity(hwnd, IsWindowVisible(hwnd) != FALSE,
+                IsIconic(hwnd) != FALSE, GetForegroundWindow() == hwnd);
         }
         break;
 
@@ -1765,13 +2183,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             int x = static_cast<short>(LOWORD(lParam));
             int y = static_cast<short>(HIWORD(lParam));
             g_renderer->OnMouseMove(x, y);
+            RequestPointerRepaint(hwnd);
         }
         break;
 
     case WM_MOUSELEAVE:
         if (g_renderer) {
             g_renderer->OnMouseMove(-10000, -10000);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            RequestPointerRepaint(hwnd);
         }
         break;
 
@@ -1790,7 +2209,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // of a tour click reach a control exposed by dismissing the tour.
             if (message == WM_LBUTTONDBLCLK && (previous_press_was_welcome ||
                     !g_renderer->IsRepeatablePrimaryControl(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)))) return 0;
-            previous_press_was_welcome = g_renderer->IsWelcomeTourOpen();
+            previous_press_was_welcome = g_renderer->IsWelcomeTourOpen() || g_renderer->IsUpdatePromptOpen();
             int x = static_cast<short>(LOWORD(lParam));
             int y = static_cast<short>(HIWORD(lParam));
             bool widget_was_enabled = g_renderer->IsWidgetEnabled();
@@ -1799,6 +2218,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             const std::wstring adapter_was_selected = g_renderer->GetNetworkAdapterId();
             const ThemeMode previous_theme = g_renderer->GetTheme();
             const bool welcome_was_open = g_renderer->IsWelcomeTourOpen();
+            const bool update_was_open = g_renderer->IsUpdatePromptOpen();
             
             // Handle clicks and update theme/settings
             if (g_engine) {
@@ -1816,23 +2236,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 ShowToolsExportPicker(hwnd, tools_export_picker);
             }
 
+            const bool update_check_requested = g_renderer->TakeUpdateCheckRequest();
+            if (update_check_requested) RequestUpdateCheck(true);
             const bool preferences_applied = g_renderer->TakePreferencesApplyRequest();
             if (previous_theme != g_renderer->GetTheme()) ApplyMainWindowTheme(hwnd);
             
             InvalidateRect(hwnd, nullptr, FALSE);
             // Draft-only clicks need repaint, not dozens of unchanged Registry writes.
-            if (!welcome_was_open && (!g_renderer->IsSettingsOpen() || preferences_applied)) g_renderer->SaveSettings();
+            if (!welcome_was_open && !update_was_open && !update_check_requested &&
+                (!g_renderer->IsSettingsOpen() || preferences_applied)) g_renderer->SaveSettings();
             
-            if (autostart_was_enabled != g_renderer->IsAutostartEnabled()) {
-                const LONG result = SetStartupRegistry(g_renderer->IsAutostartEnabled());
-                if (result != ERROR_SUCCESS) {
-                    g_renderer->SetAutostartEnabled(autostart_was_enabled);
-                    g_renderer->SaveSettings();
-                    const std::wstring error_text = L"Windows startup could not be changed (error "
-                        + std::to_wstring(result) + L"). The previous setting has been restored.";
-                    MessageBoxW(hwnd, error_text.c_str(), L"Watchman startup", MB_OK | MB_ICONWARNING);
-                }
-            }
+            if (autostart_was_enabled != g_renderer->IsAutostartEnabled())
+                RequestStartupRegistration(g_renderer->IsAutostartEnabled(), true);
 
             bool widget_changed =
                 widget_was_enabled != g_renderer->IsWidgetEnabled() ||
@@ -1857,7 +2272,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         break;
 
     case WM_WATCHMAN_TRAY:
-        if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
+        if (LOWORD(lParam) == NIN_BALLOONUSERCLICK && g_update_balloon_active) {
+            g_update_balloon_active = false;
+            ShowWindow(g_main_hwnd, SW_RESTORE);
+            SetForegroundWindow(g_main_hwnd);
+            if (g_renderer) g_renderer->OfferUpdatePrompt(true, true);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (LOWORD(lParam) == NIN_BALLOONHIDE || LOWORD(lParam) == NIN_BALLOONTIMEOUT) {
+            g_update_balloon_active = false;
+        } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
             ShowWindow(g_main_hwnd, SW_RESTORE);
             SetForegroundWindow(g_main_hwnd);
         } else if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU) {
@@ -1866,13 +2289,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         break;
 
     case WM_CLOSE: {
+        // This is an explicit Close, not automatic startup/shell recovery.
+        // Retain the existing accessibility check before hiding the dashboard.
+        // Invalidate asynchronous results so an older Explorer call cannot
+        // overwrite the outcome of this deliberate verification.
+        g_tray_retry.Invalidate();
+        const auto generation = g_tray_retry.Begin(GetTickCount64());
         const bool tray_ready = AddTrayIcon(hwnd);
+        CompleteTrayRegistration({generation, tray_ready}, GetTickCount64());
         WatchmanWindowLifecycle::HandleMessage(hwnd, message, tray_ready);
+        if (tray_ready) {
+            // Only the dashboard is hidden. Reassert independent widgets after
+            // the shell processes the disappearing dashboard/taskbar button.
+            g_dashboard_hidden_at_sample = GetDisplayDashboardSnapshot().sample_sequence;
+            g_awaiting_hidden_widget_frame = true;
+            g_widget_retry.Wake();
+            UpdateWidgetState(true);
+            UpdateFloatingMonitorState(false);
+            WatchmanStartupDiagnostics::Record("window", "dashboard-hidden");
+        }
         if (!tray_ready) {
+#ifndef WATCHMAN_STARTUP_RECOVERY_TESTING
             MessageBoxW(hwnd,
                 L"Watchman could not create its system tray icon, so the window has been kept open. "
                 L"Monitoring is still running. Try closing the window again after the tray is available.",
                 L"Watchman system tray", MB_OK | MB_ICONWARNING);
+#endif
         }
         return 0;
     }
@@ -1882,13 +2324,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_DESTROY:
+        g_shutting_down = true;
         KillTimer(hwnd, 1);
-        g_main_animation_timer_running = false;
+        g_main_animation_timer_interval = 0;
         KillTimer(hwnd, 2);
         KillTimer(hwnd, 3);
         tm_set_widget_command_target(nullptr, 0, 0);
-        RemoveTrayIcon(hwnd);
-        if (g_widget_hwnd) {
+        if (g_tray_worker) g_tray_worker->Cancel(); // Join/remove after history flush, not inside WM_DESTROY.
+        tm_restore_taskbar_layout();
+        if (IsWidgetHost(g_widget_hwnd)) {
             DestroyWindow(g_widget_hwnd);
         }
         if (g_floating_monitor_hwnd) {
@@ -1903,17 +2347,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             ApplyMainWindowTheme(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
-        UpdateWidgetState(true);
+        g_display_recovery.Request(GetTickCount64(), false);
         break;
 
     case WM_DPICHANGED:
-        UpdateWidgetState(true);
+        if (lParam) {
+            const RECT suggested = *reinterpret_cast<const RECT*>(lParam);
+            if (suggested.right > suggested.left && suggested.bottom > suggested.top)
+                SetWindowPos(hwnd, nullptr, suggested.left, suggested.top, suggested.right - suggested.left,
+                    suggested.bottom - suggested.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        g_display_recovery.Request(GetTickCount64(), true);
         break;
 
     case WM_DISPLAYCHANGE:
-        UpdateWidgetState(true);
-        UpdateFloatingMonitorState(false);
+        g_display_recovery.Request(GetTickCount64(), true);
         break;
+
+    case WM_DEVICECHANGE:
+        if (wParam == DBT_DEVNODES_CHANGED) g_display_recovery.Request(GetTickCount64(), true);
+        break;
+
+    case WM_POWERBROADCAST:
+        if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+            g_display_recovery.Request(GetTickCount64(), true);
+            if (g_engine) g_engine->RefreshNetworkDetails();
+        }
+        return TRUE;
 
     default:
         // This class is registered/created with the W APIs. Using the ANSI
@@ -1936,13 +2396,43 @@ LRESULT CALLBACK WidgetWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         {
             PAINTSTRUCT ps;
             BeginPaint(hwnd, &ps);
-            if (g_renderer) {
+            if (g_renderer && hwnd == g_widget_hwnd && !g_shutting_down && g_renderer->IsWidgetEnabled()) {
                 const DashboardSnapshot snapshot = GetDisplayDashboardSnapshot();
+                g_renderer->AllowWidgetGpuRetry((!g_engine || !g_engine->IsSpeedTestRunning()) &&
+                    (!IsWindowVisible(g_main_hwnd) || GetForegroundWindow() != g_main_hwnd));
                 g_renderer->RenderWidget(hwnd, snapshot);
+                const auto paint = g_renderer->GetWidgetPaintResult();
+                static bool first_frame_recorded = false;
+                if (!first_frame_recorded && paint.success && paint.submitted) {
+                    first_frame_recorded = true;
+                    WatchmanStartupDiagnostics::Record("widget", "first-frame");
+                }
+                if (g_awaiting_hidden_widget_frame && !IsWindowVisible(g_main_hwnd) &&
+                    snapshot.sample_sequence > g_dashboard_hidden_at_sample && paint.success && paint.submitted) {
+                    g_awaiting_hidden_widget_frame = false;
+                    WatchmanStartupDiagnostics::Record("widget", "measurement-after-dashboard-hide");
+                }
             }
             EndPaint(hwnd, &ps);
         }
         break;
+
+    case WM_DPICHANGED:
+    case WM_DISPLAYCHANGE:
+        if (!g_shutting_down && IsWindow(g_main_hwnd))
+            PostMessageW(g_main_hwnd, WM_WATCHMAN_DISPLAY_RECOVERY, 0, 0);
+        return 0;
+
+    case WM_NCDESTROY:
+        if (hwnd == g_widget_hwnd) {
+            g_widget_hwnd = nullptr;
+            g_widget_binding_reset_pending = true;
+            // Defer graphics cleanup/recreation until destruction has unwound.
+            // Explorer must not restart monitoring or close the main window.
+            if (!g_shutting_down && IsWindow(g_main_hwnd))
+                PostMessageW(g_main_hwnd, WM_WATCHMAN_RECOVER_WIDGET, 0, 0);
+        }
+        return DefWindowProcW(hwnd, message, wParam, lParam);
 
     case WM_LBUTTONDBLCLK:
         ShowMainPage(ActiveTab::Data);
@@ -2039,6 +2529,12 @@ LRESULT CALLBACK FloatingMonitorWndProc(HWND hwnd, UINT message, WPARAM wParam, 
         ShowFloatingMonitorContextMenu(hwnd, position);
         return 0;
     }
+
+    case WM_DPICHANGED:
+    case WM_DISPLAYCHANGE:
+        if (!g_shutting_down && IsWindow(g_main_hwnd))
+            PostMessageW(g_main_hwnd, WM_WATCHMAN_DISPLAY_RECOVERY, 0, 0);
+        return 0;
 
     case WM_EXITSIZEMOVE:
         if (g_renderer && !g_renderer->IsFloatingMonitorPositionLocked() &&

@@ -40,6 +40,9 @@ struct DashboardSnapshot {
     // save retained for retry. Only a successful flush clears that error.
     bool history_save_pending = false;
     std::wstring history_save_error;
+    // Read failures retain the last good history; a real empty DB is distinct.
+    std::wstring history_read_error;
+    std::wstring history_profile_description;
 
     uint64_t uptime_seconds = 0;
 

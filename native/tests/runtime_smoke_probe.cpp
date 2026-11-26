@@ -144,12 +144,141 @@ template<class Predicate> bool Wait(unsigned timeout_ms, Predicate predicate) {
     return predicate();
 }
 
+void ExerciseInitialization(const std::filesystem::path& database_path) {
+    using Stage = WatchmanEngine::InitializationStage;
+    { WatchmanEngine never_started; never_started.Stop(); never_started.Stop(); }
+    Check("Unstarted engine supports repeated Stop and destruction", true);
+    std::atomic<bool> entered{false};
+    std::atomic<bool> worker_mta{false};
+    const DWORD ui_thread = GetCurrentThreadId();
+    const auto construct_at = GetTickCount64();
+    WatchmanEngine delayed([&](Stage stage, const std::atomic<bool>& running) {
+        if (stage != Stage::BeforeServices) return;
+        APTTYPE type{};
+        APTTYPEQUALIFIER qualifier{};
+        worker_mta = GetCurrentThreadId() != ui_thread &&
+            SUCCEEDED(CoGetApartmentType(&type, &qualifier)) && type == APTTYPE_MTA;
+        entered = true;
+        while (running) Sleep(5); // Stop cooperatively cancels the blocked setup.
+    });
+    Check("Engine construction does not initialize Windows services", GetTickCount64() - construct_at < 250);
+    delayed.SetNetworkAdapterId(L"{EARLY-STARTUP-CHOICE}");
+    const auto start_at = GetTickCount64();
+    delayed.Start();
+    Check("Start returns while initialization is deliberately blocked", GetTickCount64() - start_at < 250 &&
+        Wait(3000, [&] { return entered.load(); }) && !delayed.IsReady());
+    Check("Backend initialization has an owned MTA worker", worker_mta);
+    delayed.RefreshNetworkDetails(); delayed.SetNetworkHealthActive(true); delayed.ResetSession();
+    delayed.RunSpeedTest(); delayed.CancelSpeedTest();
+    const auto export_result = delayed.ExportTrafficCsv({});
+    Check("Early UI getters and commands tolerate unpublished services", delayed.GetDashboardSnapshot().sample_sequence == 0 &&
+        delayed.GetNetworkSnapshot().local_ip.empty() && delayed.GetAppActivitySnapshot().active_apps.empty() &&
+        delayed.GetTrafficHistorySnapshot().history.empty() && delayed.GetNetworkAdapters().empty() &&
+        delayed.GetNetworkAdapterId() == L"{EARLY-STARTUP-CHOICE}" && !delayed.RunDiagnostics() &&
+        !delayed.TerminateApp(0) && !delayed.IsSpeedTestRunning() && delayed.GetSpeedTestProgress() == 0 &&
+        delayed.GetSpeedTestLiveSpeed() == 0.0 && delayed.GetSpeedTestResult().download_speed_mbps == 0.0 &&
+        !delayed.GetSpeedTestStatus().empty() && !delayed.GetSpeedTestSnapshot().available &&
+        !delayed.GetDiagnosticsSnapshot().is_running &&
+        !export_result.success && !export_result.error.empty());
+
+    // Process actual posted UI messages while setup remains blocked. This is
+    // not a boot timing claim; it verifies the window thread is not the worker.
+    HWND window = CreateWindowExW(0, L"STATIC", L"startup responsiveness probe", WS_POPUP,
+        0, 0, 10, 10, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    bool pumped = window != nullptr;
+    for (int index = 0; window && index < 10; ++index) {
+        PostMessageW(window, WM_APP + 42, index, 0);
+        MSG message{};
+        const bool received = PeekMessageW(&message, window, WM_APP + 42, WM_APP + 42, PM_REMOVE) != FALSE;
+        pumped = pumped && received;
+        if (received) DispatchMessageW(&message);
+    }
+    if (window) DestroyWindow(window);
+    Check("Window messages remain responsive during blocked backend setup", pumped && !delayed.IsReady());
+    const auto stop_at = GetTickCount64();
+    delayed.Stop(); delayed.Stop();
+    Check("Exit during initialization joins without dereferencing partial services", GetTickCount64() - stop_at < 1500 &&
+        !delayed.IsReady() && delayed.GetStartupError().empty() && !std::filesystem::exists(database_path));
+
+    // Exceptions at successive real construction boundaries exercise cleanup
+    // of partial PDH/temperature/ETW/SQLite ownership. APPDATA is disposable.
+    for (const auto stage : {Stage::BeforeServices, Stage::MetricsReady, Stage::AppTrackerReady, Stage::StorageReady, Stage::ToolsReady}) {
+        WatchmanEngine failing([stage](Stage current, const std::atomic<bool>&) {
+            if (current == stage) throw std::runtime_error("Deliberate startup regression-test failure");
+        });
+        failing.Start();
+        const bool reported = Wait(15000, [&] { return !failing.GetStartupError().empty(); });
+        failing.Stop(); failing.Stop();
+        Check("Initialization exception is reported and partial ownership joins", reported && !failing.IsReady() &&
+            !failing.RunDiagnostics() && failing.GetNetworkAdapters().empty(), "stage=" + std::to_string(static_cast<int>(stage)));
+    }
+}
+
+void ExerciseOptionalGpuIsolation() {
+    std::atomic<bool> entered{false};
+    MetricsManager metrics([&](const std::atomic<bool>& stopping) {
+        entered = true;
+        while (!stopping) Sleep(2);
+    });
+    Check("Optional GPU discovery is stalled on its separate owner", Wait(3000, [&] { return entered.load(); }));
+    const auto before = metrics.GetRam().sampled_at_ms;
+    Sleep(1100);
+    metrics.Update();
+    Check("Core metrics publish while optional GPU discovery is blocked", !metrics.GetGpu().available &&
+        metrics.GetRam().sample_available && metrics.GetRam().sampled_at_ms > before &&
+        metrics.GetCpu().sample_available && metrics.GetUptimeSeconds() > 0);
+}
+
+void SeedHistoryProfiles(const std::filesystem::path& root) {
+    wchar_t disposable[8]{};
+    GetEnvironmentVariableW(L"WATCHMAN_SMOKE_DISPOSABLE", disposable, 8);
+    Require(std::wstring(disposable) == L"1", "Seeding requires the disposable-runner wrapper");
+    Require(!std::filesystem::exists(root / L"Watchman") && !std::filesystem::exists(root / L"Watchman.Native"),
+        "Refusing to replace any existing history fixture");
+    const auto today = Utf8(TrafficStorage::GetCurrentDateString());
+    for (bool native : {false, true}) {
+        const auto directory = root / (native ? L"Watchman.Native" : L"Watchman");
+        std::filesystem::create_directories(directory);
+        sqlite3* raw = nullptr;
+        Require(sqlite3_open_v2(Utf8((directory / L"watchman.db").wstring()).c_str(), &raw,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK, "Cannot create isolated history fixture");
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> close(raw, sqlite3_close);
+        const auto sql = std::string("CREATE TABLE daily_traffic(date TEXT PRIMARY KEY,download_bytes INTEGER NOT NULL DEFAULT 0,"
+            "upload_bytes INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL); INSERT INTO daily_traffic VALUES('") +
+            (native ? "2001-01-01',100,20,'native-sentinel');" : "2000-01-01',30,4,'legacy-sentinel');") +
+            "INSERT INTO daily_traffic VALUES('" + today + (native ? "',5368709120,1073741824,'native-today');" : "',7,3,'legacy-today');");
+        Require(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK, "Cannot seed isolated history rows");
+    }
+    const auto native = root / L"Watchman.Native";
+    std::filesystem::create_directory(native / L"original-v1");
+    std::ofstream(native / L"migration-v2.complete") << "2.0.0\n";
+    std::ofstream(native / L"original-v1" / L"watchman.db") << "archival fixture must never be opened";
+    std::ofstream(root / L"Watchman" / L"history.json") << "archival JSON must not be imported or modified";
+    Check("Seeded separate native and stale legacy profiles on disposable storage", true);
+}
+
+void VerifyHistoryProfiles(const std::filesystem::path& root) {
+    Database native(root / L"Watchman.Native" / L"watchman.db");
+    Database legacy(root / L"Watchman" / L"watchman.db");
+    Check("Actual EXE retains native-only history", native.Integer("SELECT download_bytes FROM daily_traffic WHERE date='2001-01-01'") == 100 &&
+        native.Integer("SELECT COUNT(*) FROM daily_traffic WHERE date='2000-01-01'") == 0);
+    const auto today = Utf8(TrafficStorage::GetCurrentDateString());
+    const auto download = native.Integer(("SELECT download_bytes FROM daily_traffic WHERE date='" + today + "'").c_str());
+    const auto upload = native.Integer(("SELECT upload_bytes FROM daily_traffic WHERE date='" + today + "'").c_str());
+    Check("Actual EXE preserves the native current-day baseline", download >= 5368709120ULL && upload >= 1073741824ULL);
+    Check("Actual EXE adds newly measured traffic to the native profile", download > 5368709120ULL || upload > 1073741824ULL,
+        "saved_rx=" + std::to_string(download) + ", saved_tx=" + std::to_string(upload));
+    Check("Legacy test-session history remains separate and unchanged", legacy.Integer("SELECT SUM(download_bytes) FROM daily_traffic") == 37 &&
+        legacy.Integer("SELECT SUM(upload_bytes) FROM daily_traffic") == 7);
+    Check("Selected native database has an additive per-app schema", native.Integer("SELECT COUNT(*) FROM pragma_table_info('app_traffic')") == 5);
+}
+
 int Exercise(const std::filesystem::path& output) {
     wchar_t disposable[8]{};
     GetEnvironmentVariableW(L"WATCHMAN_SMOKE_DISPOSABLE", disposable, static_cast<DWORD>(std::size(disposable)));
     Require(std::wstring(disposable) == L"1", "Runtime smoke requires the disposable-runner wrapper");
     const auto appdata = output / L"engine-appdata";
-    const auto database_path = appdata / L"Watchman.Native" / L"watchman.db";
+    const auto database_path = appdata / L"Watchman" / L"watchman.db";
     Require(!std::filesystem::exists(database_path), "Refusing to reuse an existing runtime-smoke database");
     std::filesystem::create_directories(appdata);
     Require(SetEnvironmentVariableW(L"APPDATA", appdata.c_str()) != FALSE, "Could not isolate APPDATA");
@@ -158,9 +287,16 @@ int Exercise(const std::filesystem::path& output) {
     Require(WSAStartup(MAKEWORD(2, 2), &winsock) == 0, "WinSock initialization failed");
     const auto com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     struct Cleanup { HRESULT result; ~Cleanup() { if (SUCCEEDED(result)) CoUninitialize(); WSACleanup(); } } cleanup{com};
+    ExerciseOptionalGpuIsolation();
+    ExerciseInitialization(database_path);
     auto engine = std::make_unique<WatchmanEngine>();
+    engine->SetNetworkAdapterId(L"{WATCHMAN-SMOKE-EARLY-MISSING-ADAPTER}");
     engine->Start();
     Check("Engine publishes initial snapshot", Wait(12000, [&] { return engine->GetDashboardSnapshot().sample_sequence > 0; }));
+    Check("Saved adapter choice is applied before the first sample", engine->IsReady() &&
+        engine->GetNetworkAdapterId() == L"{WATCHMAN-SMOKE-EARLY-MISSING-ADAPTER}" && !engine->GetNetworkSnapshot().is_connected);
+    engine->SetNetworkAdapterId(L"");
+    Check("Auto adapter selection works after asynchronous readiness", Wait(8000, [&] { return engine->GetNetworkSnapshot().is_connected; }));
     Sleep(3500); // CPU must prime; ETW's real-time consumer must connect.
     Traffic traffic;
     traffic.Start();
@@ -266,6 +402,8 @@ int Exercise(const std::filesystem::path& output) {
     Sleep(100);
     const auto cancel_at = GetTickCount64();
     engine->CancelSpeedTest();
+    engine->RunSpeedTest(); // An unfinished cancellation must not join/revive the old worker from this caller.
+    Check("Immediate speed cancel/restart returns without a worker join", GetTickCount64() - cancel_at < 250);
     const bool cancelled = Wait(15000, [&] { return !engine->IsSpeedTestRunning(); });
     Check("Speed-test cancellation finishes within 15 seconds", cancelled,
         "cancel_ms=" + std::to_string(GetTickCount64() - cancel_at) + ", status=" + Utf8(engine->GetSpeedTestStatus()));
@@ -283,19 +421,34 @@ int Exercise(const std::filesystem::path& output) {
     }
     InspectDatabase(database_path);
 
-    TrafficExportOptions options;
-    options.period = TrafficExportPeriod::Daily;
-    options.month = TrafficStorage::GetCurrentDateString().substr(0, 7);
-    const auto exported = engine->ExportTrafficCsv(options);
-    Check("Real saved history exports to CSV", exported.success, Utf8(exported.error));
-    if (exported.success) {
-        std::ifstream input(std::filesystem::path(exported.filepath), std::ios::binary);
-        const std::string csv((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-        input.close();
-        Check("Export contains BOM, byte columns and the actual current date", csv.size() > 3 && csv.substr(0, 3) == "\xEF\xBB\xBF" &&
-            csv.find("Download (Bytes)") != std::string::npos && csv.find(Utf8(TrafficStorage::GetCurrentDateString())) != std::string::npos);
-        std::filesystem::copy_file(exported.filepath, output / L"actual-history-export.csv", std::filesystem::copy_options::overwrite_existing);
-        std::filesystem::remove(exported.filepath);
+    std::vector<TrafficRecord> export_records;
+    {
+        TrafficStorage persisted(database_path.wstring());
+        Check("Export validation reads the persisted byte totals", persisted.LoadHistory(export_records));
+    }
+    for (const auto& entry : std::vector<std::pair<TrafficExportPeriod, const wchar_t*>>{
+            {TrafficExportPeriod::Daily, L"daily"}, {TrafficExportPeriod::Weekly, L"weekly"},
+            {TrafficExportPeriod::Monthly, L"monthly"}, {TrafficExportPeriod::Yearly, L"yearly"}}) {
+        TrafficExportOptions options;
+        options.period = entry.first;
+        options.month = TrafficStorage::GetCurrentDateString().substr(0, 7);
+        options.year = std::stoi(options.month.substr(0, 4));
+        const std::string label = Utf8(entry.second);
+        const auto exported = engine->ExportTrafficCsv(options);
+        Check(("Real saved history exports to " + label + " CSV").c_str(), exported.success, Utf8(exported.error));
+        if (exported.success) {
+            std::ifstream input(std::filesystem::path(exported.filepath), std::ios::binary);
+            const std::string csv((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            input.close();
+            const auto expected = WatchmanExport::BuildCsv(export_records, options);
+            Check((label + " export preserves the formatter's exact BOM, five columns, CRLF and saved totals").c_str(),
+                !expected.utf8.empty() && csv == expected.utf8 && csv.substr(0, 3) == "\xEF\xBB\xBF" &&
+                csv.find(",Summary\r\n") != std::string::npos && csv.find("Bytes") == std::string::npos);
+            const auto filename = entry.first == TrafficExportPeriod::Daily ? std::wstring(L"actual-history-export.csv") :
+                std::wstring(L"actual-history-export-") + entry.second + L".csv";
+            std::filesystem::copy_file(exported.filepath, output / filename, std::filesystem::copy_options::overwrite_existing);
+            std::filesystem::remove(exported.filepath);
+        }
     }
     const auto destroy_at = GetTickCount64();
     engine.reset();
@@ -317,6 +470,8 @@ int Exercise(const std::filesystem::path& output) {
 int wmain(int argc, wchar_t** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     try {
+        if (argc == 3 && std::wstring(argv[1]) == L"--seed-profiles") { SeedHistoryProfiles(argv[2]); return failures ? 1 : 0; }
+        if (argc == 3 && std::wstring(argv[1]) == L"--verify-profiles") { VerifyHistoryProfiles(argv[2]); return failures ? 1 : 0; }
         if (argc == 3 && std::wstring(argv[1]) == L"--inspect-db") { InspectDatabase(argv[2]); return failures ? 1 : 0; }
         if (argc == 3 && std::wstring(argv[1]) == L"--exercise") return Exercise(std::filesystem::absolute(argv[2]));
         std::cerr << "Use --exercise <disposable output directory> or --inspect-db <history path>\n";

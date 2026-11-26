@@ -1,10 +1,18 @@
-# Only on a fresh disposable Windows runner with the genuine v2.0.0 release installed.
-param([string]$Setup, [string]$ProtocolProbe)
+# Only on a fresh disposable Windows runner with the selected public v2 baseline installed.
+param(
+    [string]$Setup,
+    [string]$ProtocolProbe,
+    [ValidateSet('2.0.0','2.0.1')][string]$BaselineVersion = '2.0.0'
+)
 trap { Write-Host "::error::$($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)"; exit 1 }
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 $version = (Get-Content src-tauri/native-package.json -Raw | ConvertFrom-Json).version
 if (!$Setup) { $Setup = "builds/staged/Watchman_${version}_x64-setup.exe" }
+$baselineFolder = if ($BaselineVersion -eq '2.0.0') { 'watchman-v2-baseline' } else { 'watchman-v201-baseline' }
+$baselinePublisher = if ($BaselineVersion -eq '2.0.0') { 'blinkeye' } else { 'Noman Dhoni' }
+$baseline = Join-Path $env:RUNNER_TEMP "$baselineFolder/Watchman_${BaselineVersion}_x64-setup.exe"
+Import-Module "$PSScriptRoot/StartupAcceptance.psm1" -Force
 function Require($ok,$message){ if (!$ok) { throw $message } }
 function Entry {
     $rows = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' | Where-Object DisplayName -eq 'Watchman')
@@ -20,7 +28,7 @@ function Wait-App($file, $argsList) {
 $setupInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path $Setup).Path)
 Require ($setupInfo.ProductVersion -ceq $version) 'Installer PE ProductVersion is not the candidate version'
 $old = Entry
-Require ($old.DisplayVersion -eq '2.0.0' -and $old.Publisher -ceq 'blinkeye') 'Genuine v2.0.0 baseline is missing'
+Require ($old.DisplayVersion -eq $BaselineVersion -and $old.Publisher -ceq $baselinePublisher) "Genuine v$BaselineVersion baseline is missing"
 $oldEntryPath = $old.PSPath
 $oldInstallPath = $old.InstallLocation.Trim('"')
 $app = Join-Path (Split-Path $old.UninstallString.Trim('"')) 'watchman.exe'
@@ -42,10 +50,12 @@ $preservedFiles = @($marker, $profile, (Join-Path $original 'history.json'), (Jo
 $hashesBefore = @{}
 foreach ($file in $preservedFiles) { $hashesBefore[$file] = (Get-FileHash $file).Hash }
 
-# Keep representative native preferences and an enabled per-user startup command.
+# The old native build stored this saved preference and launched through Run.
+# v2.0.2 must migrate it to one current-user task, not silently switch startup off.
 $settingsKey = 'HKCU:\Software\Watchman'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $null = New-Item $settingsKey -Force
+New-ItemProperty $settingsKey -Name Autostart -Value 1 -PropertyType DWord -Force | Out-Null
 New-ItemProperty $settingsKey -Name Theme -Value 1 -PropertyType DWord -Force | Out-Null
 New-ItemProperty $settingsKey -Name UnitModeBits -Value 1 -PropertyType DWord -Force | Out-Null
 New-ItemProperty $settingsKey -Name DataLimitBytes -Value ([long]9876543210) -PropertyType QWord -Force | Out-Null
@@ -55,15 +65,17 @@ New-ItemProperty $runKey -Name Watchman -Value $startup -PropertyType String -Fo
 
 $oldProcess = Start-Process $app -PassThru
 Start-Sleep -Seconds 8
-Require (!$oldProcess.HasExited) 'Released v2.0.0 is not running'
+Require (!$oldProcess.HasExited) "Released v$BaselineVersion is not running"
 $settingsBefore = Get-ItemProperty $settingsKey
-$startupBefore = (Get-ItemProperty $runKey).Watchman
-Require ($settingsBefore.Theme -eq 1 -and $settingsBefore.UnitModeBits -eq 1 -and $settingsBefore.DataLimitBytes -eq 9876543210) 'Could not seed representative native settings'
-Require ($startupBefore -match 'watchman.exe" --startup$') 'Could not seed the per-user startup command'
+$startupBefore = Get-WatchmanRunCommand
+Require ($settingsBefore.Autostart -eq 1 -and $settingsBefore.Theme -eq 1 -and
+    $settingsBefore.UnitModeBits -eq 1 -and $settingsBefore.DataLimitBytes -eq 9876543210) 'Could not seed representative native settings'
+Require ($startupBefore -ceq $startup) 'Could not seed the per-user startup command'
+Require ($null -eq (Get-WatchmanStartupTask)) 'The disposable baseline already had a new-format sign-in task'
 
 # The staging probe verifies the exact signed candidate and launches it through its real updater path.
 if ($ProtocolProbe) { Wait-App $ProtocolProbe '--install' } else { Wait-App $Setup '/P /UPDATE /R' }
-Require ($oldProcess.HasExited) 'Old v2.0.0 process did not stop for update'
+Require ($oldProcess.HasExited) "Released v$BaselineVersion process did not stop for update"
 $new = Entry
 Require ($new.PSPath -eq $oldEntryPath -and $new.DisplayName -eq 'Watchman' -and $new.DisplayVersion -eq $version) 'Uninstall identity/version changed'
 Require ($new.Publisher -ceq 'Noman Dhoni') 'Installed apps publisher is not exactly Noman Dhoni'
@@ -72,25 +84,40 @@ Require ($installPath -eq $oldInstallPath -and (Split-Path $new.UninstallString.
 $locationKey = Get-Item 'HKLM:\SOFTWARE\Noman Dhoni\Watchman'
 Require ($locationKey.GetValue('') -eq $installPath) 'New publisher install-location key was not saved'
 $locationKey.Close()
-$legacyLocationKey = Get-Item 'HKLM:\SOFTWARE\blinkeye\Watchman'
-Require ($legacyLocationKey.GetValue('') -eq $oldInstallPath) 'Legacy install-location key was not retained for rollback'
-$legacyLocationKey.Close()
+if ($BaselineVersion -eq '2.0.0') {
+    $legacyLocationKey = Get-Item 'HKLM:\SOFTWARE\blinkeye\Watchman'
+    Require ($legacyLocationKey.GetValue('') -eq $oldInstallPath) 'Legacy install-location key was not retained for rollback'
+    $legacyLocationKey.Close()
+} elseif (Test-Path 'HKLM:\SOFTWARE\blinkeye\Watchman') {
+    $legacyLocationKey = Get-Item 'HKLM:\SOFTWARE\blinkeye\Watchman'
+    Require ($legacyLocationKey.GetValue('') -eq $oldInstallPath) 'Existing legacy install-location key changed'
+    $legacyLocationKey.Close()
+}
 $defaultInstall = Join-Path $env:ProgramFiles 'Watchman'
 if ($defaultInstall -ne $installPath) { Require (!(Test-Path (Join-Path $defaultInstall 'watchman.exe'))) 'Update created a duplicate default-path installation' }
 $installedInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($app)
 Require ($installedInfo.CompanyName -ceq 'Noman Dhoni') 'Executable CompanyName is not exactly Noman Dhoni'
-Require ($installedInfo.FileVersion -ceq $version -and $installedInfo.ProductVersion -ceq $version) 'Executable PE version metadata is not 2.0.1'
+Require ($installedInfo.FileVersion -ceq $version -and $installedInfo.ProductVersion -ceq $version) 'Executable PE version metadata is not the candidate version'
 Require ((Get-FileHash $app).Hash -eq (Get-Content builds/staged/Watchman.exe.sha256).Trim()) 'Installed executable is not the MSVC build'
 
-$baseline = "$env:RUNNER_TEMP/watchman-v2-baseline/Watchman_2.0.0_x64-setup.exe"
-& (Join-Path (Split-Path $app) 'watchman-verify-release.exe') $baseline "$baseline.minisig"
-Require ($LASTEXITCODE -eq 0) 'Could not re-verify the unmodified released v2.0.0 baseline with the shipped public key'
+& (Join-Path (Split-Path $app) 'watchman-verify-release.exe') $baseline "${baseline}.minisig"
+Require ($LASTEXITCODE -eq 0) "Could not re-verify the unmodified released v$BaselineVersion baseline with the shipped public key"
 for ($i=0; $i -lt 60 -and @(Get-Process watchman -ErrorAction Ignore).Count -ne 1; $i++) { Start-Sleep 1 }
 Require (@(Get-Process watchman -ErrorAction Ignore).Count -eq 1) 'Expected exactly one restarted Watchman process'
+$registrationReady = $false
+for ($i = 0; $i -lt 60; $i++) {
+    if ((Test-WatchmanStartupTask -Executable $app) -and $null -eq (Get-WatchmanRunCommand)) {
+        $registrationReady = $true
+        break
+    }
+    Start-Sleep 1
+}
+Require $registrationReady 'Enabled Run startup was not migrated to the verified current-user sign-in task'
+Assert-WatchmanStartupTask -Executable $app
 $settingsAfter = Get-ItemProperty $settingsKey
-$startupAfter = (Get-ItemProperty $runKey).Watchman
-Require ($settingsAfter.Theme -eq $settingsBefore.Theme -and $settingsAfter.UnitModeBits -eq $settingsBefore.UnitModeBits -and $settingsAfter.DataLimitBytes -eq $settingsBefore.DataLimitBytes) 'Native settings changed during the publisher-only update'
-Require ($startupAfter -ceq $startupBefore) 'Per-user startup command changed during the publisher-only update'
+Require ($settingsAfter.Autostart -eq 1 -and $settingsAfter.Theme -eq $settingsBefore.Theme -and
+    $settingsAfter.UnitModeBits -eq $settingsBefore.UnitModeBits -and
+    $settingsAfter.DataLimitBytes -eq 9876543210) 'Native settings changed during the update'
 Require ((Get-Content -Raw $marker).Trim() -eq '2.0.0') 'Completed migration marker was rewritten'
 foreach ($file in $preservedFiles) { Require ((Get-FileHash $file).Hash -eq $hashesBefore[$file]) "Existing profile or archived JSON changed: $file" }
 $links = @(Get-ChildItem "$env:ProgramData/Microsoft/Windows/Start Menu/Programs" -Recurse -Filter 'Watchman.lnk')
@@ -99,4 +126,10 @@ Require ((New-Object -ComObject WScript.Shell).CreateShortcut($links[0].FullName
 Stop-Process -Name watchman -Force
 Wait-Process -Name watchman -Timeout 15 -ErrorAction SilentlyContinue
 python "$PSScriptRoot/test_native_upgrade.py" verify (Join-Path $native 'watchman.db')
-"Verified v2.0.0 -> $version in-place update, publisher, install identity, custom path, SQLite, settings, startup and preserved profile files." | Write-Output
+
+# The machine uninstaller must remove this current user's owned task but retain all data.
+Wait-App $new.UninstallString.Trim('"') '/S'
+for ($i = 0; $i -lt 30 -and (Test-Path $app); $i++) { Start-Sleep 1 }
+Require (!(Test-Path $app) -and (Test-Path "$native/watchman.db") -and (Test-Path $marker)) 'Uninstall removed profile data or left the executable'
+Assert-WatchmanStartupAbsent
+"Verified v$BaselineVersion -> $version in-place update, startup migration, publisher, install identity, custom path, SQLite, settings, profile preservation and uninstall cleanup." | Write-Output

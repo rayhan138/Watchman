@@ -104,10 +104,11 @@ void PlainCopyAndRealMonitorSamples() {
         "Preview numbers must show real rate and percentage units");
     Check(FloatingMonitorLayout::default_text_color == 0x00FFFFFFu && FloatingMonitorLayout::panel_background_color == 0,
         "Floating samples and live defaults must remain white-on-black in Light and Dark");
-    static_assert(sizeof(FloatingMonitorLayout::Layout) == 4 * sizeof(FloatingMonitorLayout::Rect),
-        "Floating monitor may only contain upload/download labels and values");
+    static_assert(sizeof(FloatingMonitorLayout::Layout) == 8 * sizeof(FloatingMonitorLayout::Rect),
+        "Floating monitor supports upload/download and independent CPU/memory fields");
     for (int font = FloatingMonitorLayout::minimum_font_size; font <= FloatingMonitorLayout::maximum_font_size; ++font) {
-        Check(FloatingMonitorLayout::Height(font) == 28, "Floating monitor must not reserve CPU/memory height");
+        Check(FloatingMonitorLayout::Height(font) == 56, "Default sample must include CPU/memory height");
+        Check(FloatingMonitorLayout::Height(font, false, false) == 28, "Network-only mode remains compact");
     }
 }
 
@@ -148,7 +149,7 @@ void Geometry() {
                     "Taskbar sample must use the real preferred dimensions, not a placeholder diagram");
                 Check(Near(Width(previews.floating), FloatingMonitorLayout::Width(FloatingMonitorLayout::default_font_size) * previews.scale)
                     && Near(Height(previews.floating), FloatingMonitorLayout::Height() * previews.scale),
-                    "Floating sample must use the real network-only strip dimensions");
+                    "Floating sample must use the real default network/CPU/memory dimensions");
                 Check(previews.taskbar_label.bottom < previews.taskbar.top && previews.floating_label.bottom < previews.floating.top
                     && previews.taskbar.right < previews.floating.left,
                     "Monitor samples and captions must remain clearly separated");

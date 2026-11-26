@@ -13,11 +13,10 @@
 #include <map>
 #include <shlobj.h>
 #include <sstream>
+#include <stdexcept>
 #include <string_view>
 
 namespace {
-
-constexpr uint64_t kBytesPerMegabyte = 1024ULL * 1024ULL;
 
 bool IsLeapYear(int year) {
     return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
@@ -53,95 +52,10 @@ bool ParseDate(const std::wstring& value, int& year, int& month, int& day) {
     return month >= 1 && month <= 12 && day >= 1 && day <= DaysInMonth(year, month);
 }
 
-bool IsValidMonthKey(const std::wstring& value) {
-    int year = 0;
-    int month = 0;
-    int day = 0;
-    return value.size() == 7 &&
-        ParseDate(value + L"-01", year, month, day);
-}
-
-int DayOfWeekSundayZero(int year, int month, int day) {
-    static constexpr int kMonthOffsets[] = {
-        0, 3, 2, 5, 0, 3,
-        5, 1, 4, 6, 2, 4,
-    };
-    if (month < 3) --year;
-    return (year + year / 4 - year / 100 + year / 400 + kMonthOffsets[month - 1] + day) % 7;
-}
-
-int DayOfYear(int year, int month, int day) {
-    int ordinal = day;
-    for (int current_month = 1; current_month < month; ++current_month) {
-        ordinal += DaysInMonth(year, current_month);
-    }
-    return ordinal;
-}
-
-int WeeksInIsoYear(int year) {
-    const int jan_first = DayOfWeekSundayZero(year, 1, 1);
-    return jan_first == 4 || (jan_first == 3 && IsLeapYear(year)) ? 53 : 52;
-}
-
-std::wstring GetIsoWeekKey(int year, int month, int day) {
-    const int sunday_zero = DayOfWeekSundayZero(year, month, day);
-    const int iso_weekday = sunday_zero == 0 ? 7 : sunday_zero;
-    const int ordinal = DayOfYear(year, month, day);
-    int week = (ordinal - iso_weekday + 10) / 7;
-    int iso_year = year;
-    if (week < 1) {
-        iso_year = year - 1;
-        week = WeeksInIsoYear(iso_year);
-    } else if (week > WeeksInIsoYear(year)) {
-        iso_year = year + 1;
-        week = 1;
-    }
-
-    wchar_t key[16]{};
-    swprintf_s(key, L"%04d-W%02d", iso_year, week);
-    return key;
-}
-
 uint64_t SaturatingAdd(uint64_t left, uint64_t right) {
     return std::numeric_limits<uint64_t>::max() - left < right
         ? std::numeric_limits<uint64_t>::max()
         : left + right;
-}
-
-bool MatchesExportScope(
-    const std::wstring& date,
-    const TrafficExportOptions& options,
-    int year
-) {
-    switch (options.period) {
-    case TrafficExportPeriod::Daily:
-    case TrafficExportPeriod::Weekly:
-        return date.rfind(options.month, 0) == 0;
-    case TrafficExportPeriod::Monthly:
-    case TrafficExportPeriod::Yearly:
-        return year == options.year;
-    }
-    return false;
-}
-
-std::wstring GetPeriodKey(
-    const std::wstring& date,
-    const TrafficExportOptions& options,
-    int year,
-    int month,
-    int day
-) {
-    switch (options.period) {
-    case TrafficExportPeriod::Daily:
-        return date;
-    case TrafficExportPeriod::Weekly:
-        return GetIsoWeekKey(year, month, day);
-    case TrafficExportPeriod::Monthly:
-        return date.substr(0, 7);
-    case TrafficExportPeriod::Yearly:
-        return date.substr(0, 4);
-    }
-    return {};
 }
 
 const wchar_t* ExportPeriodName(TrafficExportPeriod period) {
@@ -185,27 +99,18 @@ std::string WideToUtf8(const std::wstring& value) {
     return output;
 }
 
-std::wstring EscapeCsvField(const std::wstring& value) {
-    if (value.find_first_of(L",\"\r\n") == std::wstring::npos) {
-        return value;
-    }
-    std::wstring escaped = L"\"";
-    for (const wchar_t character : value) {
-        if (character == L'\"') escaped += L'\"';
-        escaped += character;
-    }
-    escaped += L"\"";
-    return escaped;
-}
-
 } // namespace
 
 
 
-TrafficStorage::TrafficStorage() : TrafficStorage(GetDatabasePath()) {}
+TrafficStorage::TrafficStorage() : TrafficStorage(GetDefaultProfile()) {}
 
 TrafficStorage::TrafficStorage(const std::wstring& database_path, int busy_timeout_ms)
-    : database_path_(database_path), busy_timeout_ms_(busy_timeout_ms) {
+    : TrafficStorage(WatchmanHistory::Selection{std::filesystem::path(database_path),
+          WatchmanHistory::Profile::Explicit, true, false, {}}, busy_timeout_ms) {}
+
+TrafficStorage::TrafficStorage(const WatchmanHistory::Selection& profile, int busy_timeout_ms)
+    : database_path_(profile.database.wstring()), profile_(profile), busy_timeout_ms_(busy_timeout_ms) {
     OpenDatabase();
 }
 
@@ -213,15 +118,14 @@ TrafficStorage::~TrafficStorage() {
     CloseDatabase();
 }
 
-std::wstring TrafficStorage::GetDatabasePath() {
-    const DWORD size = ExpandEnvironmentStringsW(L"%APPDATA%\\Watchman.Native\\watchman.db", nullptr, 0);
-    if (size == 0) return {};
+WatchmanHistory::Selection TrafficStorage::GetDefaultProfile() {
+    const DWORD size = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
+    if (size == 0) return WatchmanHistory::Select({});
     std::wstring path(size, L'\0');
-    const DWORD written = ExpandEnvironmentStringsW(
-        L"%APPDATA%\\Watchman.Native\\watchman.db", path.data(), size);
-    if (written == 0 || written > size || path.find(L"%APPDATA%") != std::wstring::npos) return {};
-    path.resize(written - 1);
-    return path;
+    const DWORD written = GetEnvironmentVariableW(L"APPDATA", path.data(), size);
+    if (written == 0 || written >= size) return WatchmanHistory::Select({});
+    path.resize(written);
+    return WatchmanHistory::Select(std::filesystem::path(path));
 }
 
 std::wstring TrafficStorage::GetCurrentDateString() {
@@ -268,6 +172,11 @@ bool TrafficStorage::OpenDatabase() {
         last_error_ = "History database path is unavailable.";
         return false;
     }
+    // Native selection is authoritative. An inaccessible, missing, zero-length
+    // or corrupt native DB must never send subsequent writes into stale legacy
+    // history. Selection and pending deltas stay bound to this one path.
+    if (!WatchmanHistory::ValidateExisting(std::filesystem::path(database_path_),
+                                         profile_.allow_create, last_error_)) return false;
     std::error_code error;
     const auto parent = std::filesystem::path(database_path_).parent_path();
     if (!parent.empty()) std::filesystem::create_directories(parent, error);
@@ -276,10 +185,18 @@ bool TrafficStorage::OpenDatabase() {
         return false;
     }
 
+    // Keep the official native guard as well as profile selection: a zero-byte
+    // DB or orphaned SQLite sidecar is recovery data, not a blank DB to create.
     try { CheckHistoryFiles(database_path_); }
-    catch (const std::exception& e) { last_error_ = e.what(); return false; }
+    catch (const std::exception& exception) { last_error_ = exception.what(); return false; }
+
     sqlite3* candidate = nullptr;
-    const int result = sqlite3_open16(database_path_.c_str(), &candidate);
+    const auto utf8_path = WideToUtf8(database_path_);
+    if (utf8_path.empty()) { last_error_ = "History database path is invalid."; return false; }
+    // READWRITE without CREATE protects known profiles against an unexpected
+    // missing-file race. Explicit/fresh standalone paths may create a new DB.
+    const int flags = SQLITE_OPEN_READWRITE | (profile_.allow_create ? SQLITE_OPEN_CREATE : 0);
+    const int result = sqlite3_open_v2(utf8_path.c_str(), &candidate, flags, nullptr);
     if (!CheckResult(candidate, result, SQLITE_OK, "Open history database")) {
         if (candidate) sqlite3_close_v2(candidate);
         return false;
@@ -467,29 +384,37 @@ bool PendingTrafficHistory::Flush(TrafficStorage& storage) {
 }
 
 std::vector<TrafficRecord> TrafficStorage::LoadHistory() {
-    std::lock_guard<std::mutex> lock(storage_mutex_);
     std::vector<TrafficRecord> records;
-    if (!db_) OpenDatabase();
-    if (!db_) return records;
-
-    const char* select_all = "SELECT date, download_bytes, upload_bytes FROM daily_traffic ORDER BY date ASC;";
-    sqlite3_stmt* stmt = nullptr;
-
-    if (sqlite3_prepare_v2(db_, select_all, -1, &stmt, nullptr) == SQLITE_OK) {
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            TrafficRecord rec;
-            const wchar_t* date_wstr = reinterpret_cast<const wchar_t*>(sqlite3_column_text16(stmt, 0));
-            if (date_wstr) {
-                rec.date = date_wstr;
-            }
-            rec.rx_bytes = sqlite3_column_int64(stmt, 1);
-            rec.tx_bytes = sqlite3_column_int64(stmt, 2);
-            records.push_back(rec);
-        }
-        sqlite3_finalize(stmt);
-    }
-
+    LoadHistory(records);
     return records;
+}
+
+bool TrafficStorage::LoadHistory(std::vector<TrafficRecord>& records) {
+    std::lock_guard<std::mutex> lock(storage_mutex_);
+    if (!OpenDatabase()) return false;
+    constexpr char sql[] = "SELECT date, download_bytes, upload_bytes FROM daily_traffic ORDER BY date ASC;";
+    sqlite3_stmt* raw = nullptr;
+    if (!CheckResult(db_, sqlite3_prepare_v2(db_, sql, -1, &raw, nullptr), SQLITE_OK,
+                     "Read daily history")) return false;
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(raw, sqlite3_finalize);
+    std::vector<TrafficRecord> next;
+    int result;
+    while ((result = sqlite3_step(raw)) == SQLITE_ROW) {
+        const auto* date = reinterpret_cast<const wchar_t*>(sqlite3_column_text16(raw, 0));
+        int year = 0, month = 0, day = 0;
+        if (!date || !ParseDate(date, year, month, day) || year < 1 ||
+            sqlite3_column_type(raw, 1) != SQLITE_INTEGER || sqlite3_column_type(raw, 2) != SQLITE_INTEGER ||
+            sqlite3_column_int64(raw, 1) < 0 || sqlite3_column_int64(raw, 2) < 0) {
+            last_error_ = "Saved history contains an invalid date or byte count; last good history retained.";
+            return false;
+        }
+        next.push_back({date, static_cast<uint64_t>(sqlite3_column_int64(raw, 1)),
+                              static_cast<uint64_t>(sqlite3_column_int64(raw, 2))});
+    }
+    if (!CheckResult(db_, result, SQLITE_DONE, "Read daily history")) return false;
+    records.swap(next);
+    last_error_.clear();
+    return true;
 }
 
 std::vector<TrafficRecord> TrafficStorage::LoadMonthlyHistory() {
@@ -610,82 +535,18 @@ uint64_t TrafficStorage::GetAppTotalTrafficToday(const std::wstring& app_name) {
 
 TrafficExportResult TrafficStorage::ExportTrafficCsv(const TrafficExportOptions& options) {
     TrafficExportResult result;
-    const bool uses_month = options.period == TrafficExportPeriod::Daily ||
-        options.period == TrafficExportPeriod::Weekly;
-    if (uses_month && !IsValidMonthKey(options.month)) {
-        result.error = L"Choose a month with saved history before exporting.";
+    result.error = WatchmanExport::ValidateOptions(options);
+    if (!result.error.empty()) return result;
+
+    std::vector<TrafficRecord> saved;
+    if (!LoadHistory(saved)) {
+        result.error = L"Saved traffic history could not be read. No partial report was written.";
         return result;
     }
-    if (!uses_month && (options.year < 1970 || options.year > 9999)) {
-        result.error = L"Choose a year with saved history before exporting.";
+    const auto csv = WatchmanExport::BuildCsv(saved, options);
+    if (!csv.error.empty()) {
+        result.error = csv.error;
         return result;
-    }
-
-    std::map<std::wstring, std::pair<uint64_t, uint64_t>> aggregated;
-    {
-        // The engine updates SQLite on its worker thread while export begins
-        // from the UI. Keep the report a consistent snapshot of saved data.
-        std::lock_guard<std::mutex> lock(storage_mutex_);
-        if (!db_) OpenDatabase();
-        if (!db_) {
-            result.error = L"Saved traffic history is unavailable.";
-            return result;
-        }
-
-        constexpr char kSelectSql[] =
-            "SELECT date, download_bytes, upload_bytes "
-            "FROM daily_traffic ORDER BY date ASC;";
-        sqlite3_stmt* statement = nullptr;
-        if (sqlite3_prepare_v2(db_, kSelectSql, -1, &statement, nullptr) != SQLITE_OK) {
-            result.error = L"Saved traffic history could not be read.";
-            return result;
-        }
-
-        while (sqlite3_step(statement) == SQLITE_ROW) {
-            const wchar_t* raw_date = reinterpret_cast<const wchar_t*>(sqlite3_column_text16(statement, 0));
-            if (raw_date == nullptr) continue;
-
-            const std::wstring date(raw_date);
-            int year = 0;
-            int month = 0;
-            int day = 0;
-            if (!ParseDate(date, year, month, day) || !MatchesExportScope(date, options, year)) {
-                continue;
-            }
-
-            const std::wstring key = GetPeriodKey(date, options, year, month, day);
-            if (key.empty()) continue;
-
-            auto& totals = aggregated[key];
-            totals.first = SaturatingAdd(
-                totals.first,
-                static_cast<uint64_t>(sqlite3_column_int64(statement, 1))
-            );
-            totals.second = SaturatingAdd(
-                totals.second,
-                static_cast<uint64_t>(sqlite3_column_int64(statement, 2))
-            );
-        }
-        sqlite3_finalize(statement);
-    }
-
-    if (aggregated.empty()) {
-        result.error = L"No data is available for the selected export range.";
-        return result;
-    }
-
-    std::wostringstream csv;
-    csv << L"Period,Download (MB),Upload (MB),Total (MB),Download (Bytes),Upload (Bytes),Total (Bytes)\n";
-    csv << std::fixed << std::setprecision(2);
-    for (const auto& [period, totals] : aggregated) {
-        const uint64_t download = totals.first;
-        const uint64_t upload = totals.second;
-        const uint64_t total = SaturatingAdd(download, upload);
-        csv << EscapeCsvField(period) << L","
-            << static_cast<double>(download) / static_cast<double>(kBytesPerMegabyte) << L","
-            << static_cast<double>(upload) / static_cast<double>(kBytesPerMegabyte) << L","
-            << static_cast<double>(total) / static_cast<double>(kBytesPerMegabyte) << L","
-            << download << L"," << upload << L"," << total << L"\n";
     }
 
     time_t now = time(nullptr);
@@ -697,8 +558,6 @@ TrafficExportResult TrafficStorage::ExportTrafficCsv(const TrafficExportOptions&
     const std::wstring filename = std::wstring(L"traffic-report-") +
         ExportPeriodName(options.period) + L"-" + ExportScopeLabel(options) + L"-" + timestamp + L".csv";
     const std::wstring filepath = GetDownloadsDirectory() + L"\\" + filename;
-    const std::string utf8_csv = WideToUtf8(csv.str());
-    const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
 
     FILE* file = nullptr;
     if (_wfopen_s(&file, filepath.c_str(), L"wb") != 0 || file == nullptr) {
@@ -706,11 +565,9 @@ TrafficExportResult TrafficStorage::ExportTrafficCsv(const TrafficExportOptions&
         return result;
     }
 
-    const bool wrote_bom = fwrite(bom, 1, sizeof(bom), file) == sizeof(bom);
-    const bool wrote_csv = utf8_csv.empty() ||
-        fwrite(utf8_csv.data(), 1, utf8_csv.size(), file) == utf8_csv.size();
+    const bool wrote_csv = fwrite(csv.utf8.data(), 1, csv.utf8.size(), file) == csv.utf8.size();
     const int close_result = fclose(file);
-    if (!wrote_bom || !wrote_csv || close_result != 0) {
+    if (!wrote_csv || close_result != 0) {
         result.error = L"The report could not be written completely.";
         return result;
     }

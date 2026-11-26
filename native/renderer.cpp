@@ -1,7 +1,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "renderer.h"
-#include "update.h"
+#include "startup_diagnostics.h"
 #include <d2d1helper.h>
 #include <wincodec.h>
 #include "speed_tester.h"
@@ -27,6 +27,10 @@
 #include "taskbar_embed.h"
 #include "widget_compositor.h"
 #include "resource.h"
+#include "app_version.h"
+#include "update.h"
+#include "update_preferences.h"
+#include "settings_header_layout.h"
 #include "floating_monitor_settings_layout.h"
 #include "floating_monitor_layout.h"
 #include "taskbar_widget_layout.h"
@@ -36,6 +40,7 @@
 #include "app_traffic_presentation.h"
 #include "warnings_settings_layout.h"
 #include "speed_test_presentation.h"
+#include "speed_test_view.h"
 #include "window_lifecycle.h"
 #include "welcome_tour_preferences.h"
 #include "scoped_handle.h"
@@ -44,9 +49,9 @@ namespace {
 
 bool ReadWindowsLightTaskbarTheme();
 
-std::array<COLORREF, 3> GetFloatingMonitorDefaultColors() {
+std::array<COLORREF, FloatingMonitorSettingsLayout::color_count> GetFloatingMonitorDefaultColors() {
     constexpr COLORREF white = FloatingMonitorLayout::default_text_color;
-    return { white, white, white };
+    return { white, white, white, white, white };
 }
 
 constexpr const wchar_t* kShortMonthNames[] = {
@@ -1158,12 +1163,86 @@ AppRenderer::~AppRenderer() {
     Cleanup();
 }
 
+uint64_t AppRenderer::MainGraphicsTime() const {
+#ifdef WATCHMAN_RENDER_TESTING
+    if (test_main_time_) return test_main_time_;
+#endif
+    return GetTickCount64();
+}
+
 HRESULT AppRenderer::Initialize(HWND hwnd) {
-    HRESULT hr = CreateDeviceIndependentResources();
-    if (SUCCEEDED(hr) && IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
+    // Even an accidental hidden-window paint/initialize request must not pull
+    // dashboard D2D/DWrite/fonts into the quiet widget-first startup path.
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return S_FALSE;
+    const uint64_t now = MainGraphicsTime();
+    if (!main_graphics_retry_.Due(now)) return main_initialization_error_;
+    HRESULT hr = S_OK;
+    if (!main_resources_initialized_) {
+#ifdef WATCHMAN_RENDER_TESTING
+        ++test_main_initialization_attempts_;
+#endif
+        hr = CreateDeviceIndependentResources();
+        main_resources_initialized_ = SUCCEEDED(hr);
+        if (FAILED(hr)) ReleaseMainDeviceIndependentResources(); // Includes partial font/factory setup.
+        WatchmanStartupDiagnostics::Record("main-graphics", SUCCEEDED(hr) ? "initialized" : "failed",
+                                           static_cast<uint32_t>(hr));
+    }
+    if (SUCCEEDED(hr)) {
         hr = CreateDeviceResources(hwnd);
+        if (FAILED(hr)) WatchmanStartupDiagnostics::Record("main-graphics", "target-failed", static_cast<uint32_t>(hr));
+    }
+    main_initialization_error_ = hr;
+    if (FAILED(hr)) {
+        ReleaseMainWindowResources();
+        main_graphics_retry_.Failed(now);
     }
     return hr;
+}
+
+void AppRenderer::DrawMainGraphicsFallback(HWND hwnd) {
+    // No D2D, DWrite, bundled-font or GPU dependency. A deliberately opened
+    // dashboard should explain failure, not leave a featureless white HWND.
+    if (data_limit_edit_ && IsWindowVisible(data_limit_edit_)) {
+        main_editor_suspended_ = true;
+        ShowWindow(data_limit_edit_, SW_HIDE); // Preserve the draft, do not commit/cancel an unseen edit.
+    }
+    HDC dc = GetDC(hwnd);
+    if (!dc) return;
+    const int saved = SaveDC(dc);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const bool dark = effective_theme_ == ThemeMode::Dark;
+    SetDCBrushColor(dc, dark ? RGB(24, 26, 32) : RGB(245, 246, 249));
+    const bool filled = FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(DC_BRUSH))) != 0;
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, dark ? RGB(240, 241, 245) : RGB(32, 34, 42));
+    SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+    RECT title{24, 12, client.right - 100, 38};
+    DrawTextW(dc, L"WATCHMAN", -1, &title, DT_SINGLELINE | DT_VCENTER);
+    const auto bar = MainContentLayout::GetTitlebar(static_cast<float>(client.right));
+    RECT minimize{static_cast<LONG>(bar.minimize_left), 8, static_cast<LONG>(bar.minimize_left + bar.action_size), 40};
+    RECT close{static_cast<LONG>(bar.close_left), 8, static_cast<LONG>(bar.close_left + bar.action_size), 40};
+    DrawFrameControl(dc, &minimize, DFC_CAPTION, DFCS_CAPTIONMIN);
+    DrawFrameControl(dc, &close, DFC_CAPTION, DFCS_CAPTIONCLOSE);
+    RECT text{24, 80, client.right - 24, 190};
+    const int drawn = DrawTextW(dc,
+        L"Dashboard graphics are temporarily unavailable. Watchman will retry automatically.\n\n"
+        L"Monitoring and taskbar recovery run independently of this window.",
+        -1, &text, DT_WORDBREAK | DT_NOPREFIX);
+    wchar_t error[64]{};
+    swprintf_s(error, L"Graphics error: 0x%08lX", static_cast<unsigned long>(main_initialization_error_));
+    RECT detail{24, 198, client.right - 24, 226};
+    DrawTextW(dc, error, -1, &detail, DT_SINGLELINE | DT_NOPREFIX);
+    RECT exit{24, 240, 174, 274};
+    DrawFrameControl(dc, &exit, DFC_BUTTON, DFCS_BUTTONPUSH);
+    DrawTextW(dc, L"Exit Watchman", -1, &exit, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+#ifdef WATCHMAN_RENDER_TESTING
+    if (filled && drawn) ++test_main_fallback_paints_;
+#else
+    (void)filled; (void)drawn;
+#endif
+    if (saved) RestoreDC(dc, saved);
+    ReleaseDC(hwnd, dc);
 }
 
 void AppRenderer::Cleanup() {
@@ -1173,8 +1252,14 @@ void AppRenderer::Cleanup() {
         DestroyWindow(data_limit_edit_);
     }
     data_limit_edit_ = nullptr;
+    main_editor_suspended_ = false;
     ReleaseDeviceResources();
-    
+    ReleaseMainDeviceIndependentResources();
+    main_initialization_error_ = S_OK;
+    main_graphics_retry_.Succeeded();
+}
+
+void AppRenderer::ReleaseMainDeviceIndependentResources() {
     if (format_unit_speed_) { format_unit_speed_->Release(); format_unit_speed_ = nullptr; }
     if (format_title_) { format_title_->Release(); format_title_ = nullptr; }
     if (format_sidebar_) { format_sidebar_->Release(); format_sidebar_ = nullptr; }
@@ -1185,6 +1270,8 @@ void AppRenderer::Cleanup() {
     if (format_titlebar_button_) { format_titlebar_button_->Release(); format_titlebar_button_ = nullptr; }
     if (format_status_) { format_status_->Release(); format_status_ = nullptr; }
     if (format_status_mono_) { format_status_mono_->Release(); format_status_mono_ = nullptr; }
+    if (format_update_footer_) { format_update_footer_->Release(); format_update_footer_ = nullptr; }
+    if (format_update_version_) { format_update_version_->Release(); format_update_version_ = nullptr; }
     if (format_values_) { format_values_->Release(); format_values_ = nullptr; }
     if (format_mono_) { format_mono_->Release(); format_mono_ = nullptr; }
     if (format_chart_tick_) { format_chart_tick_->Release(); format_chart_tick_ = nullptr; }
@@ -1201,6 +1288,9 @@ void AppRenderer::Cleanup() {
     if (format_welcome_title_) { format_welcome_title_->Release(); format_welcome_title_ = nullptr; }
     if (format_welcome_button_) { format_welcome_button_->Release(); format_welcome_button_ = nullptr; }
     if (format_floating_preview_) { format_floating_preview_->Release(); format_floating_preview_ = nullptr; }
+    if (settings_version_layout_) { settings_version_layout_->Release(); settings_version_layout_ = nullptr; }
+    settings_version_text_width_ = settings_title_text_width_ = 0;
+    if (format_settings_version_) { format_settings_version_->Release(); format_settings_version_ = nullptr; }
     if (format_dashboard_value_) { format_dashboard_value_->Release(); format_dashboard_value_ = nullptr; }
     if (format_dashboard_gauge_) { format_dashboard_gauge_->Release(); format_dashboard_gauge_ = nullptr; }
     if (format_picker_title_) { format_picker_title_->Release(); format_picker_title_ = nullptr; }
@@ -1247,6 +1337,7 @@ void AppRenderer::Cleanup() {
     bundled_fonts_.Reset();
     if (dwrite_factory_) { dwrite_factory_->Release(); dwrite_factory_ = nullptr; }
     if (d2d_factory_) { d2d_factory_->Release(); d2d_factory_ = nullptr; }
+    main_resources_initialized_ = false;
 }
 
 HRESULT AppRenderer::CreateDeviceIndependentResources() {
@@ -1268,6 +1359,8 @@ HRESULT AppRenderer::CreateDeviceIndependentResources() {
         FAILED(hr = create_format(UIStyle::FONT_MAIN, DWRITE_FONT_WEIGHT_BOLD, 13.0f, &format_body_bold_)) ||
         FAILED(hr = create_format(UIStyle::FONT_MAIN, DWRITE_FONT_WEIGHT_SEMI_BOLD, UIStyle::TEXT_SMALL, &format_status_)) ||
         FAILED(hr = create_format(UIStyle::FONT_MONO, DWRITE_FONT_WEIGHT_MEDIUM, UIStyle::TEXT_SMALL, &format_status_mono_)) ||
+        FAILED(hr = create_format(UIStyle::FONT_MAIN, DWRITE_FONT_WEIGHT_SEMI_BOLD, WatchmanUpdates::Presentation::footer_font_size, &format_update_footer_)) ||
+        FAILED(hr = create_format(UIStyle::FONT_MAIN, DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.0f, &format_update_version_)) ||
         FAILED(hr = create_format(UIStyle::FONT_VALUES, DWRITE_FONT_WEIGHT_EXTRA_BOLD, 18.0f, &format_values_)) ||
         FAILED(hr = create_format(UIStyle::FONT_MONO, DWRITE_FONT_WEIGHT_MEDIUM, UIStyle::TEXT_SMALL, &format_mono_)) ||
         FAILED(hr = create_format(UIStyle::FONT_MONO, DWRITE_FONT_WEIGHT_MEDIUM, UIStyle::TEXT_SMALL, &format_chart_tick_)) ||
@@ -1278,6 +1371,7 @@ HRESULT AppRenderer::CreateDeviceIndependentResources() {
         FAILED(hr = create_format(UIStyle::FONT_MAIN, DWRITE_FONT_WEIGHT_BOLD, WatchmanWelcome::title_font_size, &format_welcome_title_)) ||
         FAILED(hr = create_format(UIStyle::FONT_MAIN, DWRITE_FONT_WEIGHT_SEMI_BOLD, WatchmanWelcome::button_font_size, &format_welcome_button_)) ||
         FAILED(hr = create_format(UIStyle::FONT_VALUES, DWRITE_FONT_WEIGHT_EXTRA_BOLD, 22.0f, &format_dashboard_value_)) ||
+        FAILED(hr = create_format(UIStyle::FONT_MAIN, DWRITE_FONT_WEIGHT_BOLD, SettingsHeaderLayout::version_font_size, &format_settings_version_)) ||
         FAILED(hr = create_format(UIStyle::FONT_MAIN, DWRITE_FONT_WEIGHT_EXTRA_BOLD, 13.0f, &format_dashboard_gauge_)) ||
         FAILED(hr = create_format(UIStyle::FONT_MAIN, DWRITE_FONT_WEIGHT_EXTRA_BOLD, 12.0f, &format_data_period_)) ||
         FAILED(hr = create_format(UIStyle::FONT_MAIN, DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.0f, &format_data_filter_)) ||
@@ -1328,9 +1422,15 @@ HRESULT AppRenderer::CreateDeviceIndependentResources() {
         return hr;
     }
 
-    // The floating monitor deliberately uses Windows' built-in Segoe UI Bold.
-    // Keep it separate from Inter's private collection, including its previews.
-    hr = dwrite_factory_->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_BOLD,
+#ifdef WATCHMAN_RENDER_TESTING
+    // Fail after real partial allocation so retry tests exercise its cleanup.
+    if (FAILED(test_main_initialization_error_)) return test_main_initialization_error_;
+#endif
+    // Use the same built-in family/default weight as the independent GDI window.
+    // This format also supplies the welcome sample; a settings layout overrides
+    // its own range, never this shared format or the welcome's default weight.
+    hr = dwrite_factory_->CreateTextFormat(FloatingMonitorText::family, nullptr,
+        static_cast<DWRITE_FONT_WEIGHT>(FloatingMonitorText::Value(FloatingMonitorText::default_weight)),
         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
         static_cast<float>(FloatingMonitorLayout::default_font_size), L"", &format_floating_preview_);
     if (FAILED(hr)) return hr;
@@ -1356,11 +1456,32 @@ HRESULT AppRenderer::CreateDeviceIndependentResources() {
     format_dashboard_value_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     format_dashboard_value_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     format_dashboard_value_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+    if (FAILED(hr = SettingsText::ConfigureThemeChoice(format_settings_version_)) ||
+        FAILED(hr = format_settings_version_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER))) return hr;
+    const auto& version_label = WatchmanVersion::Label();
+    if (FAILED(hr = dwrite_factory_->CreateTextLayout(version_label.c_str(),
+        static_cast<UINT32>(version_label.size()), format_settings_version_, 4096, 128,
+        &settings_version_layout_))) return hr;
+    DWRITE_TEXT_METRICS version_metrics{};
+    if (FAILED(hr = settings_version_layout_->GetMetrics(&version_metrics))) return hr;
+    settings_version_text_width_ = version_metrics.widthIncludingTrailingWhitespace;
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> settings_title_measure;
+    if (FAILED(hr = dwrite_factory_->CreateTextLayout(L"SETTINGS", 8, format_dashboard_value_,
+        4096, 128, settings_title_measure.GetAddressOf()))) return hr;
+    DWRITE_TEXT_METRICS title_metrics{};
+    if (FAILED(hr = settings_title_measure->GetMetrics(&title_metrics))) return hr;
+    settings_title_text_width_ = title_metrics.widthIncludingTrailingWhitespace;
     format_dashboard_gauge_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     format_dashboard_gauge_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     format_dashboard_gauge_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     format_status_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     format_status_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    format_update_footer_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    format_update_footer_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    format_update_footer_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    format_update_version_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    format_update_version_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     format_status_mono_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     format_status_mono_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     format_status_mono_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -1477,7 +1598,10 @@ HRESULT AppRenderer::CreateDeviceIndependentResources() {
 
 HRESULT AppRenderer::CreateDeviceResources(HWND hwnd) {
     if (render_target_) return S_OK;
-
+#ifdef WATCHMAN_RENDER_TESTING
+    ++test_main_target_attempts_;
+    if (FAILED(test_main_target_error_)) return test_main_target_error_;
+#endif
     RECT rc;
     GetClientRect(hwnd, &rc);
     D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
@@ -1823,8 +1947,133 @@ void AppRenderer::ReportContentBottom(float bottom) {
     content_bottoms_[index] = std::max(content_bottoms_[index], bottom);
 }
 
+void AppRenderer::SetUpdateResult(const WatchmanUpdates::Result& result) {
+    const auto previous = update_notice_.Key();
+    update_notice_.Apply(result);
+    update_action_status_.clear();
+    if (update_notice_.Key() != previous) {
+        update_download_error_.clear();
+        update_focus_ = 1;
+    }
+    if (!update_notice_.Available()) update_prompt_open_ = update_prompt_requested_ = false;
+}
+
+void AppRenderer::RememberUpdateMarker(const wchar_t* name) {
+#ifndef WATCHMAN_RENDER_TESTING
+    Watchman::ScopedHKey key;
+    const LONG opened = RegCreateKeyExW(HKEY_CURRENT_USER, WatchmanUpdates::preference_path, 0, nullptr,
+        REG_OPTION_NON_VOLATILE, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, key.Put(), nullptr);
+    if (opened != ERROR_SUCCESS || WatchmanUpdates::WriteMarker(key.Get(), name, update_notice_.Key()) != ERROR_SUCCESS)
+        OutputDebugStringW(L"Watchman: could not remember an update notice; the in-memory marker remains active.\n");
+#else
+    (void)name; // Owned-window CTests must not write real update preferences.
+#endif
+}
+
+void AppRenderer::MarkUpdateNotified() {
+    update_notice_.Notified();
+    RememberUpdateMarker(WatchmanUpdates::notified_value);
+}
+
+void AppRenderer::DismissUpdatePrompt() {
+    update_prompt_open_ = update_prompt_requested_ = false;
+    update_notice_.Dismissed();
+    RememberUpdateMarker(WatchmanUpdates::dismissed_value);
+}
+
+void AppRenderer::OfferUpdatePrompt(bool interactive, bool force) {
+    if (force) update_prompt_requested_ = true;
+    if (!interactive || update_prompt_open_ || !update_notice_.Available() ||
+        welcome_tour_.IsOpen() || settings_open_ || speed_consent_open_ || speed_details_open_ ||
+        (data_limit_edit_ && IsWindowVisible(data_limit_edit_))) return;
+    if (!update_prompt_requested_ && !update_notice_.MayPrompt()) return;
+    update_prompt_open_ = true;
+    update_prompt_requested_ = false;
+    update_focus_ = 1;
+    ResetDataChartTooltip();
+}
+
+void AppRenderer::OpenUpdateDownload(HWND hwnd) {
+    if (!update_notice_.Available()) return;
+    // The GitHub Releases API result is notification metadata only. Hand all
+    // installation work to the existing pinned-trust native updater, which
+    // verifies the signed feed and installer before showing its own consent.
+#ifndef WATCHMAN_RENDER_TESTING
+    update_action_status_ = L"Starting the signed official updater...";
+    update_download_error_.clear();
+    CheckForUpdate(hwnd);
+#else
+    (void)hwnd;
+    update_action_status_ = L"The signed updater is disabled in this isolated rendering test.";
+#endif
+}
+
+bool AppRenderer::HandleUpdatePromptKeyDown(HWND hwnd, WPARAM key, bool shift) {
+    if (!update_prompt_open_) return false;
+    if (key == VK_ESCAPE) DismissUpdatePrompt();
+    else if (key == VK_TAB) update_focus_ = (update_focus_ + (shift ? 2 : 1)) % 3;
+    else if (key == VK_RETURN || key == VK_SPACE) {
+        if (update_focus_ == 1) OpenUpdateDownload(hwnd); else DismissUpdatePrompt();
+    }
+    return true; // Never edit/navigate the page behind a modal notice.
+}
+
+void AppRenderer::DrawUpdatePrompt(D2D1_SIZE_F size) {
+    using namespace WatchmanUpdates::Presentation;
+    if (!update_notice_.Available()) return;
+    const auto l = GetLayout(size.width, size.height);
+    const auto rect = [](Rect r) { return D2D1::RectF(r.left, r.top, r.right, r.bottom); };
+    ID2D1SolidColorBrush* scrim = nullptr;
+    if (SUCCEEDED(render_target_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.58f), &scrim))) {
+        render_target_->FillRectangle(D2D1::RectF(0, 0, size.width, size.height), scrim);
+        scrim->Release();
+    }
+    ID2D1SolidColorBrush* surface = nullptr;
+    auto color = palette_.CardBackground;
+    color.a = 1;
+    if (SUCCEEDED(render_target_->CreateSolidColorBrush(color, &surface))) {
+        render_target_->FillRoundedRectangle(D2D1::RoundedRect(rect(l.card), 22, 22), surface);
+        surface->Release();
+    }
+    render_target_->DrawRoundedRectangle(D2D1::RoundedRect(rect(l.card), 22, 22), brush_accent_dl_, 1);
+    render_target_->FillRoundedRectangle(D2D1::RoundedRect(rect(l.icon), 17, 17), brush_action_bg_);
+    DrawVectorIcon(render_target_, VectorIcon::Download,
+        D2D1::RectF(l.icon.left + 17, l.icon.top + 17, l.icon.right - 17, l.icon.bottom - 17), brush_tooltip_text_, 2.5f);
+    const auto text = [&](const std::wstring& value, IDWriteTextFormat* format, Rect area, ID2D1Brush* brush) {
+        render_target_->DrawText(value.c_str(), static_cast<UINT32>(value.size()), format, rect(area), brush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    };
+    text(L"WATCHMAN  /  NEW RELEASE", format_dashboard_label_, l.eyebrow, brush_accent_dl_);
+    text(L"Update available", format_welcome_title_, l.title, brush_text_primary_);
+    text(L"Version " + WatchmanUpdates::VersionText(update_notice_.Available()->version), format_update_version_, l.version, brush_text_primary_);
+    text(L"Installed: " + WatchmanVersion::Label(), format_dashboard_note_, l.installed, brush_text_secondary_);
+    SettingsText::Paragraph body;
+    if (SUCCEEDED(SettingsText::CreateParagraph(dwrite_factory_, format_body_,
+            update_download_error_.empty() ? body_text : update_download_error_.c_str(), l.body.right - l.body.left, body))) {
+        render_target_->PushAxisAlignedClip(rect(l.body), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        render_target_->DrawTextLayout(D2D1::Point2F(l.body.left, l.body.top), body.layout.Get(), brush_text_secondary_);
+        render_target_->PopAxisAlignedClip();
+    }
+    const auto button = [&](Rect area, const wchar_t* label, int focus, bool primary) {
+        const auto round = D2D1::RoundedRect(rect(area), 10, 10);
+        render_target_->FillRoundedRectangle(round, primary ? brush_action_bg_ :
+            (Contains(area, static_cast<float>(mouse_x_), static_cast<float>(mouse_y_)) ? brush_hover_ : brush_popup_bg_));
+        render_target_->DrawRoundedRectangle(round, update_focus_ == focus ? brush_accent_dl_ : brush_card_border_,
+            update_focus_ == focus ? 2.0f : 1.0f);
+        text(label, format_limit_button_, area, primary ? brush_tooltip_text_ : brush_text_primary_);
+    };
+    button(l.download, L"Download now", 1, true);
+    button(l.later, L"Not now", 2, false);
+    if (Contains(l.close, static_cast<float>(mouse_x_), static_cast<float>(mouse_y_)) || update_focus_ == 0)
+        render_target_->DrawRoundedRectangle(D2D1::RoundedRect(rect(l.close), 10, 10), brush_accent_dl_, 1.5f);
+    const float cx = (l.close.left + l.close.right) / 2, cy = (l.close.top + l.close.bottom) / 2;
+    render_target_->DrawLine(D2D1::Point2F(cx - 6, cy - 6), D2D1::Point2F(cx + 6, cy + 6), brush_text_secondary_, 2);
+    render_target_->DrawLine(D2D1::Point2F(cx + 6, cy - 6), D2D1::Point2F(cx - 6, cy + 6), brush_text_secondary_, 2);
+    text(L"Keep monitoring. Update when you're ready.", format_dashboard_note_, l.note, brush_text_secondary_);
+}
+
 void AppRenderer::OfferWelcomeTour(bool interactive) {
-    if (settings_open_ || speed_consent_open_ || speed_details_open_) return;
+    if (update_prompt_open_ || settings_open_ || speed_consent_open_ || speed_details_open_) return;
     if (welcome_tour_.Offer(interactive)) {
         welcome_scroll_ = welcome_scroll_max_ = 0;
         welcome_keyboard_focus_ = true;
@@ -1833,7 +2082,7 @@ void AppRenderer::OfferWelcomeTour(bool interactive) {
 }
 
 void AppRenderer::OpenWelcomeTour() {
-    if (speed_consent_open_ || speed_details_open_) return;
+    if (update_prompt_open_ || speed_consent_open_ || speed_details_open_) return;
     // Replay does not apply or discard an unsaved Settings draft.
     CommitVisibleSettingsEditors();
     if (data_limit_edit_) ShowWindow(data_limit_edit_, SW_HIDE);
@@ -1879,6 +2128,8 @@ bool AppRenderer::HandleWelcomeTourKeyDown(WPARAM key, bool shift) {
 }
 
 void AppRenderer::OnMouseWheel(short delta) {
+    if (MainGraphicsUnavailable()) return;
+    if (update_prompt_open_) return;
     if (welcome_tour_.IsOpen()) {
         welcome_scroll_ = std::clamp(welcome_scroll_ - static_cast<float>(delta) / WHEEL_DELTA * 48.0f,
             0.0f, welcome_scroll_max_);
@@ -1931,6 +2182,7 @@ void AppRenderer::OnMouseWheel(short delta) {
         return;
     }
 
+    reveal_speed_test_ = false; // Explicit navigation always wins over following results.
     const float max_scroll = ContentScrollMax(active_tab_);
     if (max_scroll <= 0.0f) {
         return;
@@ -2184,7 +2436,7 @@ void AppRenderer::SetToolsExportPeriodIndex(int index) {
 void AppRenderer::OnMouseMove(int x, int y) {
     mouse_x_ = x;
     mouse_y_ = y;
-    if (welcome_tour_.IsOpen()) {
+    if (update_prompt_open_ || welcome_tour_.IsOpen()) {
         hovered_titlebar_btn_ = -1;
         hovered_tab_item_ = -1;
         hover_settings_close_ = false;
@@ -2227,7 +2479,7 @@ void AppRenderer::OnMouseMove(int x, int y) {
 }
 
 bool AppRenderer::IsRepeatablePrimaryControl(int x, int y) const {
-    if (welcome_tour_.IsOpen() || speed_consent_open_ || speed_details_open_) return false;
+    if (update_prompt_open_ || welcome_tour_.IsOpen() || speed_consent_open_ || speed_details_open_) return false;
     if (!settings_open_) {
         return MainContentLayout::IsRepeatableTitlebarButton(GetTitlebarButtonAt(
             std::max(render_size_.width, UIStyle::MIN_WINDOW_WIDTH), x, y));
@@ -2242,7 +2494,9 @@ bool AppRenderer::IsRepeatablePrimaryControl(int x, int y) const {
 }
 
 bool AppRenderer::IsTitlebarDragRegion(int x, int y) const {
-    if (welcome_tour_.IsOpen() || settings_open_ || speed_consent_open_ || speed_details_open_ ||
+    if (FAILED(main_initialization_error_))
+        return y >= 0 && y < 48 && GetTitlebarButtonAt(render_size_.width, x, y) < 4;
+    if (update_prompt_open_ || welcome_tour_.IsOpen() || settings_open_ || speed_consent_open_ || speed_details_open_ ||
         y < 0 || y > static_cast<int>(UIStyle::TITLEBAR_HEIGHT)) {
         return false;
     }
@@ -2254,6 +2508,28 @@ bool AppRenderer::IsTitlebarDragRegion(int x, int y) const {
 }
 
 void AppRenderer::OnLButtonDown(HWND hwnd, int x, int y, WatchmanEngine& engine) {
+    if (FAILED(main_initialization_error_)) {
+        const int button = GetTitlebarButtonAt(render_size_.width, x, y);
+        if (button == 4) ShowWindow(hwnd, SW_MINIMIZE);
+        else if (button == 5) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        else if (x >= 24 && x < 174 && y >= 240 && y < 274)
+            PostMessageW(hwnd, WatchmanWindowLifecycle::ExitMessage, 0, 0);
+        return; // Never activate controls hidden behind the failure surface.
+    }
+    if (update_prompt_open_) {
+        const auto layout = WatchmanUpdates::Presentation::GetLayout(render_size_.width, render_size_.height);
+        if (WatchmanUpdates::Presentation::Contains(layout.close, static_cast<float>(x), static_cast<float>(y)) ||
+            WatchmanUpdates::Presentation::Contains(layout.later, static_cast<float>(x), static_cast<float>(y))) DismissUpdatePrompt();
+        else if (WatchmanUpdates::Presentation::Contains(layout.download, static_cast<float>(x), static_cast<float>(y))) OpenUpdateDownload(hwnd);
+        SetFocus(hwnd);
+        return; // Modal: no click-through, including the titlebar controls.
+    }
+    if (!settings_open_ && !welcome_tour_.IsOpen() && !speed_consent_open_ && !speed_details_open_ && update_footer_visible_ &&
+        WatchmanUpdates::Presentation::Contains(WatchmanUpdates::Presentation::FooterLink(render_size_.width, render_size_.height),
+            static_cast<float>(x), static_cast<float>(y))) {
+        OpenUpdateDownload(hwnd);
+        return;
+    }
     if (welcome_tour_.IsOpen()) {
         welcome_keyboard_focus_ = false;
         const auto layout = WatchmanWelcome::GetLayout(render_size_.width, render_size_.height);
@@ -2269,7 +2545,10 @@ void AppRenderer::OnLButtonDown(HWND hwnd, int x, int y, WatchmanEngine& engine)
             speed_details_open_ = false;
         } else if (speed_consent_open_ && IsPointInside(dialog.confirm, x, y)) {
             speed_consent_open_ = false;
-            if (!engine.IsSpeedTestRunning()) engine.RunSpeedTest();
+            if (engine.IsReady() && !engine.IsSpeedTestRunning()) {
+                engine.RunSpeedTest();
+                reveal_speed_test_ = true;
+            }
         } else if (speed_consent_open_ && IsPointInside(dialog.privacy, x, y)) {
             ShellExecuteW(hwnd, L"open", L"https://www.measurementlab.net/privacy/", nullptr, nullptr, SW_SHOWNORMAL);
         }
@@ -2525,6 +2804,16 @@ void AppRenderer::OnLButtonDown(HWND hwnd, int x, int y, WatchmanEngine& engine)
                 settings_appearance_scroll_max_ = layout.scroll_max;
                 if (y < layout.view_top || y > layout.view_bottom) return;
 
+                if (IsPointInside(layout.cpu_row, x, y)) {
+                    preferences_draft_.floating_monitor_show_cpu = !preferences_draft_.floating_monitor_show_cpu;
+                    MarkPreferencesDirty();
+                    return;
+                }
+                if (IsPointInside(layout.memory_row, x, y)) {
+                    preferences_draft_.floating_monitor_show_memory = !preferences_draft_.floating_monitor_show_memory;
+                    MarkPreferencesDirty();
+                    return;
+                }
                 if (IsPointInside(layout.lock_row, x, y)) {
                     preferences_draft_.floating_monitor_lock_position = !preferences_draft_.floating_monitor_lock_position;
                     MarkPreferencesDirty();
@@ -2551,11 +2840,23 @@ void AppRenderer::OnLButtonDown(HWND hwnd, int x, int y, WatchmanEngine& engine)
                 COLORREF* colors[] = {
                     &preferences_draft_.floating_monitor_text_color,
                     &preferences_draft_.floating_monitor_upload_color,
-                    &preferences_draft_.floating_monitor_download_color
+                    &preferences_draft_.floating_monitor_download_color,
+                    &preferences_draft_.floating_monitor_cpu_color,
+                    &preferences_draft_.floating_monitor_memory_color
                 };
                 for (size_t index = 0; index < layout.color_count; ++index) {
                     if (IsPointInside(layout.color_controls[index], x, y)) {
                         ChooseAppearanceColor(hwnd, *colors[index], defaults[index]);
+                        return;
+                    }
+                }
+                for (size_t index = 0; index < layout.weight_controls.size(); ++index) {
+                    if (IsPointInside(layout.weight_controls[index], x, y)) {
+                        const auto weight = FloatingMonitorText::weights[index];
+                        if (preferences_draft_.floating_monitor_text_weight != weight) {
+                            preferences_draft_.floating_monitor_text_weight = weight;
+                            MarkPreferencesDirty();
+                        }
                         return;
                     }
                 }
@@ -3112,6 +3413,7 @@ void AppRenderer::OnLButtonDown(HWND hwnd, int x, int y, WatchmanEngine& engine)
         const float btn_y = layout.speed_test_y + 15.0f;
 
         if (x >= btn_x && x <= btn_x + btn_w && y >= btn_y && y <= btn_y + btn_h) {
+            if (!engine.IsReady()) return;
             if (engine.IsSpeedTestRunning()) {
                 engine.CancelSpeedTest();
             } else {
@@ -3161,7 +3463,7 @@ void AppRenderer::OnLButtonDown(HWND hwnd, int x, int y, WatchmanEngine& engine)
             return;
         }
         if (contains(updates_button)) {
-            CheckForUpdate(hwnd);
+            if (update_notice_.Last().status != WatchmanUpdates::Status::Checking) update_check_requested_ = true;
             return;
         }
         if (contains(period_rect)) {
@@ -3195,20 +3497,32 @@ void AppRenderer::Render(HWND hwnd,
                          const NetworkSnapshot& net_snap, 
                          const AppActivitySnapshot& app_snap,
                          const TrafficHistorySnapshot& hist_snap,
-                         const SpeedTestResult& speed_res,
-                         int speed_prog,
-                         double speed_live,
-                         const std::wstring& speed_stat,
-                         bool speed_running,
+                         const SpeedTestSnapshot& speed,
                          const DiagnosticsSnapshot& diagnostics_snap) {
-    if (FAILED(CreateDeviceResources(hwnd))) return;
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
+    if (FAILED(Initialize(hwnd))) {
+        main_animation_active_ = false;
+        DrawMainGraphicsFallback(hwnd);
+        return;
+    }
+#ifdef WATCHMAN_RENDER_TESTING
+    ++test_main_paints_;
+#endif
+    if (main_editor_suspended_) {
+        if (IsWindow(data_limit_edit_)) ShowWindow(data_limit_edit_, SW_SHOWNOACTIVATE);
+        main_editor_suspended_ = false;
+    }
 
-    // Smooth animations
-    anim_dl_speed_ += (static_cast<float>(dash_snap.download_speed_bps) - anim_dl_speed_) * 0.12f;
-    anim_ul_speed_ += (static_cast<float>(dash_snap.upload_speed_bps) - anim_ul_speed_) * 0.12f;
-    anim_cpu_usage_ += ((CpuReadingAvailable(dash_snap) ? dash_snap.cpu_usage_percent : 0.0f) - anim_cpu_usage_) * 0.15f;
-    anim_ram_usage_ += (dash_snap.ram_usage_percent - anim_ram_usage_) * 0.15f;
-    anim_gpu_usage_ += (dash_snap.gpu_usage_percent - anim_gpu_usage_) * 0.15f;
+    // Animation duration is independent of paint count, input rate or refresh
+    // rate. Numeric readings still show their real sampled values.
+    animation_alpha_ = animation_clock_.Advance(GetTickCount64());
+    anim_dl_speed_ += (static_cast<float>(dash_snap.download_speed_bps) - anim_dl_speed_) * animation_alpha_;
+    anim_ul_speed_ += (static_cast<float>(dash_snap.upload_speed_bps) - anim_ul_speed_) * animation_alpha_;
+    anim_cpu_usage_ += ((CpuReadingAvailable(dash_snap) ? dash_snap.cpu_usage_percent : 0.0f) - anim_cpu_usage_) * animation_alpha_;
+    const float ram_target = WatchmanLiveReadings::MemoryReady(dash_snap, GetTickCount64()) ? dash_snap.ram_usage_percent : 0.0f;
+    const float gpu_target = WatchmanLiveReadings::GpuReady(dash_snap) ? dash_snap.gpu_usage_percent : 0.0f;
+    anim_ram_usage_ += (ram_target - anim_ram_usage_) * animation_alpha_;
+    anim_gpu_usage_ += (gpu_target - anim_gpu_usage_) * animation_alpha_;
     UpdateContentAnimation();
     UpdateDataPickerAnimation();
     if (active_tab_ == ActiveTab::Data) {
@@ -3221,12 +3535,11 @@ void AppRenderer::Render(HWND hwnd,
         data_chart_progress_ = 0.0f;
     }
     
-    // Update charts hist_snap.history
-    speed_history_.erase(speed_history_.begin());
-    speed_history_.push_back({ 
-        dash_snap.download_speed_bps / 8.0 / 1024.0, 
-        dash_snap.upload_speed_bps / 8.0 / 1024.0 
-    });
+    if (chart_sample_gate_.Accept(dash_snap.sample_sequence)) {
+        speed_history_.erase(speed_history_.begin());
+        speed_history_.push_back({dash_snap.download_speed_bps / 8.0 / 1024.0,
+            dash_snap.upload_speed_bps / 8.0 / 1024.0});
+    }
 
     render_target_->BeginDraw();
     render_target_->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
@@ -3239,6 +3552,16 @@ void AppRenderer::Render(HWND hwnd,
 
     // 2. Render only the active tab inside the scrolling content viewport.
     const int active_tab_index = static_cast<int>(active_tab_);
+    if (active_tab_ == ActiveTab::Network && reveal_speed_test_) {
+        const auto network_layout = GetNetworkTabLayout(rt_size.width);
+        const auto status = SpeedTestPresentation::GetStatus(speed.result.download_state, speed.result.upload_state,
+            speed.result.upload_server_confirmed, !speed.result.error_message.empty(), !speed.result.warning_message.empty());
+        const float height = !speed.Running() && status.notice ? 396.0f : network_layout.speed_test_h;
+        content_bottoms_[active_tab_index] = (std::max)(content_bottoms_[active_tab_index], network_layout.speed_test_y + height + 20.0f);
+        content_scroll_offsets_[active_tab_index] = SpeedTestView::RevealOffset(network_layout.speed_test_y, height + 20.0f,
+            ContentViewportTop(), ContentViewportBottom(), CurrentContentScroll());
+        if (!speed.Running()) reveal_speed_test_ = false;
+    }
     ClampContentScroll(active_tab_);
     const float scroll_offset = CurrentContentScroll();
     content_bottoms_[active_tab_index] = ContentViewportBottom();
@@ -3280,7 +3603,7 @@ void AppRenderer::Render(HWND hwnd,
         DrawAppMonitor(rt_size, app_snap);
         break;
     case ActiveTab::Network:
-        DrawNetworkHealth(rt_size, net_snap, dash_snap, speed_res, speed_prog, speed_live, speed_stat, speed_running);
+        DrawNetworkHealth(rt_size, net_snap, dash_snap, speed);
         break;
     case ActiveTab::Tools:
         DrawTools(rt_size, hist_snap, diagnostics_snap);
@@ -3307,11 +3630,23 @@ void AppRenderer::Render(HWND hwnd,
     }
     if (speed_consent_open_ || speed_details_open_) DrawSpeedDialog(rt_size);
     if (welcome_tour_.IsOpen()) DrawWelcomeTour(rt_size);
+    if (update_prompt_open_) DrawUpdatePrompt(rt_size);
 
+    main_animation_active_ = content_animation_started_ms_ != 0 || data_picker_animating_ ||
+        (active_tab_ == ActiveTab::Data && (data_chart_progress_ < 1.0f || data_limit_animating_)) ||
+        (active_tab_ == ActiveTab::Dashboard && !hide_hardware_gauges_ &&
+            (std::abs(anim_cpu_usage_ - (CpuReadingAvailable(dash_snap) ? dash_snap.cpu_usage_percent : 0.0f)) > 0.1f ||
+             std::abs(anim_ram_usage_ - ram_target) > 0.1f ||
+             std::abs(anim_gpu_usage_ - gpu_target) > 0.1f));
     HRESULT hr = render_target_->EndDraw();
-    if (hr == D2DERR_RECREATE_TARGET) {
-        ReleaseDeviceResources();
-    }
+    if (FAILED(hr)) {
+        ReleaseMainWindowResources();
+        main_initialization_error_ = hr;
+        main_graphics_retry_.Failed(MainGraphicsTime());
+        main_animation_active_ = false;
+        WatchmanStartupDiagnostics::Record("main-graphics", "presentation-failed", static_cast<uint32_t>(hr));
+        DrawMainGraphicsFallback(hwnd);
+    } else main_graphics_retry_.Succeeded(); // Only an accepted dashboard frame clears repeated device failures.
 }
 
 void AppRenderer::DrawWelcomeMonitorPreviews(const WatchmanWelcome::Rect& area) {
@@ -3383,7 +3718,7 @@ void AppRenderer::DrawWelcomeMonitorPreviews(const WatchmanWelcome::Rect& area) 
     draw(sample_memory, taskbar.memory_value, format_widget_, memory, true);
     format_widget_->SetTextAlignment(alignment);
 
-    // The real floating strip is network-only, white-on-black in either theme.
+    // Match the real default floating monitor, including its CPU/memory row.
     at(previews.floating);
     const int floating_width = FloatingMonitorLayout::Width(FloatingMonitorLayout::default_font_size);
     const int floating_height = FloatingMonitorLayout::Height();
@@ -3396,6 +3731,10 @@ void AppRenderer::DrawWelcomeMonitorPreviews(const WatchmanWelcome::Rect& area) 
     draw(sample_upload, floating.upload_value, format_floating_preview_, white, false);
     draw(L"DN", floating.download_label, format_floating_preview_, white, false);
     draw(sample_download, floating.download_value, format_floating_preview_, white, false);
+    draw(L"CPU", floating.cpu_label, format_floating_preview_, white, false);
+    draw(sample_cpu, floating.cpu_value, format_floating_preview_, white, false);
+    draw(L"MEM", floating.memory_label, format_floating_preview_, white, false);
+    draw(sample_memory, floating.memory_value, format_floating_preview_, white, false);
     render_target_->SetTransform(previous);
 }
 
@@ -3741,6 +4080,7 @@ void AppRenderer::DrawTabbar(D2D1_SIZE_F rt_size) {
 }
 
 void AppRenderer::DrawStatusbar(D2D1_SIZE_F rt_size, const NetworkSnapshot& net_snap, const DashboardSnapshot& dash_snap) {
+    update_footer_visible_ = false;
     float bar_y = rt_size.height - UIStyle::STATUSBAR_HEIGHT;
     D2D1_RECT_F bar_rect = D2D1::RectF(0.0f, bar_y, rt_size.width, rt_size.height);
     render_target_->FillRectangle(bar_rect, brush_sidebar_bg_);
@@ -3752,6 +4092,15 @@ void AppRenderer::DrawStatusbar(D2D1_SIZE_F rt_size, const NetworkSnapshot& net_
         brush_card_border_,
         1.0f
     );
+
+    // Only transient startup/widget problems replace the ordinary footer.
+    // Full status and numeric errors are available from the tray on demand.
+    if (!runtime_status_.empty() && dash_snap.history_save_error.empty()) {
+        const auto text_bounds = D2D1::RectF(16.0f, bar_y + 1.0f, rt_size.width - 16.0f, rt_size.height - 1.0f);
+        render_target_->DrawText(runtime_status_.c_str(), static_cast<UINT32>(runtime_status_.size()),
+            format_status_, text_bounds, brush_text_primary_, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        return;
+    }
 
     // Tauri keeps this footer compact: an 8px dot, 10px label, and mono uptime.
     const bool is_connected = net_snap.is_connected;
@@ -3788,6 +4137,22 @@ void AppRenderer::DrawStatusbar(D2D1_SIZE_F rt_size, const NetworkSnapshot& net_
 
     const D2D1_RECT_F uptime_rect = D2D1::RectF(rt_size.width - 140.0f, bar_y + 1.0f, rt_size.width - 16.0f, rt_size.height - 1.0f);
     render_target_->DrawText(ss.str().c_str(), static_cast<UINT32>(ss.str().length()), format_status_mono_, uptime_rect, brush_text_primary_);
+
+    if (update_notice_.Available()) {
+        const auto link = WatchmanUpdates::Presentation::FooterLink(rt_size.width, rt_size.height);
+        if (link.right - link.left >= 120) {
+            update_footer_visible_ = true;
+            const auto* label = WatchmanUpdates::Presentation::FooterText(rt_size.width);
+            ID2D1SolidColorBrush* link_brush = brush_accent_dl_;
+            if (effective_theme_ == ThemeMode::Light) {
+                ID2D1SolidColorBrush* contrast = nullptr;
+                if (SUCCEEDED(render_target_->CreateSolidColorBrush(D2D1::ColorF(0x165CC5), &contrast))) link_brush = contrast;
+            }
+            render_target_->DrawText(label, static_cast<UINT32>(wcslen(label)), format_update_footer_,
+                D2D1::RectF(link.left, link.top, link.right, link.bottom), link_brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            if (link_brush != brush_accent_dl_) link_brush->Release();
+        }
+    }
 }
 
 void AppRenderer::FormatSpeedWithUnit(double bytesPerSec, std::wstring& valStr, std::wstring& unitStr) {
@@ -3868,7 +4233,8 @@ void AppRenderer::DrawDashboard(
 
         std::wstring value;
         std::wstring unit;
-        FormatSpeedWithUnit(speed_bps / 8.0, value, unit);
+        if (WatchmanLiveReadings::NetworkReady(dash_snap)) FormatSpeedWithUnit(speed_bps / 8.0, value, unit);
+        else value = L"--";
 
         float value_width = static_cast<float>(value.size()) * 25.0f;
         IDWriteTextLayout* value_layout = nullptr;
@@ -3946,10 +4312,12 @@ void AppRenderer::DrawDashboard(
     draw_outline_surface(status_rect, layout.status_h / 2.0f, is_hovered(status_rect));
     render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(start_x + 39.0f, layout.status_y + 30.0f), 10.0f, 10.0f), brush_accent_sys_);
     const bool history_failed = !dash_snap.history_save_error.empty();
-    const std::wstring status_title = history_failed ? L"HISTORY SAVE FAILED" : L"MONITORING";
+    const std::wstring status_title = history_failed ? L"HISTORY SAVE FAILED" :
+        WatchmanLiveReadings::NetworkReady(dash_snap) ? L"MONITORING" : L"STARTING";
     const std::wstring status_note = history_failed
         ? L"Unsaved usage is in memory; keep Watchman open."
-        : L"Traffic is measured on the selected adapter.";
+        : WatchmanLiveReadings::NetworkReady(dash_snap) ? L"Traffic is measured on the selected adapter."
+        : L"Waiting for the first monitoring sample.";
     render_target_->DrawText(status_title.c_str(), static_cast<UINT32>(status_title.size()), format_body_bold_, D2D1::RectF(start_x + 73.0f, layout.status_y + 12.0f, start_x + content_w - 18.0f, layout.status_y + 32.0f), history_failed && effective_theme_ == ThemeMode::Dark ? brush_limit_warning_ : brush_text_primary_);
     render_target_->DrawText(status_note.c_str(), static_cast<UINT32>(status_note.size()), format_dashboard_note_, D2D1::RectF(start_x + 73.0f, layout.status_y + 33.0f, start_x + content_w - 18.0f, layout.status_y + 52.0f), brush_text_secondary_);
 
@@ -3998,8 +4366,10 @@ void AppRenderer::DrawDashboard(
             : (!dash_snap.gpu_available ? L"Unavailable" : L"Idle"));
     draw_gauge_card(0, dash_snap.cpu_usage_percent, anim_cpu_usage_, L"CPU", cpu_subtitle, palette_.AccentSystem,
         CpuReadingAvailable(dash_snap));
-    draw_gauge_card(1, dash_snap.ram_usage_percent, anim_ram_usage_, L"RAM", ram_stream.str(), D2D1::ColorF(0.16f, 0.37f, 0.78f));
-    draw_gauge_card(2, dash_snap.gpu_usage_percent, anim_gpu_usage_, L"GPU", gpu_subtitle, D2D1::ColorF(0.52f, 0.32f, 0.72f));
+    draw_gauge_card(1, dash_snap.ram_usage_percent, anim_ram_usage_, L"RAM", WatchmanLiveReadings::MemoryReady(dash_snap, sensor_now) ? ram_stream.str() : L"Waiting for reading",
+        D2D1::ColorF(0.16f, 0.37f, 0.78f), WatchmanLiveReadings::MemoryReady(dash_snap, sensor_now));
+    draw_gauge_card(2, dash_snap.gpu_usage_percent, anim_gpu_usage_, L"GPU", gpu_subtitle, D2D1::ColorF(0.52f, 0.32f, 0.72f),
+        WatchmanLiveReadings::GpuReady(dash_snap));
     }
 
     const std::vector<std::pair<std::wstring, std::wstring>> network_rows = {
@@ -4720,11 +5090,12 @@ void AppRenderer::DrawData(D2D1_SIZE_F rt_size, const TrafficHistorySnapshot& hi
             : 0;
     }
     const float limit_target_progress = static_cast<float>(std::clamp(limit_percentage / 100.0, 0.0, 1.0));
-    data_limit_progress_ += (limit_target_progress - data_limit_progress_) * 0.20f;
+    data_limit_progress_ += (limit_target_progress - data_limit_progress_) * animation_alpha_;
     if (std::abs(limit_target_progress - data_limit_progress_) < 0.001f) {
         data_limit_progress_ = limit_target_progress;
     }
 
+    data_limit_animating_ = std::abs(limit_target_progress - data_limit_progress_) >= 0.001f;
     const bool show_limit_usage = data_limit_bytes_ > 0 && limit_percentage > 0.0;
     const std::wstring limit_status = show_limit_usage
         ? FormatBytes(limit_remaining) + L" remaining"
@@ -5507,8 +5878,9 @@ void AppRenderer::DrawAppMonitor(D2D1_SIZE_F rt_size, const AppActivitySnapshot&
     ReportContentBottom(table_rect.bottom + 20.0f);
 }
 
-void AppRenderer::DrawNetworkHealth(D2D1_SIZE_F rt_size, const NetworkSnapshot& net_snap, const DashboardSnapshot& dash_snap, const SpeedTestResult& speed_res, int speed_prog, double speed_live, const std::wstring& speed_stat, bool speed_running) {
-    UNREFERENCED_PARAMETER(dash_snap);
+void AppRenderer::DrawNetworkHealth(D2D1_SIZE_F rt_size, const NetworkSnapshot& net_snap, const DashboardSnapshot& dash_snap, const SpeedTestSnapshot& speed) {
+    const auto& speed_res = speed.result;
+    const bool speed_running = speed.Running();
     const NetworkTabLayout layout = GetNetworkTabLayout(rt_size.width);
     const float start_x = layout.side;
     const float start_y = layout.start_y;
@@ -5531,7 +5903,7 @@ void AppRenderer::DrawNetworkHealth(D2D1_SIZE_F rt_size, const NetworkSnapshot& 
     std::wstring health_label;
     D2D1_COLOR_F status_color = palette_.AccentSystem;
     if (offline) {
-        health_label = !net_snap.is_connected ? L"Disconnected"
+        health_label = !WatchmanLiveReadings::NetworkReady(dash_snap) ? L"Starting..." : !net_snap.is_connected ? L"Disconnected"
             : (net_snap.ping_samples_sent == 0 ? L"Not measured" : L"No ICMP reply");
         status_color = D2D1::ColorF(0.96f, 0.62f, 0.04f);
     } else if (net_snap.packet_loss_percent >= 20.0f ||
@@ -5825,6 +6197,10 @@ void AppRenderer::DrawNetworkHealth(D2D1_SIZE_F rt_size, const NetworkSnapshot& 
         speed_res.upload_server_confirmed, !speed_res.error_message.empty(), !speed_res.warning_message.empty());
     const bool show_notice = !speed_running && result_status.notice;
     const float test_h = show_notice ? 396.0f : layout.speed_test_h;
+#ifdef WATCHMAN_RENDER_TESTING
+    test_speed_card_visible_ = test_y_pos - CurrentContentScroll() >= ContentViewportTop() &&
+        test_y_pos + test_h - CurrentContentScroll() <= ContentViewportBottom();
+#endif
     const D2D1_RECT_F test_rect = D2D1::RectF(
         start_x, test_y_pos, start_x + content_w, test_y_pos + test_h
     );
@@ -5852,99 +6228,46 @@ void AppRenderer::DrawNetworkHealth(D2D1_SIZE_F rt_size, const NetworkSnapshot& 
     bool hover_run = (mouse_x_ >= btn_x && mouse_x_ <= btn_x + btn_w && mouse_y_ >= btn_y && mouse_y_ <= btn_y + btn_h);
     if (hover_run) render_target_->FillRoundedRectangle(btn_round, brush_hover_);
     
-    // Filled button (crimson cancel if running, action blue if idle)
-    ID2D1SolidColorBrush* run_brush = nullptr;
-    D2D1_COLOR_F btn_color = is_test_running ? D2D1::ColorF(0.85f, 0.22f, 0.22f, 1.0f) : palette_.ActionBackground;
-    render_target_->CreateSolidColorBrush(btn_color, &run_brush);
-    render_target_->FillRoundedRectangle(btn_round, run_brush);
-    run_brush->Release();
-
-    D2D1_COLOR_F inv_col = D2D1::ColorF(1.0f, 1.0f, 1.0f);
-    ID2D1SolidColorBrush* run_txt_brush = nullptr;
-    render_target_->CreateSolidColorBrush(inv_col, &run_txt_brush);
-    std::wstring btn_label = is_test_running ? L"CANCEL" : L"RUN TEST";
-    render_target_->DrawText(btn_label.c_str(), static_cast<UINT32>(btn_label.length()), format_limit_button_, btn_rect, run_txt_brush);
-    run_txt_brush->Release();
+    // Reuse target-owned brushes; no per-speed-frame brush allocation.
+    const D2D1_COLOR_F previous_action = brush_action_bg_->GetColor();
+    brush_action_bg_->SetColor(is_test_running ? D2D1::ColorF(0.85f, 0.22f, 0.22f, 1.0f) : palette_.ActionBackground);
+    render_target_->FillRoundedRectangle(btn_round, brush_action_bg_);
+    brush_action_bg_->SetColor(previous_action);
+    const std::wstring btn_label = !speed.available ? L"STARTING" :
+        speed.phase == SpeedTestPhase::Cancelling ? L"WAIT..." : is_test_running ? L"CANCEL" : L"RUN TEST";
+    render_target_->DrawText(btn_label.c_str(), static_cast<UINT32>(btn_label.length()), format_limit_button_, btn_rect, brush_tooltip_text_);
 
     // Table of speed results
     float res_y = test_y_pos + 112.0f;
     const wchar_t* res_keys[] = { speed_running ? L"DOWNLOAD" : result_status.download_label,
-        speed_running ? L"UPLOAD" : result_status.upload_label, L"LATENCY", L"SERVER", L"LAST TESTED" };
+        speed_running ? L"UPLOAD" : result_status.upload_label, L"LATENCY", L"SERVER", speed_running ? L"PROGRESS" : L"LAST TESTED" };
     
-    std::wstring dl_val = L"-";
-    std::wstring ul_val = L"-";
-    std::wstring lat_val = L"-";
-    std::wstring srv_val = L"-";
-    std::wstring stat_val = FormatSpeedTestTimestamp(speed_res.completed_at_unix_seconds);
-
-    int progress = speed_prog;
-    double live_sp = speed_live;
-    auto result = speed_res;
+    const auto& result = speed_res;
+    const std::wstring dl_val = SpeedTestView::Rate(speed, true);
+    const std::wstring ul_val = SpeedTestView::Rate(speed, false);
+    std::wstring lat_val = L"--", srv_val = L"--";
+    std::wstring stat_val = FormatSpeedTestTimestamp(result.completed_at_unix_seconds);
     const auto format_server = [](const SpeedTestResult& value) {
         if (value.server_name.empty()) return std::wstring{};
         if (value.server_city.empty()) return value.server_name;
         return value.server_name + L" \x00B7 " + value.server_city;
     };
-
-    if (is_test_running) {
-        std::wstringstream ss;
-        ss << std::fixed << std::setprecision(1) << live_sp << L" Mbps";
-
-        if (progress < 50) {
-            dl_val = ss.str() + L" (Testing...)";
-        } else {
-            std::wstringstream ss_dl;
-            ss_dl << std::fixed << std::setprecision(1) << result.download_speed_mbps << L" Mbps";
-            dl_val = ss_dl.str();
-
-            if (progress < 90) {
-                ul_val = ss.str() + L" (Testing...)";
-            }
-        }
-
-        if (result.latency_ms > 0.0) {
-            std::wstringstream ssl; ssl << std::fixed << std::setprecision(1) << result.latency_ms << L" ms";
-            lat_val = ssl.str();
-        } else {
-            lat_val = L"Measuring...";
-        }
-
-        if (!result.server_name.empty()) {
-            srv_val = result.server_name + L" · " + result.server_city;
-        } else {
-            srv_val = L"Locating...";
-        }
-
-        std::wstringstream sss; sss << speed_stat << L" (" << progress << L"%)";
-        stat_val = sss.str();
-    } else {
-        if (result.download_speed_mbps > 0.0) {
-            std::wstringstream ss;
-            ss << std::fixed << std::setprecision(1) << result.download_speed_mbps << L" Mbps (" 
-               << std::setprecision(2) << (result.download_speed_mbps / 8.0) << L" MB/s)";
-            dl_val = ss.str();
-        }
-        if (result.upload_speed_mbps > 0.0) {
-            std::wstringstream ss;
-            ss << std::fixed << std::setprecision(1) << speed_res.upload_speed_mbps << L" Mbps (" 
-               << std::setprecision(2) << (result.upload_speed_mbps / 8.0) << L" MB/s)";
-            ul_val = ss.str();
-        }
-        if (result.latency_ms > 0.0) {
-            std::wstringstream ss;
-            ss << std::fixed << std::setprecision(1) << result.latency_ms << L" ms";
-            lat_val = ss.str();
-        }
-        if (!result.server_name.empty()) {
-            srv_val = result.server_name + L" · " + result.server_city;
-        }
-    }
+    if (result.latency_ms > 0.0) {
+        std::wostringstream text;
+        text << std::fixed << std::setprecision(1) << result.latency_ms << L" ms";
+        lat_val = text.str();
+    } else if (speed_running) lat_val = L"Measuring...";
+    if (speed_running) {
+        if (result.server_name.empty()) srv_val = L"Locating...";
+        stat_val = SpeedTestView::Progress(speed);
+    } else if (!speed.available) stat_val = L"Monitoring is starting...";
+    else if (speed.phase == SpeedTestPhase::Cancelled) stat_val = L"Cancelled";
 
     if (!result.server_name.empty()) {
         srv_val = format_server(result);
     }
     if (!is_test_running && !result.error_message.empty()) {
-        if (srv_val == L"-") srv_val = L"M-Lab unavailable";
+        if (srv_val == L"--") srv_val = L"M-Lab unavailable";
         // Keep the actual completion time; the status callout explains failure.
     }
 
@@ -6098,8 +6421,7 @@ void AppRenderer::DrawTools(
         }
     }
 
-    // The updater service will be added alongside packaging. This keeps the
-    // card honest rather than claiming a native build was checked remotely.
+    // Real background check state; never label an offline/failed check current.
     const D2D1_RECT_F updates_card = D2D1::RectF(
         start_x, layout.updates_y, start_x + content_w, layout.updates_y + layout.updates_h
     );
@@ -6110,7 +6432,8 @@ void AppRenderer::DrawTools(
         brush_text_primary_
     );
     const D2D1_RECT_F updates_button = GetToolsHeaderButtonRect(layout, layout.updates_y);
-    draw_button(updates_button, L"CHECK FOR UPDATES", true, true);
+    const bool checking_update = update_notice_.Last().status == WatchmanUpdates::Status::Checking;
+    draw_button(updates_button, checking_update ? L"CHECKING..." : L"CHECK FOR UPDATES", true, !checking_update);
     const D2D1_RECT_F updates_status = D2D1::RectF(
         start_x + 20.0f, layout.updates_y + 56.0f, start_x + content_w - 20.0f, layout.updates_y + 116.0f
     );
@@ -6118,12 +6441,14 @@ void AppRenderer::DrawTools(
     render_target_->FillRoundedRectangle(updates_status_round, brush_sidebar_bg_);
     render_target_->DrawRoundedRectangle(updates_status_round, brush_card_border_, 1.0f);
     render_target_->DrawText(
-        L"WATCHMAN NATIVE C++", 19, format_body_bold_,
+        WatchmanUpdates::StatusText(update_notice_.Last()).c_str(),
+        static_cast<UINT32>(WatchmanUpdates::StatusText(update_notice_.Last()).size()), format_body_bold_,
         D2D1::RectF(start_x + 35.0f, layout.updates_y + 70.0f, start_x + content_w - 35.0f, layout.updates_y + 89.0f),
         brush_text_primary_
     );
     render_target_->DrawText(
-        L"Check the release channel for a newer build", static_cast<UINT32>(wcslen(L"Check the release channel for a newer build")), format_dashboard_note_,
+        (update_action_status_.empty() ? L"Official stable releases - no automatic installation" : update_action_status_.c_str()),
+        static_cast<UINT32>(update_action_status_.empty() ? wcslen(L"Official stable releases - no automatic installation") : update_action_status_.size()), format_dashboard_note_,
         D2D1::RectF(start_x + 35.0f, layout.updates_y + 91.0f, start_x + content_w - 35.0f, layout.updates_y + 107.0f),
         brush_text_secondary_
     );
@@ -6279,6 +6604,8 @@ AppRenderer::PreferencesDraft AppRenderer::CapturePreferences() const {
     draft.widget_mode = widget_mode_;
     draft.network_adapter_id = network_adapter_id_;
     draft.floating_monitor_enabled = floating_monitor_enabled_;
+    draft.floating_monitor_show_cpu = floating_monitor_show_cpu_;
+    draft.floating_monitor_show_memory = floating_monitor_show_memory_;
     draft.floating_monitor_always_on_top = floating_monitor_always_on_top_;
     draft.floating_monitor_lock_position = floating_monitor_lock_position_;
     draft.floating_monitor_click_through = floating_monitor_click_through_;
@@ -6289,14 +6616,27 @@ AppRenderer::PreferencesDraft AppRenderer::CapturePreferences() const {
     draft.floating_monitor_text_color = floating_monitor_text_color_;
     draft.floating_monitor_upload_color = floating_monitor_upload_color_;
     draft.floating_monitor_download_color = floating_monitor_download_color_;
+    draft.floating_monitor_cpu_color = floating_monitor_cpu_color_;
+    draft.floating_monitor_memory_color = floating_monitor_memory_color_;
 
     draft.floating_monitor_font_size = floating_monitor_font_size_;
+    draft.floating_monitor_text_weight = floating_monitor_text_weight_;
     return draft;
 }
 
 void AppRenderer::SetFloatingMonitorEnabled(bool enabled) {
     floating_monitor_enabled_ = enabled;
     if (settings_open_) preferences_draft_.floating_monitor_enabled = enabled;
+}
+
+void AppRenderer::SetFloatingMonitorCpuShown(bool show) {
+    floating_monitor_show_cpu_ = show;
+    if (settings_open_) preferences_draft_.floating_monitor_show_cpu = show;
+}
+
+void AppRenderer::SetFloatingMonitorMemoryShown(bool show) {
+    floating_monitor_show_memory_ = show;
+    if (settings_open_) preferences_draft_.floating_monitor_show_memory = show;
 }
 
 void AppRenderer::SetFloatingMonitorPositionLocked(bool locked) {
@@ -6327,6 +6667,11 @@ void AppRenderer::SetFloatingMonitorOpacity(int opacity) {
 void AppRenderer::SetFloatingMonitorFontSize(int size) {
     floating_monitor_font_size_ = FloatingMonitorLayout::ClampFontSize(size);
     if (settings_open_) preferences_draft_.floating_monitor_font_size = floating_monitor_font_size_;
+}
+
+void AppRenderer::SetFloatingMonitorTextWeight(FloatingMonitorText::Weight weight) {
+    floating_monitor_text_weight_ = FloatingMonitorText::FromSaved(static_cast<int>(weight));
+    if (settings_open_) preferences_draft_.floating_monitor_text_weight = floating_monitor_text_weight_;
 }
 
 void AppRenderer::OpenFloatingMonitorSettings() {
@@ -6372,7 +6717,12 @@ void AppRenderer::UseRecommendedPreferences() {
         preferences_draft_.floating_monitor_text_color = CLR_INVALID;
         preferences_draft_.floating_monitor_upload_color = CLR_INVALID;
         preferences_draft_.floating_monitor_download_color = CLR_INVALID;
+        preferences_draft_.floating_monitor_cpu_color = CLR_INVALID;
+        preferences_draft_.floating_monitor_memory_color = CLR_INVALID;
+        preferences_draft_.floating_monitor_show_cpu = FloatingMonitorLayout::default_show_cpu;
+        preferences_draft_.floating_monitor_show_memory = FloatingMonitorLayout::default_show_memory;
         preferences_draft_.floating_monitor_font_size = FloatingMonitorLayout::default_font_size;
+        preferences_draft_.floating_monitor_text_weight = FloatingMonitorText::default_weight;
         MarkPreferencesDirty();
         return;
     }
@@ -6399,6 +6749,8 @@ void AppRenderer::UseRecommendedPreferences() {
     recommended.widget_enabled = true;
     recommended.widget_mode = TaskbarWidgetMode::All;
     recommended.floating_monitor_enabled = false;
+    recommended.floating_monitor_show_cpu = FloatingMonitorLayout::default_show_cpu;
+    recommended.floating_monitor_show_memory = FloatingMonitorLayout::default_show_memory;
     recommended.floating_monitor_always_on_top = true;
     recommended.floating_monitor_lock_position = false;
     recommended.floating_monitor_click_through = false;
@@ -6409,8 +6761,11 @@ void AppRenderer::UseRecommendedPreferences() {
     recommended.floating_monitor_text_color = CLR_INVALID;
     recommended.floating_monitor_upload_color = CLR_INVALID;
     recommended.floating_monitor_download_color = CLR_INVALID;
+    recommended.floating_monitor_cpu_color = CLR_INVALID;
+    recommended.floating_monitor_memory_color = CLR_INVALID;
 
     recommended.floating_monitor_font_size = FloatingMonitorLayout::default_font_size;
+    recommended.floating_monitor_text_weight = FloatingMonitorText::default_weight;
     preferences_draft_ = std::move(recommended);
     MarkPreferencesDirty();
 }
@@ -6440,6 +6795,8 @@ void AppRenderer::CommitPreferencesDraft() {
     widget_mode_ = preferences_draft_.widget_mode;
     network_adapter_id_ = preferences_draft_.network_adapter_id;
     floating_monitor_enabled_ = preferences_draft_.floating_monitor_enabled;
+    floating_monitor_show_cpu_ = preferences_draft_.floating_monitor_show_cpu;
+    floating_monitor_show_memory_ = preferences_draft_.floating_monitor_show_memory;
     floating_monitor_always_on_top_ = preferences_draft_.floating_monitor_always_on_top;
     floating_monitor_lock_position_ = preferences_draft_.floating_monitor_lock_position;
     floating_monitor_click_through_ = preferences_draft_.floating_monitor_click_through;
@@ -6453,7 +6810,10 @@ void AppRenderer::CommitPreferencesDraft() {
     floating_monitor_text_color_ = preferences_draft_.floating_monitor_text_color;
     floating_monitor_upload_color_ = preferences_draft_.floating_monitor_upload_color;
     floating_monitor_download_color_ = preferences_draft_.floating_monitor_download_color;
+    floating_monitor_cpu_color_ = preferences_draft_.floating_monitor_cpu_color;
+    floating_monitor_memory_color_ = preferences_draft_.floating_monitor_memory_color;
     floating_monitor_font_size_ = FloatingMonitorLayout::ClampFontSize(preferences_draft_.floating_monitor_font_size);
+    floating_monitor_text_weight_ = FloatingMonitorText::FromSaved(static_cast<int>(preferences_draft_.floating_monitor_text_weight));
     SetTheme(preferences_draft_.theme);
     preferences_dirty_ = false;
     preferences_apply_requested_ = true;
@@ -6647,21 +7007,25 @@ void AppRenderer::DrawSettingsModal(D2D1_SIZE_F rt_size, const DashboardSnapshot
     modal_surface->Release();
     render_target_->DrawRoundedRectangle(card_round, brush_chart_grid_, 1.0f);
 
-    const float header_bottom = my + 62.0f;
+    const float header_bottom = my + SettingsHeaderLayout::height;
     const auto replay = WatchmanWelcome::ReplayButton(mx, my, mw);
-    // Reserve the badge's width even at the 360-DIP minimum modal width.
-    const auto badge = D2D1::RectF(replay.left - 68.0f, my + 21.0f, replay.left - 10.0f, my + 45.0f);
-    constexpr wchar_t version[] = L"v" WATCHMAN_VERSION_TEXT;
-    render_target_->DrawText(
-        L"SETTINGS", 8, format_dashboard_value_,
-        D2D1::RectF(mx + 22.0f, my + 14.0f, badge.left - 5.0f, my + 51.0f),
-        brush_text_primary_
-    );
-    const auto pill = D2D1::RoundedRect(badge, 12.0f, 12.0f);
-    render_target_->FillRoundedRectangle(pill, brush_popup_bg_);
-    render_target_->DrawRoundedRectangle(pill, brush_chart_grid_, 1.0f);
-    render_target_->DrawText(version, static_cast<UINT32>(std::size(version) - 1), format_limit_button_,
-        badge, brush_text_primary_);
+    const auto header = SettingsHeaderLayout::Get(mx, my, replay.left,
+        settings_title_text_width_, settings_version_text_width_);
+    const auto rect = [](const SettingsHeaderLayout::Rect& area) {
+        return D2D1::RectF(area.left, area.top, area.right, area.bottom);
+    };
+    render_target_->DrawText(L"SETTINGS", 8, format_dashboard_value_, rect(header.title),
+        brush_text_primary_, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+    // A non-interactive, theme-aware badge identifies the running build on
+    // every Settings page, without displacing Quick tour or the close control.
+    render_target_->FillRoundedRectangle(D2D1::RoundedRect(rect(header.version), 8, 8), brush_active_);
+    settings_version_layout_->SetMaxWidth(header.version_text.right - header.version_text.left);
+    settings_version_layout_->SetMaxHeight(header.version_text.bottom - header.version_text.top);
+    settings_version_layout_->SetFontSize(SettingsHeaderLayout::version_font_size * header.version_font_scale,
+        DWRITE_TEXT_RANGE{0, static_cast<UINT32>(WatchmanVersion::Label().size())});
+    render_target_->DrawTextLayout(D2D1::Point2F(header.version_text.left, header.version_text.top),
+        settings_version_layout_, brush_text_primary_, D2D1_DRAW_TEXT_OPTIONS_CLIP);
     const auto replay_rect = D2D1::RectF(replay.left, replay.top, replay.right, replay.bottom);
     render_target_->FillRoundedRectangle(D2D1::RoundedRect(replay_rect, 8.0f, 8.0f),
         IsPointInside(replay_rect, mouse_x_, mouse_y_) ? brush_active_ : brush_popup_bg_);
@@ -7481,7 +7845,8 @@ void AppRenderer::DrawSettingsModal(D2D1_SIZE_F rt_size, const DashboardSnapshot
                 D2D1::RectF(w.card_left + w.pad, w.alert_top + 16.0f, w.toggle_left - 14.0f, w.alert_top + 34.0f), brush_text_primary_
             );
             render_target_->DrawText(
-                L"Apply rules after Save Changes.", static_cast<UINT32>(wcslen(L"Apply rules after Save Changes.")), format_dashboard_note_,
+                L"Updates + warnings. Save to apply.",
+                static_cast<UINT32>(wcslen(L"Updates + warnings. Save to apply.")), format_dashboard_note_,
                 D2D1::RectF(w.card_left + w.pad, w.alert_top + 45.0f, w.card_right - w.pad, w.alert_bot - 12.0f), brush_text_secondary_
             );
             draw_warning_switch(w.alert_top + 26.0f, draft.alerts_enabled);
@@ -7573,6 +7938,9 @@ void AppRenderer::DrawSettingsModal(D2D1_SIZE_F rt_size, const DashboardSnapshot
                 render_target_->DrawText(detail, static_cast<UINT32>(wcslen(detail)), format_dashboard_note_,
                     D2D1::RectF(row.left, row.top + 26.0f, track.left - 10.0f, row.bottom - 4.0f), brush_text_secondary_);
             };
+            draw_monitor_card(page.readings_card, L"Readings");
+            draw_monitor_toggle(page.cpu_row, L"CPU usage", L"Show live CPU percentage.", draft.floating_monitor_show_cpu);
+            draw_monitor_toggle(page.memory_row, L"Memory usage", L"Show live memory percentage.", draft.floating_monitor_show_memory);
             draw_monitor_toggle(page.lock_row, L"Lock position", L"Drag when unlocked.", draft.floating_monitor_lock_position);
             draw_monitor_toggle(page.transparent_row, L"Transparent", L"Text stays solid.", draft.floating_monitor_transparent_background);
             render_target_->DrawText(L"Panel", 5, format_body_,
@@ -7584,10 +7952,11 @@ void AppRenderer::DrawSettingsModal(D2D1_SIZE_F rt_size, const DashboardSnapshot
             draw_button(page.reset_position, L"Reset position", true, false);
 
             draw_monitor_card(page.colors_card, L"Colors");
-            const wchar_t* labels[] = { L"Values", L"Upload", L"Download" };
+            const wchar_t* labels[] = { L"Values", L"Upload", L"Download", L"CPU", L"Memory" };
             const COLORREF colors[] = {
                 draft.floating_monitor_text_color, draft.floating_monitor_upload_color,
-                draft.floating_monitor_download_color
+                draft.floating_monitor_download_color, draft.floating_monitor_cpu_color,
+                draft.floating_monitor_memory_color
             };
             for (size_t index = 0; index < page.color_count; ++index) {
                 const auto& row = page.color_rows[index];
@@ -7620,8 +7989,19 @@ void AppRenderer::DrawSettingsModal(D2D1_SIZE_F rt_size, const DashboardSnapshot
                 }
             }
 
-            draw_monitor_card(page.font_card, L"Text size");
-            render_target_->DrawText(L"Segoe UI Bold", 13, format_body_, page.font_description, brush_text_primary_);
+            draw_monitor_card(page.font_card, L"Text style");
+            constexpr wchar_t font_description[] = L"Segoe UI \u00b7 Light by default";
+            render_target_->DrawText(font_description, static_cast<UINT32>(wcslen(font_description)),
+                format_dashboard_note_, page.font_description, brush_text_secondary_);
+            render_target_->DrawText(L"Weight", 6, format_body_, page.weight_label, brush_text_primary_);
+            for (size_t index = 0; index < page.weight_controls.size(); ++index) {
+                const auto weight = FloatingMonitorText::weights[index];
+                draw_button(page.weight_controls[index], FloatingMonitorText::Label(weight), true,
+                    draft.floating_monitor_text_weight == weight);
+            }
+            render_target_->DrawText(L"Size", 4, format_body_,
+                D2D1::RectF(page.font_description.left, page.font_minus.top + 8.0f,
+                    page.font_minus.left - 8.0f, page.font_minus.bottom), brush_text_primary_);
             draw_button(page.font_minus, L"\u2212", draft.floating_monitor_font_size > FloatingMonitorLayout::minimum_font_size, false);
             const std::wstring font_size_text = std::to_wstring(draft.floating_monitor_font_size) + L" px";
             draw_button(page.font_value, font_size_text.c_str(), true, false);
@@ -7631,34 +8011,45 @@ void AppRenderer::DrawSettingsModal(D2D1_SIZE_F rt_size, const DashboardSnapshot
                 if (SUCCEEDED(render_target_->CreateSolidColorBrush(
                         D2D1::ColorF(FloatingMonitorLayout::panel_background_color), &preview_brush))) {
                     render_target_->FillRoundedRectangle(D2D1::RoundedRect(page.preview, 8.0f, 8.0f), preview_brush);
-                    const wchar_t sample[] = L"UP   1.2 MB/s   DN   8.6 MB/s";
-                    IDWriteTextLayout* preview_text = nullptr;
-                    if (SUCCEEDED(dwrite_factory_->CreateTextLayout(sample, static_cast<UINT32>(wcslen(sample)), format_floating_preview_,
-                            page.preview.right - page.preview.left - 24.0f, 80.0f, &preview_text))) {
-                        const DWRITE_TEXT_RANGE all{0, static_cast<UINT32>(wcslen(sample))};
+                    std::wstring sample = L"UP   1.2 MB/s   DN   8.6 MB/s";
+                    if (draft.floating_monitor_show_cpu || draft.floating_monitor_show_memory) sample += L"\n";
+                    if (draft.floating_monitor_show_cpu) sample += L"CPU   24%";
+                    if (draft.floating_monitor_show_cpu && draft.floating_monitor_show_memory) sample += L"   ";
+                    if (draft.floating_monitor_show_memory) sample += L"MEM   58%";
+                    Microsoft::WRL::ComPtr<IDWriteTextLayout> preview_text;
+                    if (SUCCEEDED(dwrite_factory_->CreateTextLayout(sample.c_str(), static_cast<UINT32>(sample.size()), format_floating_preview_,
+                            page.preview.right - page.preview.left - 24.0f, page.preview.bottom - page.preview.top - 16.0f,
+                            preview_text.GetAddressOf()))) {
+                        const DWRITE_TEXT_RANGE all{0, static_cast<UINT32>(sample.size())};
                         preview_text->SetFontSize(static_cast<float>(draft.floating_monitor_font_size), all);
+                        preview_text->SetFontWeight(
+                            static_cast<DWRITE_FONT_WEIGHT>(FloatingMonitorText::Value(draft.floating_monitor_text_weight)), all);
                         preview_text->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
                         preview_text->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
                         const auto color = [](COLORREF value) {
                             return D2D1::ColorF(GetRValue(value) / 255.0f, GetGValue(value) / 255.0f, GetBValue(value) / 255.0f);
                         };
                         preview_brush->SetColor(color(colors[0] == CLR_INVALID ? defaults[0] : colors[0]));
-                        ID2D1SolidColorBrush* upload = nullptr;
-                        ID2D1SolidColorBrush* download = nullptr;
-                        render_target_->CreateSolidColorBrush(color(colors[1] == CLR_INVALID ? defaults[1] : colors[1]), &upload);
-                        render_target_->CreateSolidColorBrush(color(colors[2] == CLR_INVALID ? defaults[2] : colors[2]), &download);
-                        if (upload) preview_text->SetDrawingEffect(upload, DWRITE_TEXT_RANGE{0, 2});
-                        if (download) preview_text->SetDrawingEffect(download, DWRITE_TEXT_RANGE{16, 2});
-                        render_target_->DrawTextLayout(D2D1::Point2F(page.preview.left + 12.0f, page.preview.top), preview_text, preview_brush);
-                        preview_text->Release();
-                        if (upload) upload->Release();
-                        if (download) download->Release();
+                        const wchar_t* tokens[] = {L"UP", L"DN", L"CPU", L"MEM"};
+                        for (size_t index = 0; index < std::size(tokens); ++index) {
+                            const size_t start = sample.find(tokens[index]);
+                            if (start == std::wstring::npos) continue;
+                            Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> label_ink;
+                            if (SUCCEEDED(render_target_->CreateSolidColorBrush(
+                                    color(colors[index + 1] == CLR_INVALID ? defaults[index + 1] : colors[index + 1]),
+                                    label_ink.GetAddressOf()))) {
+                                preview_text->SetDrawingEffect(label_ink.Get(),
+                                    DWRITE_TEXT_RANGE{static_cast<UINT32>(start), static_cast<UINT32>(wcslen(tokens[index]))});
+                            }
+                        }
+                        render_target_->DrawTextLayout(D2D1::Point2F(page.preview.left + 12.0f, page.preview.top + 8.0f),
+                            preview_text.Get(), preview_brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
                     }
                     preview_brush->Release();
                 }
                 render_target_->DrawRoundedRectangle(D2D1::RoundedRect(page.preview, 8.0f, 8.0f), brush_card_border_, 1.0f);
             }
-            constexpr wchar_t preview_caption[] = L"Text preview only. Apply with Save Changes.";
+            constexpr wchar_t preview_caption[] = L"No outline. Save Changes to apply.";
             render_target_->DrawText(preview_caption, static_cast<UINT32>(wcslen(preview_caption)), format_dashboard_note_,
                 page.preview_caption, brush_text_secondary_);
             render_target_->PopAxisAlignedClip();
@@ -8162,8 +8553,48 @@ void AppRenderer::RenderWidget(HWND hwnd, const DashboardSnapshot& dash_snap) {
 }
 #endif
 
+void AppRenderer::ResetWidgetHost() {
+    if (widget_compositor_) widget_compositor_->Reset();
+    widget_compositor_.reset();
+    if (widget_render_target_) { widget_render_target_->Release(); widget_render_target_ = nullptr; }
+    widget_composition_failed_ = false;
+    widget_gpu_retry_.Reset();
+    widget_first_frame_.Reset();
+    widget_paint_result_ = {};
+    tm_set_widget_manual_layered_paint(0);
+    tm_set_widget_layered_style(0);
+}
+
+void AppRenderer::InvalidateWidgetFrame() {
+    if (widget_compositor_) widget_compositor_->InvalidateFrame();
+    widget_paint_result_ = {};
+}
+
 void AppRenderer::RenderWidget(HWND hwnd, const DashboardSnapshot& dash_snap) {
-    if (!hwnd) return;
+    uint64_t now = GetTickCount64();
+#ifdef WATCHMAN_RENDER_TESTING
+    if (test_widget_time_) now = test_widget_time_;
+#endif
+    widget_paint_result_.submitted = false;
+    const auto previous = widget_paint_result_;
+    const auto finish = [this, previous, now](WatchmanWidgetRuntime::PaintResult result) {
+        widget_paint_result_ = result;
+        if (result.backend == WatchmanWidgetRuntime::Backend::Gdi)
+            widget_first_frame_.GdiResult(now, result.success);
+        if (result.backend == WatchmanWidgetRuntime::Backend::Gdi) widget_gpu_retry_.GdiFrame(result.success);
+#ifdef WATCHMAN_RENDER_TESTING
+        if (result.success && result.submitted) ++test_widget_submissions_;
+#endif
+        if (previous.success != result.success || previous.backend != result.backend || previous.error != result.error) {
+            const char* event = !result.success ? "presentation-failed"
+                : result.backend == WatchmanWidgetRuntime::Backend::Gdi ? "gdi-presented" : "composition-presented";
+            WatchmanStartupDiagnostics::Record("graphics", event, result.error);
+        }
+    };
+    const auto fail = [&](DWORD error) {
+        finish(WatchmanWidgetRuntime::LayeredResult(false, error ? error : ERROR_GEN_FAILURE));
+    };
+    if (!IsWindow(hwnd)) { fail(ERROR_INVALID_WINDOW_HANDLE); return; }
 
     TaskbarWidgetFrame frame{};
     const auto taskbar_edge = reinterpret_cast<INT_PTR>(GetPropW(hwnd, L"Watchman.TaskbarEdge"));
@@ -8173,14 +8604,16 @@ void AppRenderer::RenderWidget(HWND hwnd, const DashboardSnapshot& dash_snap) {
     frame.dpi = taskbar_dpi != 0 ? static_cast<unsigned>(taskbar_dpi) : 96;
     frame.mode = widget_mode_;
     frame.light_taskbar = ReadWindowsLightTaskbarTheme();
-    frame.upload_text = FormatTaskbarSpeed(static_cast<double>(dash_snap.upload_speed_bps) / 8.0, use_bits_per_second_);
-    frame.download_text = FormatTaskbarSpeed(static_cast<double>(dash_snap.download_speed_bps) / 8.0, use_bits_per_second_);
+    frame.upload_text = WatchmanLiveReadings::NetworkReady(dash_snap)
+        ? FormatTaskbarSpeed(dash_snap.upload_speed_bps / 8.0, use_bits_per_second_) : L"--";
+    frame.download_text = WatchmanLiveReadings::NetworkReady(dash_snap)
+        ? FormatTaskbarSpeed(dash_snap.download_speed_bps / 8.0, use_bits_per_second_) : L"--";
 
     frame.cpu_text = FormatCpuUsage(dash_snap);
 
     std::wstringstream memory_text;
     memory_text << std::fixed << std::setprecision(0) << dash_snap.ram_usage_percent << L"%";
-    frame.memory_text = memory_text.str();
+    frame.memory_text = WatchmanLiveReadings::MemoryReady(dash_snap, GetTickCount64()) ? memory_text.str() : L"--";
     frame.text_color = frame.light_taskbar ? RGB(38, 49, 58) : RGB(255, 255, 255);
     frame.upload_color = frame.light_taskbar ? RGB(209, 63, 131) : RGB(240, 125, 172);
     frame.download_color = frame.light_taskbar ? RGB(0, 120, 212) : RGB(99, 214, 255);
@@ -8188,33 +8621,68 @@ void AppRenderer::RenderWidget(HWND hwnd, const DashboardSnapshot& dash_snap) {
     frame.memory_color = frame.light_taskbar ? RGB(22, 122, 56) : RGB(134, 217, 108);
     frame.font_family = UIStyle::FONT_MONO;
 
-    if (!widget_composition_failed_) {
+    if (widget_composition_failed_ && widget_gpu_retry_.Due(now, widget_gpu_retry_allowed_)) {
+        WatchmanStartupDiagnostics::Record("graphics", "composition-retry");
+        widget_compositor_.reset();
+        tm_set_widget_manual_layered_paint(0);
+        tm_set_widget_layered_style(0);
+        if (tm_apply_widget_styles(hwnd)) widget_composition_failed_ = false;
+        else widget_gpu_retry_.Failed(now);
+    }
+    const bool first_frame_gdi = widget_first_frame_.PreferGdi(now, widget_gpu_retry_allowed_);
+    if (!first_frame_gdi && !widget_composition_failed_) {
+        // A successful fast first frame used a layered window. Return to the
+        // compositor style only when the deferred GPU trial is actually due.
+        tm_set_widget_manual_layered_paint(0);
+        tm_set_widget_layered_style(0);
+        if (!tm_apply_widget_styles(hwnd)) { fail(tm_get_widget_result().error); return; }
         if (!widget_compositor_) {
             widget_compositor_ = std::make_unique<TaskbarWidgetCompositor>();
         }
-        if (widget_compositor_->Render(hwnd, frame)) {
+        const uint64_t submissions = widget_compositor_->SubmissionCount();
+#ifdef WATCHMAN_RENDER_TESTING
+        ++test_composition_attempts_;
+        const bool composition_ok = !test_fail_composition_ && widget_compositor_->Render(hwnd, frame);
+#else
+        const bool composition_ok = widget_compositor_->Render(hwnd, frame);
+#endif
+        if (composition_ok) {
+            widget_gpu_retry_.Reset();
+            finish({true, WatchmanWidgetRuntime::Backend::Composition, 0,
+                    widget_compositor_->SubmissionCount() != submissions});
             return;
         }
+        HRESULT composition_error = widget_compositor_->LastError();
+#ifdef WATCHMAN_RENDER_TESTING
+        if (test_fail_composition_) composition_error = E_ACCESSDENIED;
+#endif
+        WatchmanStartupDiagnostics::Record("graphics", "composition-failed", static_cast<uint32_t>(composition_error));
 
         // DirectComposition is unavailable only on a small set of graphics paths.
         // Keep the old layered renderer as a functional fallback for those systems.
         widget_composition_failed_ = true;
-        tm_set_widget_layered_style(1);
-        tm_set_widget_manual_layered_paint(1);
-        tm_apply_widget_styles(hwnd);
+        widget_gpu_retry_.Failed(now);
     }
 
+    // A latched fallback is retried without reinitializing D3D every second.
+    // Healthy fallback frames permit only a quiet, cooldown-controlled trial.
+    // Failure restores GDI in this same paint; there is no per-tick GPU loop.
+    tm_set_widget_layered_style(1);
+    tm_set_widget_manual_layered_paint(1);
+    if (!tm_apply_widget_styles(hwnd)) { fail(tm_get_widget_result().error); return; }
     RECT rc{};
-    GetClientRect(hwnd, &rc);
+    if (!GetClientRect(hwnd, &rc)) { fail(GetLastError()); return; }
     const UINT width = static_cast<UINT>(std::max<LONG>(1, rc.right - rc.left));
     const UINT height = static_cast<UINT>(std::max<LONG>(1, rc.bottom - rc.top));
     {
         HDC screen_dc = GetDC(nullptr);
-        if (!screen_dc) return;
+        if (!screen_dc) { fail(GetLastError()); return; }
 
         HDC mem_dc = CreateCompatibleDC(screen_dc);
         if (!mem_dc) {
+            const DWORD error = GetLastError();
             ReleaseDC(nullptr, screen_dc);
+            fail(error);
             return;
         }
 
@@ -8229,9 +8697,11 @@ void AppRenderer::RenderWidget(HWND hwnd, const DashboardSnapshot& dash_snap) {
         void* bits = nullptr;
         HBITMAP dib = CreateDIBSection(screen_dc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
         if (!dib || !bits) {
+            const DWORD error = GetLastError();
             if (dib) DeleteObject(dib);
             DeleteDC(mem_dc);
             ReleaseDC(nullptr, screen_dc);
+            fail(error);
             return;
         }
 
@@ -8253,31 +8723,70 @@ void AppRenderer::RenderWidget(HWND hwnd, const DashboardSnapshot& dash_snap) {
             ? CreateDIBSection(screen_dc, &bmi, DIB_RGB_COLORS, &mask_bits, nullptr, 0)
             : nullptr;
         if (!mask_dc || !mask_dib || !mask_bits) {
+            const DWORD error = GetLastError();
             if (mask_dib) DeleteObject(mask_dib);
             if (mask_dc) DeleteDC(mask_dc);
             DeleteObject(dib);
             DeleteDC(mem_dc);
             ReleaseDC(nullptr, screen_dc);
+            fail(error);
             return;
         }
 
-        HGDIOBJ old_bitmap = SelectObject(mem_dc, dib);
-        HGDIOBJ old_mask_bitmap = SelectObject(mask_dc, mask_dib);
+        HGDIOBJ old_bitmap = nullptr, old_mask_bitmap = nullptr, old_font = nullptr;
+        HFONT font = nullptr;
+        const auto selected = [](HGDIOBJ object) { return object && object != HGDI_ERROR; };
+        const auto cleanup = [&] {
+            if (selected(old_font)) SelectObject(mask_dc, old_font);
+            // Delete the DCs before their objects even if restoring a selection
+            // fails. Never leak a still-selected bitmap/font on an error path.
+            if (selected(old_mask_bitmap)) SelectObject(mask_dc, old_mask_bitmap);
+            if (selected(old_bitmap)) SelectObject(mem_dc, old_bitmap);
+            DeleteDC(mask_dc);
+            DeleteDC(mem_dc);
+            if (font) DeleteObject(font);
+            DeleteObject(mask_dib);
+            DeleteObject(dib);
+            ReleaseDC(nullptr, screen_dc);
+        };
+        SetLastError(0);
+#ifdef WATCHMAN_RENDER_TESTING
+        old_bitmap = test_selection_error_ ? (SetLastError(test_selection_error_), nullptr) :
+#else
+        old_bitmap =
+#endif
+            SelectObject(mem_dc, dib);
+        if (!selected(old_bitmap)) {
+            const DWORD error = GetLastError();
+            cleanup(); fail(error); return;
+        }
+        SetLastError(0);
+        old_mask_bitmap = SelectObject(mask_dc, mask_dib);
+        if (!selected(old_mask_bitmap)) {
+            const DWORD error = GetLastError();
+            cleanup(); fail(error); return;
+        }
 
         const auto layout = TaskbarWidgetLayout::Get(static_cast<int>(width), static_cast<int>(height), frame.mode, frame.vertical, frame.dpi, frame.taskbar_edge);
         const wchar_t* widget_font = UIStyle::FONT_MONO;
-        HFONT font = CreateFontW(
+        font = CreateFontW(
             -static_cast<int>(std::round(layout.font_size)), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
             DEFAULT_PITCH | FF_DONTCARE, widget_font
         );
-        HFONT old_font = static_cast<HFONT>(SelectObject(mask_dc, font));
+        if (!font) {
+            const DWORD error = GetLastError();
+            cleanup(); fail(error); return;
+        }
+        SetLastError(0);
+        old_font = SelectObject(mask_dc, font);
+        if (!selected(old_font)) {
+            const DWORD error = GetLastError();
+            cleanup(); fail(error); return;
+        }
 
-        double dl_val = static_cast<double>(dash_snap.download_speed_bps) / 8.0;
-        double ul_val = static_cast<double>(dash_snap.upload_speed_bps) / 8.0;
-
-        const std::wstring up_text = FormatTaskbarSpeed(ul_val, use_bits_per_second_);
-        const std::wstring down_text = FormatTaskbarSpeed(dl_val, use_bits_per_second_);
+        const auto& up_text = frame.upload_text;
+        const auto& down_text = frame.download_text;
         const RECT bounds{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
 
         const COLORREF shadow = light_taskbar ? RGB(255, 255, 255) : RGB(0, 0, 0);
@@ -8344,130 +8853,21 @@ void AppRenderer::RenderWidget(HWND hwnd, const DashboardSnapshot& dash_snap) {
         blend.AlphaFormat = AC_SRC_ALPHA;
         // The taskbar owns this child window's position. Updating only the
         // surface avoids a second position change that can hide or shake it.
-        UpdateLayeredWindow(hwnd, screen_dc, nullptr, &size, mem_dc, &src, 0, &blend, ULW_ALPHA);
+        SetLastError(0);
+#ifdef WATCHMAN_RENDER_TESTING
+        const BOOL accepted = test_layered_error_ ? (SetLastError(test_layered_error_), FALSE) :
+#else
+        const BOOL accepted =
+#endif
+            UpdateLayeredWindow(hwnd, screen_dc, nullptr, &size, mem_dc, &src, 0, &blend, ULW_ALPHA);
+        const DWORD presentation_error = accepted ? ERROR_SUCCESS : GetLastError();
 
-        SelectObject(mask_dc, old_font);
-        DeleteObject(font);
-        SelectObject(mask_dc, old_mask_bitmap);
-        DeleteObject(mask_dib);
-        DeleteDC(mask_dc);
-        SelectObject(mem_dc, old_bitmap);
-        DeleteObject(dib);
-        DeleteDC(mem_dc);
-        ReleaseDC(nullptr, screen_dc);
+        cleanup();
+        finish(WatchmanWidgetRuntime::LayeredResult(accepted != FALSE,
+            presentation_error ? presentation_error : ERROR_GEN_FAILURE));
         return;
     }
 
-    const D2D1_SIZE_U size = D2D1::SizeU(width, height);
-
-    if (widget_render_target_ && widget_render_target_->GetHwnd() != hwnd) {
-        widget_render_target_->Release();
-        widget_render_target_ = nullptr;
-    }
-
-    if (!widget_render_target_) {
-        HRESULT hr = d2d_factory_->CreateHwndRenderTarget(
-            D2D1::RenderTargetProperties(
-                D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
-            ),
-            D2D1::HwndRenderTargetProperties(hwnd, size, D2D1_PRESENT_OPTIONS_IMMEDIATELY),
-            &widget_render_target_
-        );
-        if (FAILED(hr)) return;
-    } else if (widget_render_target_->GetPixelSize().width != width ||
-               widget_render_target_->GetPixelSize().height != height) {
-        widget_render_target_->Resize(size);
-    }
-
-    const bool light_taskbar = ReadWindowsLightTaskbarTheme();
-    const COLORREF bg_color = SampleTaskbarBackground(hwnd, light_taskbar);
-    auto to_d2d = [](COLORREF color) {
-        return D2D1::ColorF(
-            GetRValue(color) / 255.0f,
-            GetGValue(color) / 255.0f,
-            GetBValue(color) / 255.0f,
-            1.0f
-        );
-    };
-
-    ID2D1SolidColorBrush* bg_brush = nullptr;
-    ID2D1SolidColorBrush* shadow_brush = nullptr;
-    ID2D1SolidColorBrush* value_brush = nullptr;
-    ID2D1SolidColorBrush* up_brush = nullptr;
-    ID2D1SolidColorBrush* down_brush = nullptr;
-    ID2D1SolidColorBrush* cpu_brush = nullptr;
-    ID2D1SolidColorBrush* mem_brush = nullptr;
-
-    widget_render_target_->CreateSolidColorBrush(to_d2d(bg_color), &bg_brush);
-    widget_render_target_->CreateSolidColorBrush(to_d2d(light_taskbar ? RGB(255, 255, 255) : RGB(0, 0, 0)), &shadow_brush);
-    widget_render_target_->CreateSolidColorBrush(to_d2d(light_taskbar ? RGB(38, 49, 58) : RGB(255, 255, 255)), &value_brush);
-    widget_render_target_->CreateSolidColorBrush(to_d2d(light_taskbar ? RGB(209, 63, 131) : RGB(240, 125, 172)), &up_brush);
-    widget_render_target_->CreateSolidColorBrush(to_d2d(light_taskbar ? RGB(0, 120, 212) : RGB(99, 214, 255)), &down_brush);
-    widget_render_target_->CreateSolidColorBrush(to_d2d(light_taskbar ? RGB(164, 95, 0) : RGB(243, 182, 74)), &cpu_brush);
-    widget_render_target_->CreateSolidColorBrush(to_d2d(light_taskbar ? RGB(22, 122, 56) : RGB(134, 217, 108)), &mem_brush);
-
-    widget_render_target_->BeginDraw();
-    widget_render_target_->FillRectangle(D2D1::RectF(0, 0, static_cast<float>(width), static_cast<float>(height)), bg_brush);
-
-    double dl_val = static_cast<double>(dash_snap.download_speed_bps) / 8.0;
-    double ul_val = static_cast<double>(dash_snap.upload_speed_bps) / 8.0;
-
-    std::wstring dl_str, dl_unit;
-    FormatSpeedWithUnit(dl_val, dl_str, dl_unit);
-
-    std::wstring ul_str, ul_unit;
-    FormatSpeedWithUnit(ul_val, ul_str, ul_unit);
-
-    auto shortUnit = [](const std::wstring& unit) {
-        if (unit.empty()) return std::wstring();
-        if (unit[0] == L'B') return std::wstring(L"B/s");
-        return unit.substr(0, 1);
-    };
-
-    const std::wstring up_text = ul_str + L" " + shortUnit(ul_unit);
-    const std::wstring down_text = dl_str + L" " + shortUnit(dl_unit);
-    const float row_h = std::max(1.0f, static_cast<float>(height) / 2.0f);
-    const float value_right = IsWidgetNetworkOnly() ? static_cast<float>(width - 2) : 82.0f;
-
-    auto draw_text = [&](const std::wstring& text, D2D1_RECT_F rect, DWRITE_TEXT_ALIGNMENT alignment, ID2D1Brush* brush) {
-        if (!brush || !shadow_brush) return;
-        format_widget_->SetTextAlignment(alignment);
-        D2D1_RECT_F shadow_rect = rect;
-        shadow_rect.top += 1.0f;
-        shadow_rect.bottom += 1.0f;
-        widget_render_target_->DrawText(text.c_str(), static_cast<UINT32>(text.length()), format_widget_, shadow_rect, shadow_brush);
-        widget_render_target_->DrawText(text.c_str(), static_cast<UINT32>(text.length()), format_widget_, rect, brush);
-    };
-
-    draw_text(L"\u2191", D2D1::RectF(4.0f, 0.0f, 18.0f, row_h), DWRITE_TEXT_ALIGNMENT_LEADING, up_brush);
-    draw_text(up_text, D2D1::RectF(18.0f, 0.0f, value_right, row_h), DWRITE_TEXT_ALIGNMENT_TRAILING, value_brush);
-    draw_text(L"\u2193", D2D1::RectF(4.0f, row_h, 18.0f, static_cast<float>(height)), DWRITE_TEXT_ALIGNMENT_LEADING, down_brush);
-    draw_text(down_text, D2D1::RectF(18.0f, row_h, value_right, static_cast<float>(height)), DWRITE_TEXT_ALIGNMENT_TRAILING, value_brush);
-
-    if (TaskbarWidgetModes::ShowsSystem(widget_mode_)) {
-        std::wstringstream cpu_ss;
-        cpu_ss << L"CPU " << FormatCpuUsage(dash_snap);
-        draw_text(cpu_ss.str(), D2D1::RectF(88.0f, 0.0f, static_cast<float>(width - 2), row_h), DWRITE_TEXT_ALIGNMENT_LEADING, cpu_brush);
-
-        std::wstringstream mem_ss;
-        mem_ss << L"MEM " << std::fixed << std::setprecision(0) << dash_snap.ram_usage_percent << L"%";
-        draw_text(mem_ss.str(), D2D1::RectF(88.0f, row_h, static_cast<float>(width - 2), static_cast<float>(height)), DWRITE_TEXT_ALIGNMENT_LEADING, mem_brush);
-    }
-
-    HRESULT hr = widget_render_target_->EndDraw();
-    if (hr == D2DERR_RECREATE_TARGET) {
-        widget_render_target_->Release();
-        widget_render_target_ = nullptr;
-    }
-
-    if (bg_brush) bg_brush->Release();
-    if (shadow_brush) shadow_brush->Release();
-    if (value_brush) value_brush->Release();
-    if (up_brush) up_brush->Release();
-    if (down_brush) down_brush->Release();
-    if (cpu_brush) cpu_brush->Release();
-    if (mem_brush) mem_brush->Release();
 }
 
 void AppRenderer::RenderFloatingMonitor(HWND hwnd, HDC hdc, const DashboardSnapshot& dash_snap) {
@@ -8509,30 +8909,26 @@ void AppRenderer::RenderFloatingMonitor(HWND hwnd, HDC hdc, const DashboardSnaps
     const COLORREF primary = floating_monitor_text_color_ == CLR_INVALID ? defaults[0] : floating_monitor_text_color_;
     const COLORREF upload = floating_monitor_upload_color_ == CLR_INVALID ? defaults[1] : floating_monitor_upload_color_;
     const COLORREF download = floating_monitor_download_color_ == CLR_INVALID ? defaults[2] : floating_monitor_download_color_;
-    HFONT font = CreateFontW(-FloatingMonitorLayout::ClampFontSize(floating_monitor_font_size_), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    // Grayscale antialiasing into a coverage mask, then tint once. No ClearType
+    // color fringes, artificial stroke, or color-dependent contrast halo.
+    HFONT font = CreateFontW(-FloatingMonitorLayout::ClampFontSize(floating_monitor_font_size_), 0, 0, 0,
+        FloatingMonitorText::Value(floating_monitor_text_weight_), FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+        FloatingMonitorText::GdiFamily(floating_monitor_text_weight_));
     if (!font) return;
     HGDIOBJ old_font = SelectObject(mask.dc, font);
-    const auto layout = FloatingMonitorLayout::Get(width, height, floating_monitor_font_size_);
+    const auto layout = FloatingMonitorLayout::Get(width, height, floating_monitor_font_size_,
+        floating_monitor_show_cpu_, floating_monitor_show_memory_);
     const auto draw_text = [&](const std::wstring& text, const FloatingMonitorLayout::Rect& area, COLORREF color, bool align_right) {
         const RECT rect{ area.left, area.top, area.right, area.bottom };
         const UINT flags = (align_right ? DT_RIGHT : DT_LEFT) | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
-        if (transparent || floating_monitor_opacity_ < 100) {
-            // Outline on every side gives contrast on arbitrary desktops without
-            // capturing the screen or guessing its color from the app theme.
-            const COLORREF outline = GetRValue(color) + GetGValue(color) + GetBValue(color) < 384 ? RGB(255, 255, 255) : RGB(0, 0, 0);
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    if (dx == 0 && dy == 0) continue;
-                    RECT edge = rect;
-                    OffsetRect(&edge, dx, dy);
-                    DrawLayeredWidgetText(mask.dc, mask.pixels, surface.pixels, pixel_count, bounds, text, edge, flags, outline, 255);
-                }
-            }
-        }
         DrawLayeredWidgetText(mask.dc, mask.pixels, surface.pixels, pixel_count, bounds, text, rect, flags, color, 255);
     };
     const auto draw_speed = [&](double bytes_per_second, const FloatingMonitorLayout::Rect& area) {
+        if (!WatchmanLiveReadings::NetworkReady(dash_snap)) {
+            draw_text(L"--", area, primary, false);
+            return;
+        }
         std::wstring text = FormatTaskbarSpeed(bytes_per_second, use_bits_per_second_);
         const size_t separator = text.find(L' ');
         const std::wstring unit = text.substr(separator + 1);
@@ -8568,8 +8964,26 @@ void AppRenderer::RenderFloatingMonitor(HWND hwnd, HDC hdc, const DashboardSnaps
     draw_speed(dash_snap.upload_speed_bps / 8.0, layout.upload_value);
     draw_text(L"DN", layout.download_label, download, false);
     draw_speed(dash_snap.download_speed_bps / 8.0, layout.download_value);
+    if (floating_monitor_show_cpu_) {
+        const COLORREF cpu = floating_monitor_cpu_color_ == CLR_INVALID ? defaults[3] : floating_monitor_cpu_color_;
+        draw_text(L"CPU", layout.cpu_label, cpu, false);
+        draw_text(FormatCpuUsage(dash_snap), layout.cpu_value, primary, false);
+    }
+    if (floating_monitor_show_memory_) {
+        const COLORREF memory = floating_monitor_memory_color_ == CLR_INVALID ? defaults[4] : floating_monitor_memory_color_;
+        draw_text(L"MEM", layout.memory_label, memory, false);
+        std::wostringstream text;
+        text << std::fixed << std::setprecision(0) << dash_snap.ram_usage_percent << L"%";
+        draw_text(WatchmanLiveReadings::MemoryReady(dash_snap, GetTickCount64()) ? text.str() : L"--",
+            layout.memory_value, primary, false);
+    }
     SelectObject(mask.dc, old_font);
     DeleteObject(font);
+#ifdef WATCHMAN_RENDER_TESTING
+    // Owned native fixture inspects the actual premultiplied production pixels.
+    // This copy and its accessors do not exist in the shipped executable.
+    test_floating_pixels_.assign(surface.pixels, surface.pixels + pixel_count);
+#endif
 
     SIZE size{ width, height };
     POINT origin{ 0, 0 };
@@ -8578,7 +8992,18 @@ void AppRenderer::RenderFloatingMonitor(HWND hwnd, HDC hdc, const DashboardSnaps
     // Panel opacity is baked into its pixels; never fade the text with it.
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
-    UpdateLayeredWindow(hwnd, nullptr, nullptr, &size, surface.dc, &origin, 0, &blend, ULW_ALPHA);
+    SetLastError(0);
+    const BOOL accepted = UpdateLayeredWindow(hwnd, nullptr, nullptr, &size, surface.dc, &origin, 0, &blend, ULW_ALPHA);
+    const DWORD error = accepted ? ERROR_SUCCESS : GetLastError();
+#ifdef WATCHMAN_RENDER_TESTING
+    if (accepted) ++test_floating_submissions_;
+#endif
+    static DWORD previous_error = ERROR_SUCCESS;
+    const DWORD result = accepted ? ERROR_SUCCESS : (error ? error : ERROR_GEN_FAILURE);
+    if (result != previous_error) {
+        WatchmanStartupDiagnostics::Record("floating-graphics", accepted ? "gdi-presented" : "presentation-failed", result);
+        previous_error = result;
+    }
 }
 
 std::wstring AppRenderer::FormatBytes(uint64_t bytes) {
@@ -8633,6 +9058,12 @@ void AppRenderer::SetWidgetMode(TaskbarWidgetMode mode) {
 }
 
 void AppRenderer::LoadSettings() {
+    {
+        Watchman::ScopedHKey updates;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, WatchmanUpdates::preference_path, 0, KEY_QUERY_VALUE, updates.Put()) == ERROR_SUCCESS)
+            update_notice_.Load(WatchmanUpdates::ReadMarker(updates.Get(), WatchmanUpdates::notified_value),
+                WatchmanUpdates::ReadMarker(updates.Get(), WatchmanUpdates::dismissed_value));
+    }
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Watchman", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         DWORD dwType = REG_DWORD;
@@ -8671,8 +9102,10 @@ void AppRenderer::LoadSettings() {
         if (read_dword(L"UnitModeBits", val)) use_bits_per_second_ = val != 0;
         if (read_dword(L"HideHardwareGauges", val)) hide_hardware_gauges_ = val != 0;
         if (read_dword(L"FloatingMonitor", val)) floating_monitor_enabled_ = val != 0;
-        // Legacy CPU/memory toggles and system color are intentionally ignored:
-        // the floating monitor always contains only upload and download.
+        // Reuse the original independent visibility keys, preserving explicit
+        // choices on upgrade. Missing keys use the new CPU+memory defaults.
+        if (read_dword(L"FloatingMonitorCpu", val)) floating_monitor_show_cpu_ = val != 0;
+        if (read_dword(L"FloatingMonitorMemory", val)) floating_monitor_show_memory_ = val != 0;
         if (read_dword(L"FloatingMonitorTopmost", val)) floating_monitor_always_on_top_ = val != 0;
         if (read_dword(L"FloatingMonitorLocked", val)) floating_monitor_lock_position_ = val != 0;
         if (read_dword(L"FloatingMonitorClickThrough", val)) floating_monitor_click_through_ = val != 0;
@@ -8684,9 +9117,13 @@ void AppRenderer::LoadSettings() {
         if (read_dword(L"FloatingTextColor", val)) floating_monitor_text_color_ = static_cast<COLORREF>(val);
         if (read_dword(L"FloatingUploadColor", val)) floating_monitor_upload_color_ = static_cast<COLORREF>(val);
         if (read_dword(L"FloatingDownloadColor", val)) floating_monitor_download_color_ = static_cast<COLORREF>(val);
+        if (read_dword(L"FloatingCpuColor", val)) floating_monitor_cpu_color_ = static_cast<COLORREF>(val);
+        if (read_dword(L"FloatingMemoryColor", val)) floating_monitor_memory_color_ = static_cast<COLORREF>(val);
 
-        // Ignore legacy family overrides; only the bounded text size is customizable.
+        // Ignore old family overrides. Missing weight keys intentionally get the
+        // new Light default, without discarding saved size, colors, or behavior.
         if (read_dword(L"FloatingMonitorFontSize", val)) floating_monitor_font_size_ = FloatingMonitorLayout::ClampFontSize(static_cast<int>(val));
+        if (read_dword(L"FloatingMonitorTextWeight", val)) floating_monitor_text_weight_ = FloatingMonitorText::FromSaved(static_cast<int>(val));
         DWORD display_type = REG_SZ;
         DWORD display_size = 0;
         if (RegQueryValueExW(hKey, L"FloatingMonitorDisplay", nullptr, &display_type, nullptr, &display_size) == ERROR_SUCCESS &&
@@ -8752,38 +9189,53 @@ void AppRenderer::LoadSettings() {
         }
         RegCloseKey(hKey);
     }
+    saved_preferences_ = SavedPreferences{CapturePreferences(), floating_monitor_x_, floating_monitor_y_};
 }
 
 void AppRenderer::SaveSettings() {
+    const SavedPreferences current{CapturePreferences(), floating_monitor_x_, floating_monitor_y_};
+    if (saved_preferences_ && saved_preferences_->values == current.values &&
+        saved_preferences_->x == current.x && saved_preferences_->y == current.y) return;
+#ifdef WATCHMAN_STARTUP_RECOVERY_TESTING
+    // Owned fake-display/window tests must never modify the real user's HKCU.
+    // Normal-EXE desktop smoke separately validates actual settings persistence.
+    saved_preferences_ = current;
+    ++test_settings_writes_;
+    return;
+#endif
     HKEY hKey;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Watchman", 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        bool saved = true;
+        const auto write_value = [&](const wchar_t* name, DWORD type, const BYTE* bytes, DWORD size) {
+            const LONG result = RegSetValueExW(hKey, name, 0, type, bytes, size);
+            saved = saved && result == ERROR_SUCCESS;
+            return result;
+        };
         DWORD val = autostart_enabled_ ? 1 : 0;
-        RegSetValueExW(hKey, L"Autostart", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
+        write_value(L"Autostart", REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
         val = alerts_enabled_ ? 1 : 0;
-        RegSetValueExW(hKey, L"Alerts", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
+        write_value(L"Alerts", REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
         val = widget_enabled_ ? 1 : 0;
-        RegSetValueExW(hKey, L"Widget", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
+        write_value(L"Widget", REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
         val = static_cast<DWORD>(widget_mode_);
-        RegSetValueExW(hKey, L"WidgetMode", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
+        write_value(L"WidgetMode", REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
         val = IsWidgetNetworkOnly() ? 1 : 0;
-        RegSetValueExW(hKey, L"WidgetNetworkOnly", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
-        const auto write_dword = [hKey](const wchar_t* name, DWORD value) {
-            RegSetValueExW(hKey, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+        write_value(L"WidgetNetworkOnly", REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
+        const auto write_dword = [&](const wchar_t* name, DWORD value) {
+            write_value(name, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
         };
         write_dword(L"UnitModeBits", use_bits_per_second_ ? 1 : 0);
         write_dword(L"HideHardwareGauges", hide_hardware_gauges_ ? 1 : 0);
         write_dword(L"FloatingMonitor", floating_monitor_enabled_ ? 1 : 0);
+        write_dword(L"FloatingMonitorCpu", floating_monitor_show_cpu_ ? 1 : 0);
+        write_dword(L"FloatingMonitorMemory", floating_monitor_show_memory_ ? 1 : 0);
         write_dword(L"FloatingMonitorTopmost", floating_monitor_always_on_top_ ? 1 : 0);
         write_dword(L"FloatingMonitorLocked", floating_monitor_lock_position_ ? 1 : 0);
         write_dword(L"FloatingMonitorClickThrough", floating_monitor_click_through_ ? 1 : 0);
         write_dword(L"FloatingMonitorTransparentBackground", floating_monitor_transparent_background_ ? 1 : 0);
         write_dword(L"FloatingMonitorOpacity", static_cast<DWORD>(FloatingMonitorLayout::ClampOpacity(floating_monitor_opacity_)));
         const DWORD display_device_size = static_cast<DWORD>((floating_monitor_display_device_.size() + 1) * sizeof(wchar_t));
-        RegSetValueExW(
-            hKey,
-            L"FloatingMonitorDisplay",
-            0,
-            REG_SZ,
+        write_value(L"FloatingMonitorDisplay", REG_SZ,
             reinterpret_cast<const BYTE*>(floating_monitor_display_device_.c_str()),
             display_device_size
         );
@@ -8793,8 +9245,11 @@ void AppRenderer::SaveSettings() {
         write_dword(L"FloatingTextColor", static_cast<DWORD>(floating_monitor_text_color_));
         write_dword(L"FloatingUploadColor", static_cast<DWORD>(floating_monitor_upload_color_));
         write_dword(L"FloatingDownloadColor", static_cast<DWORD>(floating_monitor_download_color_));
+        write_dword(L"FloatingCpuColor", static_cast<DWORD>(floating_monitor_cpu_color_));
+        write_dword(L"FloatingMemoryColor", static_cast<DWORD>(floating_monitor_memory_color_));
 
         write_dword(L"FloatingMonitorFontSize", static_cast<DWORD>(FloatingMonitorLayout::ClampFontSize(floating_monitor_font_size_)));
+        write_dword(L"FloatingMonitorTextWeight", static_cast<DWORD>(FloatingMonitorText::Value(floating_monitor_text_weight_)));
         write_dword(L"WarningTrafficEnabled", traffic_warning_enabled_ ? 1 : 0);
         write_dword(L"WarningTrafficThreshold", static_cast<DWORD>(std::max(0, traffic_warning_threshold_)));
         write_dword(L"WarningTrafficGB", traffic_warning_gigabytes_ ? 1 : 0);
@@ -8809,25 +9264,18 @@ void AppRenderer::SaveSettings() {
         write_dword(L"WarningMainboardTempEnabled", mainboard_temp_warning_enabled_ ? 1 : 0);
         write_dword(L"WarningMainboardTempThreshold", static_cast<DWORD>(std::max(0, mainboard_temp_warning_threshold_)));
         const DWORD adapter_id_size = static_cast<DWORD>((network_adapter_id_.size() + 1) * sizeof(wchar_t));
-        RegSetValueExW(
-            hKey,
-            L"NetworkAdapterId",
-            0,
-            REG_SZ,
+        write_value(L"NetworkAdapterId", REG_SZ,
             reinterpret_cast<const BYTE*>(network_adapter_id_.c_str()),
             adapter_id_size
         );
         val = static_cast<DWORD>(current_theme_);
-        RegSetValueExW(hKey, L"Theme", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
+        write_value(L"Theme", REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(DWORD));
         const ULONGLONG data_limit = data_limit_bytes_;
-        RegSetValueExW(
-            hKey,
-            L"DataLimitBytes",
-            0,
-            REG_QWORD,
+        write_value(L"DataLimitBytes", REG_QWORD,
             reinterpret_cast<const BYTE*>(&data_limit),
             sizeof(data_limit)
         );
         RegCloseKey(hKey);
+        if (saved) saved_preferences_ = current;
     }
 }

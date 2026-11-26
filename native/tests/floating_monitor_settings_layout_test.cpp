@@ -23,19 +23,40 @@ void CheckLayout(float width, float height, float requested_scroll) {
     const auto page = GetFloatingMonitorSettingsLayout(left, right, modal_top, height, requested_scroll);
     Check(page.view_top < page.view_bottom, "Content viewport must have positive height");
     Check(page.scroll_offset >= 0.0f && page.scroll_offset <= page.scroll_max, "Scroll offset must be clamped");
-    Check(page.colors_card.top - page.controls_card.bottom >= 16.0f, "Behavior and color cards need a readable gap");
+    Check(page.readings_card.bottom + 16.0f <= page.font_card.top, "Text style follows Readings with a readable gap");
+    Check(page.cpu_row.top >= page.readings_card.top + 44.0f && page.cpu_row.bottom <= page.memory_row.top,
+        "CPU and memory toggles need their own rows below the Readings title");
+    Check(page.memory_row.bottom < page.readings_card.bottom, "Readings need bottom padding");
+    for (const auto& row : {page.cpu_row, page.memory_row}) {
+        Check(row.left > page.readings_card.left && row.right < page.readings_card.right && row.bottom - row.top >= 48.0f,
+            "Independent reading toggles need usable hit targets inside their card");
+    }
+    Check(page.colors_card.top - page.font_card.bottom >= 16.0f, "Colors follow Text style with a readable gap");
+    Check(page.controls_card.top - page.colors_card.bottom >= 16.0f, "Behavior controls follow Colors with a readable gap");
     Check(page.lock_row.bottom <= page.transparent_row.top, "Lock and transparency rows must not overlap");
     Check(page.opacity_minus.right < page.opacity_value.left && page.opacity_value.right < page.opacity_plus.left,
         "Opacity controls must have separate hit targets");
     Check(page.opacity_plus.bottom < page.reset_position.top, "Reset position needs its own row");
     Check(page.opacity_minus.left - page.lock_row.left >= 70.0f, "Opacity label needs room at minimum width");
     Check(page.reset_position.bottom < page.controls_card.bottom, "Reset control must remain inside its card");
-    Check(page.font_card.top - page.colors_card.bottom >= 16.0f, "Cards need a readable gap");
+    Check(page.weight_controls.size() == FloatingMonitorText::weights.size(), "Every supported weight has a visible choice");
+    Check(page.weight_label.top >= page.font_description.bottom && page.weight_label.bottom < page.weight_controls.front().top,
+        "Weight label needs its own row below the family/default description");
+    for (size_t index = 0; index < page.weight_controls.size(); ++index) {
+        const auto& control = page.weight_controls[index];
+        Check(control.left >= page.font_description.left && control.right <= page.font_description.right + 0.01f,
+            "Weight choices must stay inside the Text style card");
+        Check(control.bottom - control.top >= 44.0f && control.right - control.left >= 60.0f,
+            "Weight choices need full-size targets and readable labels at minimum width");
+        Check(control.bottom + 16.0f <= page.font_minus.top, "Weight and size are separate, nonoverlapping rows");
+        if (index) Check(control.left >= page.weight_controls[index - 1].right + 7.99f,
+            "Weight choices need separate hit targets, not overlapping click regions");
+    }
     Check(page.colors_card.left == left && page.font_card.right == right, "Cards must share their edges");
     Check(page.font_description.top >= page.font_card.top + 44.0f,
-        "Fixed font description must leave room for the Text size title");
+        "Font description must leave room for the Text style title");
     Check(page.font_description.bottom < page.font_minus.top,
-        "Fixed Segoe UI Bold description and size controls need separate rows");
+        "Font description and size controls need separate rows");
     Check(page.font_description.right - page.font_description.left >= 200.0f,
         "Fixed font description needs readable space at minimum modal width");
     Check(page.font_minus.right < page.font_value.left && page.font_value.right < page.font_plus.left,
@@ -74,18 +95,22 @@ void CheckLayout(float width, float height, float requested_scroll) {
         }
     }
     if (Near(page.scroll_offset, page.scroll_max)) {
-        Check(page.font_card.bottom <= page.view_bottom + 0.01f, "Bottom of page must be reachable above the footer");
+        Check(page.controls_card.bottom <= page.view_bottom + 0.01f, "Bottom of page must be reachable above the footer");
     }
 }
 
 void DefaultControlsFit() {
     const auto page = GetFloatingMonitorSettingsLayout(154.0f, 492.0f, 10.0f, 740.0f, 0.0f);
-    Check(page.controls_card.bottom < page.view_bottom, "Position/transparency controls must be visible without scrolling");
-    Check(page.scroll_max <= 300.0f, "Normal-size page should keep style and preview within a bounded scroll");
+    Check(page.font_plus.bottom < page.view_bottom && page.weight_controls.front().top > page.view_top,
+        "Weight and size controls must be available without scrolling at the normal height");
+    Check(page.scroll_max <= 700.0f, "Readings, typography, five colors and behavior have a bounded normal-size scroll");
+    const auto text = GetFloatingMonitorSettingsLayout(154.0f, 492.0f, 10.0f, 740.0f, 104.0f);
+    Check(text.font_card.top >= text.view_top && text.preview_caption.bottom <= text.view_bottom,
+        "After two wheel detents, the entire Text style card and its preview fit together");
     const auto bottom = GetFloatingMonitorSettingsLayout(154.0f, 492.0f, 10.0f, 740.0f, page.scroll_max);
-    Check(bottom.preview.top >= bottom.view_top && bottom.preview_caption.bottom <= bottom.view_bottom,
-        "Sample and Save Changes caption must be reachable together");
-    Check(page.controls_card.top > page.view_top, "Cards must not touch the fixed title");
+    Check(bottom.controls_card.top >= bottom.view_top && bottom.reset_position.bottom <= bottom.view_bottom,
+        "All position/transparency controls must be reachable together above the footer");
+    Check(page.readings_card.top > page.view_top, "Cards must not touch the fixed title");
 }
 
 void ScrollRangeIsStable() {
@@ -112,20 +137,20 @@ void ResizeAndClamp() {
     const auto enlarged = GetFloatingMonitorSettingsLayout(154.0f, 492.0f, 10.0f, 740.0f, bottom.scroll_offset);
     Check(Near(enlarged.scroll_offset, enlarged.scroll_max) && enlarged.scroll_max < bottom.scroll_max,
         "Growing the dialog must clamp obsolete scrolling to its new maximum");
-    const auto very_tall = GetFloatingMonitorSettingsLayout(154.0f, 492.0f, 10.0f, 1100.0f, enlarged.scroll_offset);
+    const auto very_tall = GetFloatingMonitorSettingsLayout(154.0f, 492.0f, 10.0f, 1400.0f, enlarged.scroll_offset);
     Check(Near(very_tall.scroll_offset, 0.0f), "A page that fits must clear obsolete scrolling");
 }
 void MonitorFontSizesAndBounds() {
     using namespace FloatingMonitorLayout;
     Check(minimum_font_size == 11 && maximum_font_size == 16 && default_font_size == 12,
         "Monitor text must use the shared 11..16px range and 12px default");
-    Check(width == 188 && Width(default_font_size) == 188 && Height() == 28,
-        "Network-only monitor must default to 188x28");
+    Check(width == 188 && Width(default_font_size) == 188 && Height() == 56 && Height(12, false, false) == 28,
+        "Default 188x56 monitor includes CPU/memory; network-only remains 188x28");
     Check(default_text_color == 0x00FFFFFFu && panel_background_color == 0,
         "Default text must stay white on a black panel, independent of app theme");
-    static_assert(sizeof(Layout) == 4 * sizeof(Rect), "Floating monitor must only have UP/DN label/value fields");
-    Check(FloatingMonitorSettingsLayout::color_count == 3,
-        "Only values, upload and download may have floating color controls");
+    static_assert(sizeof(Layout) == 8 * sizeof(Rect), "Floating monitor includes CPU/memory label/value fields");
+    Check(FloatingMonitorSettingsLayout::color_count == 5,
+        "Values, upload, download, CPU and memory need independent color controls");
     for (const int size : { std::numeric_limits<int>::min(), -1, 0, 10 }) {
         Check(ClampFontSize(size) == 11 && Width(size) == Width(11) && Height(size) == Height(11),
             "Font sizes below the minimum must clamp before dimension calculations");
@@ -146,7 +171,7 @@ void MonitorFontSizesAndBounds() {
         const int height = Height(size);
         Check(surface_width == static_cast<int>(std::ceil(188.0 * size / 12.0)),
             "Monitor width must scale from 188px at 12px, rounded up");
-        Check(height == std::max(28, size + 12), "Monitor must never reserve an extra CPU/memory row");
+        Check(height == 2 * std::max(28, size + 12), "Enabled CPU/memory share one additional row");
         const auto layout = Get(surface_width, height, size);
         for (const auto& rect : { layout.upload_label, layout.upload_value, layout.download_label, layout.download_value }) {
             check_bounds(rect, surface_width, height);
@@ -186,20 +211,20 @@ void MonitorFontSizesAndBounds() {
 
 class GdiFontMeasurement {
 public:
-    explicit GdiFontMeasurement(int size) : dc_(CreateCompatibleDC(nullptr)) {
+    explicit GdiFontMeasurement(int size, FloatingMonitorText::Weight weight) : dc_(CreateCompatibleDC(nullptr)), weight_(weight) {
         Check(dc_ != nullptr, "CreateCompatibleDC failed for font measurement");
-        font_ = CreateFontW(-size, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        font_ = CreateFontW(-size, 0, 0, 0, FloatingMonitorText::Value(weight), FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, FloatingMonitorText::GdiFamily(weight));
         if (!font_) {
             DeleteDC(dc_);
-            throw std::runtime_error("CreateFontW failed for Segoe UI Bold");
+            throw std::runtime_error("CreateFontW failed for chosen Segoe UI weight");
         }
         previous_font_ = SelectObject(dc_, font_);
         if (!previous_font_ || previous_font_ == HGDI_ERROR) {
             DeleteObject(font_);
             DeleteDC(dc_);
-            throw std::runtime_error("SelectObject failed for Segoe UI Bold");
+            throw std::runtime_error("SelectObject failed for chosen Segoe UI weight");
         }
     }
 
@@ -215,10 +240,14 @@ public:
     void CheckSelectedFont() const {
         wchar_t face[LF_FACESIZE]{};
         Check(GetTextFaceW(dc_, LF_FACESIZE, face) > 0, "GetTextFaceW failed");
-        Check(std::wstring(face) == L"Segoe UI", "Font measurement must not silently substitute Segoe UI");
+        Check(std::wstring(face).rfind(L"Segoe UI", 0) == 0, "Font measurement must not silently substitute another family");
         TEXTMETRICW metrics{};
         Check(GetTextMetricsW(dc_, &metrics) != FALSE, "GetTextMetricsW failed");
-        Check(metrics.tmWeight >= FW_BOLD, "Measured Segoe UI must actually be bold");
+        if (metrics.tmWeight != FloatingMonitorText::Value(weight_)) {
+            std::wcerr << L"Requested GDI face: " << FloatingMonitorText::GdiFamily(weight_) << L"; selected: " << face << L'\n';
+            throw std::runtime_error("Actual GDI weight " + std::to_string(metrics.tmWeight) +
+                " differs from requested " + std::to_string(FloatingMonitorText::Value(weight_)));
+        }
     }
 
     SIZE Measure(const std::wstring& text) const {
@@ -230,14 +259,15 @@ public:
 
 private:
     HDC dc_;
+    FloatingMonitorText::Weight weight_;
     HFONT font_ = nullptr;
     HGDIOBJ previous_font_ = nullptr;
 };
 
 void GdiMonitorTextFits() {
     using namespace FloatingMonitorLayout;
-    for (int size = minimum_font_size; size <= maximum_font_size; ++size) {
-        const GdiFontMeasurement font(size);
+    for (const auto weight : FloatingMonitorText::weights) for (int size = minimum_font_size; size <= maximum_font_size; ++size) {
+        const GdiFontMeasurement font(size, weight);
         font.CheckSelectedFont();
         const auto fits = [&font, size](const std::wstring& text, const Rect& column) {
             const SIZE extent = font.Measure(text);
@@ -254,6 +284,18 @@ void GdiMonitorTextFits() {
         const auto layout = Get(Width(size), Height(size), size);
         require_fit(L"UP", layout.upload_label);
         require_fit(L"DN", layout.download_label);
+        require_fit(L"CPU", layout.cpu_label);
+        require_fit(L"MEM", layout.memory_label);
+        for (const auto& column : {layout.cpu_value, layout.memory_value}) {
+            for (const auto* percentage : {L"0%", L"24%", L"58%", L"100%", L"--"}) require_fit(percentage, column);
+        }
+        for (const bool cpu : {false, true}) {
+            for (const bool memory : {false, true}) {
+                const auto selected = Get(Width(size), Height(size, cpu, memory), size, cpu, memory);
+                if (cpu) { require_fit(L"CPU", selected.cpu_label); require_fit(L"100%", selected.cpu_value); }
+                if (memory) { require_fit(L"MEM", selected.memory_label); require_fit(L"100%", selected.memory_value); }
+            }
+        }
         for (const auto& column : { layout.upload_value, layout.download_value }) {
             for (const auto* rate : { L"1.2 MB/s", L"8.6 MB/s", L"0.0KB/s", L"999GB/s", L"999Gbps" }) {
                 require_fit(rate, column);
@@ -305,7 +347,7 @@ int main() {
                 }
             }
         }
-        std::cout << "Floating monitor: font size bounds, scaled layout, GDI text measurements, alpha, opacity, settings scrolling and control bounds passed\n";
+        std::cout << "Floating monitor: Light/Regular/Bold font measurements, size bounds, scaled layout, alpha, opacity, settings scrolling and control bounds passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

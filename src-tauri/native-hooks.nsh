@@ -61,3 +61,17 @@
   RMDir "$INSTDIR\vendor\libre-hardware-monitor"
   RMDir "$INSTDIR\vendor"
 !macroend
+
+; Remove only this interactive user's ownership-verified Task Scheduler task
+; and legacy Run value before NSIS deletes the executable. The native helper
+; refuses unrelated/conflicting registrations and does not touch user data.
+!macro NSIS_HOOK_PREUNINSTALL
+  IfFileExists "$INSTDIR\watchman.exe" watchman_native_cleanup_start watchman_native_cleanup_done
+watchman_native_cleanup_start:
+  ClearErrors
+  ExecWait '"$INSTDIR\watchman.exe" --uninstall-cleanup' $0
+  ${If} $0 != 0
+    DetailPrint "Watchman could not remove every owned startup registration (exit code $0)."
+  ${EndIf}
+watchman_native_cleanup_done:
+!macroend

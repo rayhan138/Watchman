@@ -17,28 +17,62 @@ endif()
 set(SOURCES
     update.cpp
     legacy_migration.cpp
+    app_version.cpp
+    update_policy.cpp
+    update_checker.cpp
+    update_worker.cpp
     main.cpp
     renderer.cpp
     metrics.cpp
+    gpu_monitor.cpp
     temperature_monitor.cpp
     temperature_provider.cpp
     app_tracker.cpp
     ping_tester.cpp
     diagnostics.cpp
     storage.cpp
+    traffic_export.cpp
     taskbar_embed.cpp
     widget_compositor.cpp
     bundled_fonts.cpp
     sqlite3.c
     speed_tester.cpp
     engine.cpp
+    startup_diagnostics.cpp
+    startup_registration.cpp
+    startup_registration_worker.cpp
+    tray_registration_worker.cpp
     watchman_resources.rc
+    watchman.manifest
 )
 
 set(HEADERS
     renderer.h
+    app_version.h
+    update_policy.h
+    update_checker.h
+    update_preferences.h
+    update_notification.h
+    update_presentation.h
+    settings_header_layout.h
     floating_monitor_settings_layout.h
     floating_monitor_layout.h
+    floating_monitor_text.h
+    widget_runtime.h
+    widget_recovery_policy.h
+    live_readings.h
+    speed_test_state.h
+    speed_test_view.h
+    startup_diagnostics.h
+    startup_registration.h
+    startup_registration_policy.h
+    tray_registration.h
+    main_graphics_policy.h
+    gpu_monitor.h
+    history_files.h
+    history_profile.h
+    ui_responsiveness.h
+    traffic_export.h
     taskbar_widget_layout.h
     taskbar_widget_mode.h
     widget_compositor.h
@@ -78,8 +112,8 @@ set(HEADERS
 # Add executable target (GUI app, no console window in Release)
 add_executable(Watchman WIN32 ${SOURCES} ${HEADERS})
 
-# Link necessary Windows SDK libraries
-target_link_libraries(Watchman PRIVATE
+# Shared Windows SDK dependencies for the shipped app and owned-window recovery test.
+set(WATCHMAN_PLATFORM_LIBRARIES
     version.lib
     crypt32.lib
     d2d1.lib
@@ -102,9 +136,12 @@ target_link_libraries(Watchman PRIVATE
     powrprof.lib
     shell32.lib
     ole32.lib
+    oleaut32.lib
+    taskschd.lib
     windowscodecs.lib
     gdi32.lib
 )
+target_link_libraries(Watchman PRIVATE ${WATCHMAN_PLATFORM_LIBRARIES})
 
 # Set runtime settings
 set_target_properties(Watchman PROPERTIES
@@ -139,8 +176,9 @@ option(WATCHMAN_BUILD_RUNTIME_SMOKE "Build the disposable Windows runtime-smoke 
 if(WIN32 AND WATCHMAN_BUILD_RUNTIME_SMOKE)
     add_executable(WatchmanRuntimeSmoke
         tests/runtime_smoke_probe.cpp
-        engine.cpp metrics.cpp temperature_monitor.cpp temperature_provider.cpp
-        app_tracker.cpp ping_tester.cpp diagnostics.cpp storage.cpp sqlite3.c speed_tester.cpp)
+        engine.cpp startup_diagnostics.cpp metrics.cpp gpu_monitor.cpp
+        temperature_monitor.cpp temperature_provider.cpp app_tracker.cpp
+        ping_tester.cpp diagnostics.cpp storage.cpp traffic_export.cpp sqlite3.c speed_tester.cpp)
     target_include_directories(WatchmanRuntimeSmoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(WatchmanRuntimeSmoke PRIVATE
         iphlpapi ws2_32 windowsapp shlwapi wlanapi winhttp user32 advapi32
@@ -149,6 +187,117 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    find_package(Threads REQUIRED)
+
+    add_executable(TrayRegistrationTest tests/tray_registration_test.cpp tray_registration_worker.cpp)
+    target_include_directories(TrayRegistrationTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(TrayRegistrationTest PRIVATE Threads::Threads)
+    add_test(NAME TrayRegistration COMMAND TrayRegistrationTest)
+    set_tests_properties(TrayRegistration PROPERTIES TIMEOUT 15)
+
+    add_executable(UpdatePolicyTest tests/update_policy_test.cpp update_policy.cpp)
+    target_include_directories(UpdatePolicyTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME UpdatePolicy COMMAND UpdatePolicyTest)
+
+    add_executable(UpdateWorkerTest tests/update_worker_test.cpp update_worker.cpp)
+    target_include_directories(UpdateWorkerTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(UpdateWorkerTest PRIVATE Threads::Threads)
+    add_test(NAME UpdateWorker COMMAND UpdateWorkerTest)
+    set_tests_properties(UpdateWorker PROPERTIES TIMEOUT 15)
+
+    add_executable(StartupRegistrationPolicyTest tests/startup_registration_policy_test.cpp startup_registration_worker.cpp)
+    target_include_directories(StartupRegistrationPolicyTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(StartupRegistrationPolicyTest PRIVATE Threads::Threads)
+    add_test(NAME StartupRegistrationPolicy COMMAND StartupRegistrationPolicyTest)
+    set_tests_properties(StartupRegistrationPolicy PROPERTIES TIMEOUT 15)
+
+    if(WIN32)
+        add_executable(UpdateWindowsTest tests/update_windows_test.cpp update_policy.cpp bundled_fonts.cpp watchman_resources.rc)
+        target_include_directories(UpdateWindowsTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(UpdateWindowsTest PRIVATE dwrite gdi32 advapi32 shell32)
+        add_test(NAME UpdateWindows COMMAND UpdateWindowsTest)
+
+        add_executable(UpdateCheckerTest tests/update_checker_test.cpp update_checker.cpp update_policy.cpp app_version.cpp)
+        target_include_directories(UpdateCheckerTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_compile_definitions(UpdateCheckerTest PRIVATE WATCHMAN_UPDATE_CHECKING_TESTING=1)
+        target_link_libraries(UpdateCheckerTest PRIVATE winhttp ws2_32 version)
+        add_test(NAME UpdateChecker COMMAND UpdateCheckerTest)
+        set_tests_properties(UpdateChecker PROPERTIES TIMEOUT 30)
+
+        add_executable(StartupRegistrationTest tests/startup_registration_test.cpp startup_registration.cpp)
+        target_include_directories(StartupRegistrationTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_compile_definitions(StartupRegistrationTest PRIVATE WATCHMAN_STARTUP_REGISTRATION_TESTING=1)
+        target_link_libraries(StartupRegistrationTest PRIVATE taskschd ole32 oleaut32 advapi32 shell32)
+        add_test(NAME StartupRegistration COMMAND StartupRegistrationTest)
+        set_tests_properties(StartupRegistration PROPERTIES TIMEOUT 45)
+    endif()
+
+    add_executable(WidgetRuntimeTest tests/widget_runtime_test.cpp)
+    target_include_directories(WidgetRuntimeTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME WidgetRuntime COMMAND WidgetRuntimeTest)
+
+    add_executable(TrafficExportTest tests/traffic_export_test.cpp traffic_export.cpp)
+    target_include_directories(TrafficExportTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME TrafficExport COMMAND TrafficExportTest)
+
+    add_executable(FloatingMonitorLayoutTest tests/floating_monitor_layout_test.cpp)
+    target_include_directories(FloatingMonitorLayoutTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME FloatingMonitorLayout COMMAND FloatingMonitorLayoutTest)
+
+    add_executable(HistoryProfileTest tests/history_profile_test.cpp)
+    target_include_directories(HistoryProfileTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME HistoryProfile COMMAND HistoryProfileTest)
+
+    add_executable(UiResponsivenessTest tests/ui_responsiveness_test.cpp)
+    target_include_directories(UiResponsivenessTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME UiResponsiveness COMMAND UiResponsivenessTest)
+
+    add_executable(ResponsivenessPolicyTest tests/responsiveness_policy_test.cpp)
+    target_include_directories(ResponsivenessPolicyTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME ResponsivenessPolicy COMMAND ResponsivenessPolicyTest)
+
+    if(WIN32)
+        add_executable(GpuMonitorTest tests/gpu_monitor_test.cpp gpu_monitor.cpp startup_diagnostics.cpp)
+        target_include_directories(GpuMonitorTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(GpuMonitorTest PRIVATE dxgi pdh ole32)
+        add_test(NAME GpuMonitor COMMAND GpuMonitorTest)
+        set_tests_properties(GpuMonitor PROPERTIES TIMEOUT 15)
+
+        add_executable(SpeedTesterLifecycleTest tests/speed_tester_lifecycle_test.cpp speed_tester.cpp)
+        target_include_directories(SpeedTesterLifecycleTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_compile_definitions(SpeedTesterLifecycleTest PRIVATE WATCHMAN_SPEED_TESTING=1)
+        target_link_libraries(SpeedTesterLifecycleTest PRIVATE winhttp ws2_32 crypt32)
+        add_test(NAME SpeedTesterLifecycle COMMAND SpeedTesterLifecycleTest)
+        set_tests_properties(SpeedTesterLifecycle PROPERTIES TIMEOUT 45)
+
+        # Compile-time faults are confined to windows owned by this test process.
+        add_executable(StartupRecoveryTest tests/startup_recovery_test.cpp ${SOURCES})
+        target_include_directories(StartupRecoveryTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_compile_definitions(StartupRecoveryTest PRIVATE
+            WATCHMAN_TASKBAR_TESTING=1 WATCHMAN_RENDER_TESTING=1 WATCHMAN_STARTUP_RECOVERY_TESTING=1)
+        target_link_libraries(StartupRecoveryTest PRIVATE ${WATCHMAN_PLATFORM_LIBRARIES})
+        add_test(NAME StartupRecovery COMMAND StartupRecoveryTest)
+        set_tests_properties(StartupRecovery PROPERTIES TIMEOUT 45)
+    endif()
+
+    add_executable(SettingsHeaderLayoutTest tests/settings_header_layout_test.cpp)
+    target_include_directories(SettingsHeaderLayoutTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME SettingsHeaderLayout COMMAND SettingsHeaderLayoutTest)
+
+    add_executable(AppVersionTest tests/app_version_test.cpp app_version.cpp)
+    target_include_directories(AppVersionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(WIN32)
+        target_sources(AppVersionTest PRIVATE tests/app_version_resource_test.rc)
+        target_compile_definitions(AppVersionTest PRIVATE WATCHMAN_VERSION_RESOURCE_TEST=1)
+        target_link_libraries(AppVersionTest PRIVATE version)
+
+        add_executable(AppVersionUnversionedTest tests/app_version_test.cpp app_version.cpp)
+        target_include_directories(AppVersionUnversionedTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(AppVersionUnversionedTest PRIVATE version)
+        add_test(NAME AppVersionUnversioned COMMAND AppVersionUnversionedTest)
+    endif()
+    add_test(NAME AppVersion COMMAND AppVersionTest)
+
     add_executable(WatchmanUpdateProtocolProbe update.cpp)
     target_compile_definitions(WatchmanUpdateProtocolProbe PRIVATE
         WATCHMAN_PROTOCOL_PROBE WATCHMAN_PROTOCOL_PROBE_MAJOR=1
@@ -160,6 +309,12 @@ if(BUILD_TESTING)
         WATCHMAN_PROTOCOL_PROBE WATCHMAN_PROTOCOL_PROBE_MAJOR=2
         WATCHMAN_PROTOCOL_PROBE_MINOR=0 WATCHMAN_PROTOCOL_PROBE_PATCH=0)
     target_link_libraries(WatchmanUpdateProtocolProbeV2 PRIVATE crypt32 version shell32 ole32 winhttp)
+
+    add_executable(WatchmanUpdateProtocolProbeV201 update.cpp)
+    target_compile_definitions(WatchmanUpdateProtocolProbeV201 PRIVATE
+        WATCHMAN_PROTOCOL_PROBE WATCHMAN_PROTOCOL_PROBE_MAJOR=2
+        WATCHMAN_PROTOCOL_PROBE_MINOR=0 WATCHMAN_PROTOCOL_PROBE_PATCH=1)
+    target_link_libraries(WatchmanUpdateProtocolProbeV201 PRIVATE crypt32 version shell32 ole32 winhttp)
     add_executable(FloatingMonitorSettingsLayoutTest tests/floating_monitor_settings_layout_test.cpp)
     target_include_directories(FloatingMonitorSettingsLayoutTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(FloatingMonitorSettingsLayoutTest PRIVATE gdi32)
@@ -215,7 +370,7 @@ if(BUILD_TESTING)
     target_link_libraries(TemperatureProviderTest PRIVATE windowsapp)
     add_test(NAME TemperatureProvider COMMAND TemperatureProviderTest)
 
-    add_executable(HistoryStorageTest tests/history_storage_test.cpp storage.cpp sqlite3.c)
+    add_executable(HistoryStorageTest tests/history_storage_test.cpp storage.cpp traffic_export.cpp sqlite3.c)
     target_include_directories(HistoryStorageTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(HistoryStorageTest PRIVATE shell32 ole32)
     add_test(NAME HistoryStorage COMMAND HistoryStorageTest)
