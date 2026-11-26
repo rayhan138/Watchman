@@ -42,7 +42,13 @@ $v1 = Start-Process $app -PassThru
 Start-Sleep -Seconds 8
 Require (!$v1.HasExited) 'Released v1 is not running'
 $legacyStartup = Get-WatchmanRunCommand
-Require ($legacyStartup -ieq "$app --minimized") 'v1.0.5 did not create its expected unquoted Tauri --minimized Run command'
+if ($legacyStartup -ine "$app --minimized") {
+    $runRegistry = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run')
+    try {
+        $runEntries = @($runRegistry.GetValueNames() | ForEach-Object { '{0}={1}' -f $_, $runRegistry.GetValue($_) }) -join '; '
+    } finally { $runRegistry.Close() }
+    throw "v1.0.5 Run command mismatch: expected=[$app --minimized], Watchman=[$legacyStartup], entries=[$runEntries]"
+}
 Require ($null -eq (Get-WatchmanStartupTask)) 'A Task Scheduler registration existed before the v1 upgrade'
 # The v1 updater uses the passive/update/restart contract; wait for installer, not its restarted child.
 if ($ProtocolProbe) { Wait-App $ProtocolProbe '--install' } else { Wait-App $Setup '/P /UPDATE /R' }
