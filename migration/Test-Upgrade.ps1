@@ -41,15 +41,13 @@ python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('create
 $v1 = Start-Process $app -PassThru
 Start-Sleep -Seconds 8
 Require (!$v1.HasExited) 'Released v1 is not running'
-$legacyStartup = Get-WatchmanRunCommand
-if ($legacyStartup -ine "$app --minimized") {
-    $runRegistry = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run')
-    try {
-        $runEntries = @($runRegistry.GetValueNames() | ForEach-Object { '{0}={1}' -f $_, $runRegistry.GetValue($_) }) -join '; '
-    } finally { $runRegistry.Close() }
-    throw "v1.0.5 Run command mismatch: expected=[$app --minimized], Watchman=[$legacyStartup], entries=[$runEntries]"
-}
 Require ($null -eq (Get-WatchmanStartupTask)) 'A Task Scheduler registration existed before the v1 upgrade'
+# Seed the exact legacy Tauri v1 format on this disposable user. The released
+# app silently ignores autostart registration errors, so do not depend on a
+# clean hosted account already having a Run value.
+$legacyStartup = "$app --minimized"
+New-ItemProperty $runKey -Name Watchman -Value $legacyStartup -PropertyType String -Force | Out-Null
+Require ((Get-WatchmanRunCommand) -ieq $legacyStartup) 'Could not seed the exact unquoted Tauri v1 Run command'
 # The v1 updater uses the passive/update/restart contract; wait for installer, not its restarted child.
 if ($ProtocolProbe) { Wait-App $ProtocolProbe '--install' } else { Wait-App $Setup '/P /UPDATE /R' }
 Require ($v1.HasExited) 'Old app did not stop'
@@ -77,6 +75,7 @@ Require (Test-Path "$native/migration-v2.complete") 'Restart/first launch did no
 Require (!(Test-Path (Join-Path (Split-Path $app) 'vendor/libre-hardware-monitor/LibreHardwareMonitorLib.dll'))) 'Legacy sensor binaries left installed'
 Require (@(Get-Process watchman -ErrorAction Ignore).Count -eq 1) 'Expected one restarted Watchman'
 Require ((Get-ItemProperty 'HKCU:\Software\Watchman').UnitModeBits -eq 1) 'Settings were not imported'
+Require ((Get-ItemProperty 'HKCU:\Software\Watchman').Autostart -eq 1) 'v1 startOnBoot preference was not imported'
 $startupReady = $false
 for ($i = 0; $i -lt 60; $i++) {
     if ((Test-WatchmanStartupTask -Executable $app) -and $null -eq (Get-WatchmanRunCommand)) {
