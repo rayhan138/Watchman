@@ -6,7 +6,8 @@
 param(
     [Parameter(Mandatory)][string]$Executable,
     [Parameter(Mandatory)][string]$RuntimeProbe,
-    [string]$OutputDirectory = 'smoke-results'
+    [string]$OutputDirectory = 'smoke-results',
+    [switch]$LiveSpeedTest
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -30,12 +31,43 @@ $settingsPath = 'HKCU:\Software\Watchman'
 $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $themePath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
 $originalAppdata = $env:APPDATA
+$originalLocalAppdata = $env:LOCALAPPDATA
+$startupLog = Join-Path $OutputDirectory 'local-appdata\Watchman\startup-recovery.log'
 $originalDisposable = $env:WATCHMAN_SMOKE_DISPOSABLE
 $settingsBackup = Join-Path $OutputDirectory 'private-settings-backup.reg'
 $hadSettings = Test-Path $settingsPath
 $runBackup = $null
 $themeBackup = @{}
 $failure = $null
+$startupTaskName = 'Watchman Sign-in ' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$script:startupFolder = $null
+$startupTaskScopeSafe = $false
+
+function Get-StartupTask {
+    try { return $script:startupFolder.GetTask($startupTaskName) }
+    catch {
+        $exception = $_.Exception
+        while ($null -ne $exception) {
+            if ($exception.HResult -in @(-2147024894, -2147024893)) { return $null } # file/path not found
+            $exception = $exception.InnerException
+        }
+        throw
+    }
+}
+function Read-RunCommand {
+    $key = Get-Item -LiteralPath $runPath -ErrorAction SilentlyContinue
+    if ($null -eq $key) { return '' }
+    try { return $key.GetValue('Watchman', '') } finally { $key.Close() }
+}
+function Seed-LegacyRun {
+    if (-not (Test-Path $runPath)) { $null = New-Item -Path $runPath -Force }
+    $null = New-ItemProperty -LiteralPath $runPath -Name 'Watchman' -Value ('"' + $Executable + '" --startup') -PropertyType String -Force
+}
+function Same-User([string]$Identity, [string]$Sid) {
+    if ($Identity -eq $Sid) { return $true }
+    try { return ([Security.Principal.NTAccount]::new($Identity).Translate([Security.Principal.SecurityIdentifier]).Value -eq $Sid) }
+    catch { return $false }
+}
 
 function Check([string]$Name, [bool]$Pass, [string]$Detail = '') {
     $record = [pscustomobject]@{ name = $Name; pass = $Pass; detail = $Detail }
@@ -57,6 +89,32 @@ function Wait-Until([scriptblock]$Condition, [int]$Timeout = 10000) {
         Start-Sleep -Milliseconds 100
     } while ($watch.ElapsedMilliseconds -lt $Timeout)
     return [bool](& $Condition)
+}
+function Startup-Events([int]$ProcessId) {
+    if (Test-Path $startupLog) {
+        Get-Content -LiteralPath $startupLog -ErrorAction SilentlyContinue | Where-Object { $_ -match " pid=$ProcessId " }
+    }
+}
+function Record-StartupTiming([int]$ProcessId, [bool]$Quiet = $false) {
+    $null = Wait-Until { @(Startup-Events $ProcessId | Where-Object { $_ -match ' ui message-loop-ready ' }).Count -gt 0 } 3000
+    # The first measurement is normally displayed on the independent 1Hz tick.
+    # Wait for its marker without opening a quiet dashboard or imposing a speed claim.
+    $null = Wait-Until { @(Startup-Events $ProcessId | Where-Object { $_ -match ' backend first-measurement ' }).Count -gt 0 } 5000
+    $events = @(Startup-Events $ProcessId)
+    $launch = @($events | Where-Object { $_ -match ' process (quiet|interactive)-launch ' } | Select-Object -First 1)
+    if ($launch.Count -eq 0) { Check 'wWinMain-entry timing marker is available' $false; return }
+    $start = [long](($launch[0] -split ' ')[0])
+    $timing = [ordered]@{ pid = $ProcessId; quiet = $Quiet; entry_windows_uptime_ms = $start }
+    foreach ($phase in @(@('widget_first_frame_ms', ' widget first-frame '), @('message_loop_ms', ' ui message-loop-ready '), @('first_measurement_ms', ' backend first-measurement '))) {
+        $line = @($events | Where-Object { $_ -match $phase[1] } | Select-Object -First 1)
+        $timing[$phase[0]] = if ($line.Count) { [long](($line[0] -split ' ')[0]) - $start } else { $null }
+    }
+    $timing | ConvertTo-Json -Compress | Add-Content (Join-Path $OutputDirectory 'startup-timings.jsonl')
+    Observe 'Measured wWinMain-entry-to-widget timing (not OS process creation or Windows sign-in)' ($timing | ConvertTo-Json -Compress)
+    if ($Quiet) {
+        Check 'Quiet startup never attempts dashboard D2D/fonts before an interactive restore' (@($events | Where-Object { $_ -match ' main-graphics ' }).Count -eq 0)
+        Check 'Quiet startup records its hidden launch intent' (@($events | Where-Object { $_ -match ' window quiet-start-hidden ' }).Count -eq 1)
+    }
 }
 function Read-Setting([string]$Name, $Default = $null) {
     $key = Get-Item -LiteralPath $settingsPath -ErrorAction SilentlyContinue
@@ -145,12 +203,43 @@ function Modal {
 }
 function Open-Settings { $d = Dimensions; Click ($d.Width - 152) 24 }
 function Open-SpeedConsent {
+    Wheel 30 # A previous run may have brought its result card into view.
     $d = Dimensions
     Click ($d.Width - [Math]::Max(16, [Math]::Min(20, $d.Width * 0.035)) - 58) 578
 }
 function Close-Settings { $m = Modal; Click ($m.X + $m.Width - 27) ($m.Y + 27) }
 function Section([int]$Index) { $m = Modal; Click ($m.X + 55) ($m.Y + 106 + 52 * $Index) }
 function Save-Settings { $m = Modal; Click ($m.Right - 40) ($m.Y + $m.Height - 31) }
+# Coordinates mirror the shared floating layout; its native geometry/font tests
+# cover the minimum modal width. Two 52px detents reveal the whole Text card.
+function Floating-Text-Controls([int]$Scroll = 104) {
+    $m = Modal
+    $left = $m.X + 144
+    $width = ($m.Right - $left - 36 - 16) / 3
+    return [pscustomobject]@{
+        Light = $left + 18 + $width / 2
+        Regular = $left + 18 + ($width + 8) + $width / 2
+        Bold = $left + 18 + 2 * ($width + 8) + $width / 2
+        WeightY = $m.Y + 446 - $Scroll
+        Plus = $m.Right - 38
+        SizeY = $m.Y + 504 - $Scroll
+    }
+}
+function Set-Floating-ValuesColor([byte]$Red, [byte]$Green, [byte]$Blue, [string]$Stage = 'settings') {
+    # Five swatches begin at y=768. Eight detents place all of them in view.
+    $m = Modal
+    [WatchmanSmokeNative]::BeginClick($script:main, ($m.Right - 54), ($m.Y + 793 - 416))
+    if (-not (Wait-Until { [WatchmanSmokeNative]::IsColorDialogReady([WatchmanSmokeNative]::Find('#32770', $script:app.Id)) } 5000)) {
+        throw 'The actual Windows color picker did not initialize visible, readable RGB edits.'
+    }
+    $dialog = [WatchmanSmokeNative]::Find('#32770', $script:app.Id)
+    $fields = [WatchmanSmokeNative]::PrepareRgb($dialog, $Red, $Green, $Blue)
+    Check "Native color picker contains the chosen RGB values ($Stage)" ($fields -eq "$Red,$Green,$Blue") "actual=$fields"
+    $null = Capture "17e-floating-native-color-$Stage" $dialog
+    [WatchmanSmokeNative]::AcceptColor($dialog)
+    if (-not (Wait-Until { -not [WatchmanSmokeNative]::IsWindow($dialog) } 5000)) { throw 'The native color picker did not close.' }
+    Start-Sleep -Milliseconds 250
+}
 function Open-Popup([IntPtr]$Owner, [bool]$Tray = $false) {
     [WatchmanSmokeNative]::SetCursorPos(150, 150) | Out-Null
     if ($Tray) { $null = [WatchmanSmokeNative]::PostMessage($Owner, 32780, [IntPtr]::Zero, [IntPtr]0x205) }
@@ -170,6 +259,19 @@ function Choose-Popup($Popup, [string]$Label) {
     if (-not [WatchmanSmokeNative]::GetMenuItemRect($Popup.Owner, $Popup.Menu, $index, [ref]$rect)) { throw 'Native menu item bounds unavailable.' }
     [WatchmanSmokeNative]::ActualClick(($rect.Left + $rect.Right) / 2, ($rect.Top + $rect.Bottom) / 2, $false)
     Start-Sleep -Milliseconds 400
+}
+function Open-Submenu($Popup, [string]$Label) {
+    $index = [Array]::IndexOf([string[]]$Popup.Labels, $Label)
+    if ($index -lt 0) { [WatchmanSmokeNative]::EscapeMenu(); throw "Missing submenu '$Label'" }
+    $menu = [WatchmanSmokeNative]::GetSubMenu($Popup.Menu, $index)
+    if ($menu -eq [IntPtr]::Zero) { throw "Submenu '$Label' is not a real native menu" }
+    $rect = New-Object 'WatchmanSmokeNative+Rect'
+    if (-not [WatchmanSmokeNative]::GetMenuItemRect($Popup.Owner, $Popup.Menu, $index, [ref]$rect)) { throw 'Submenu parent bounds unavailable.' }
+    [WatchmanSmokeNative]::ActualClick(($rect.Left + $rect.Right) / 2, ($rect.Top + $rect.Bottom) / 2, $false)
+    Start-Sleep -Milliseconds 300
+    $labels = @()
+    for ($i = 0; $i -lt [WatchmanSmokeNative]::GetMenuItemCount($menu); ++$i) { $labels += [WatchmanSmokeNative]::MenuText($menu, $i) }
+    return [pscustomobject]@{ Menu = $menu; Owner = $Popup.Owner; Labels = $labels }
 }
 function Start-App([string[]]$LaunchArguments = @()) {
     $info = [Diagnostics.ProcessStartInfo]::new($Executable)
@@ -197,6 +299,11 @@ function Stop-App($Process, [IntPtr]$Window) {
 
 try {
     if (Get-Process Watchman -ErrorAction SilentlyContinue) { throw 'A pre-existing Watchman process is running. Refusing to interfere.' }
+    $startupService = New-Object -ComObject 'Schedule.Service'
+    $startupService.Connect()
+    $script:startupFolder = $startupService.GetFolder('\')
+    if ($null -ne (Get-StartupTask)) { throw 'A pre-existing Watchman sign-in task exists. Refusing to change it.' }
+    $startupTaskScopeSafe = $true
     if ($hadSettings) { & reg.exe export 'HKCU\Software\Watchman' $settingsBackup /y | Out-Null; if ($LASTEXITCODE) { throw 'Registry backup failed.' } }
     if (Test-Path $runPath) {
         $key = Get-Item $runPath
@@ -230,10 +337,20 @@ try {
     $Executable = Join-Path $portable 'Watchman.exe'
     $env:APPDATA = Join-Path $OutputDirectory 'appdata'
     $null = New-Item -ItemType Directory -Path $env:APPDATA
+    $env:LOCALAPPDATA = Join-Path $OutputDirectory 'local-appdata'
+    $null = New-Item -ItemType Directory -Path $env:LOCALAPPDATA
+    $env:WATCHMAN_SMOKE_DISPOSABLE = '1'
+    & $RuntimeProbe --seed-profiles $env:APPDATA | Set-Content (Join-Path $OutputDirectory 'profile-seed.jsonl')
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot seed isolated native/legacy history profiles.' }
+    $legacyDb = Join-Path $env:APPDATA 'Watchman\watchman.db'
+    $legacyHash = (Get-FileHash -Algorithm SHA256 $legacyDb).Hash
+    $archiveDb = Join-Path $env:APPDATA 'Watchman.Native\original-v1\watchman.db'
+    $archiveHash = (Get-FileHash -Algorithm SHA256 $archiveDb).Hash
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $script:app = Start-App
     Find-Main $script:app
     Check 'Portable EXE starts and responds without font/asset sidecars' ([WatchmanSmokeNative]::IsWindowVisible($script:main)) "startup_ms=$($watch.ElapsedMilliseconds), files=$(@(Get-ChildItem $portable).Count)"
+    Record-StartupTiming $script:app.Id
     $caption = [WatchmanSmokeNative]::Caption($script:main)
     Check 'Unicode main window retains its full native caption' ([WatchmanSmokeNative]::IsWindowUnicode($script:main) -and $caption -ceq 'WATCHMAN') "caption=$caption"
     [WatchmanSmokeNative]::SetForegroundWindow($script:main) | Out-Null
@@ -271,16 +388,37 @@ try {
     Click ($m.Left + 130) ($m.Y + $m.Height - 31)
     Save-Settings
     Check 'Undo discards draft changes' ((Read-Setting 'UnitModeBits' 0) -eq (1 - $oldUnit))
+    Seed-LegacyRun # Exercise old Run -> verified task migration through the real UI.
     Click ($m.Right - 40) ($m.Y + 202)
     Save-Settings
-    $runKey = Get-Item $runPath
-    try { $registeredStartup = $runKey.GetValue('Watchman', '') } finally { $runKey.Close() }
-    Check 'Startup registration quotes the portable path and uses quiet startup' ($registeredStartup -eq ('"' + $Executable + '" --startup'))
+    $registered = Wait-Until { $null -ne (Get-StartupTask) -and (Read-RunCommand) -eq '' } 10000
+    Check 'Saved startup On migrates the old Run entry to one verified sign-in task' $registered
+    if (-not $registered) { throw 'Sign-in task registration did not complete; inspect startup-recovery.txt.' }
+    $startupTask = Get-StartupTask
+    $definition = $startupTask.Definition
+    $principal = $definition.Principal
+    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    Check 'Startup task is interactive/current-user/least-privileged, never highest' ((Same-User $principal.UserId $currentSid) -and $principal.LogonType -eq 3 -and $principal.RunLevel -eq 0)
+    $trigger = $definition.Triggers.Item(1)
+    # Scheduler can omit the zero-delay default and expose a null BSTR over
+    # IDispatch. Normalize null to empty; it is not an added trigger delay.
+    $triggerDelay = [string]$trigger.Delay
+    $triggerUserMatches = Same-User $trigger.UserId $currentSid
+    Check 'Startup task has one current-user sign-in trigger with no added delay' ($definition.Triggers.Count -eq 1 -and $trigger.Type -eq 9 -and $triggerUserMatches -and $triggerDelay -in @('', 'PT0S') -and $trigger.Enabled) "count=$($definition.Triggers.Count), type=$($trigger.Type), current_user=$triggerUserMatches, delay='$triggerDelay', enabled=$($trigger.Enabled)"
+    $action = $definition.Actions.Item(1)
+    Check 'Task action keeps a spaced portable executable separate from quiet arguments' ($definition.Actions.Count -eq 1 -and $action.Type -eq 0 -and $action.Path -eq $Executable -and $action.Arguments -eq '--startup' -and $action.WorkingDirectory -eq (Split-Path $Executable))
+    $taskSettings = $definition.Settings
+    Check 'Startup task adds no battery/network/idle gate or runtime limit' (-not $taskSettings.DisallowStartIfOnBatteries -and -not $taskSettings.StopIfGoingOnBatteries -and -not $taskSettings.RunOnlyIfNetworkAvailable -and -not $taskSettings.RunOnlyIfIdle -and $taskSettings.ExecutionTimeLimit -eq 'PT0S' -and -not $taskSettings.AllowHardTerminate -and -not $taskSettings.WakeToRun)
+    $definition.XmlText | Set-Content (Join-Path $OutputDirectory 'startup-task-definition.txt')
+    # Demand execution is not a sign-in measurement. With the guarded original
+    # still running it must be a quiet duplicate and never open another DB.
+    $null = $startupTask.Run($null)
+    $demandExited = Wait-Until { $task = Get-StartupTask; $task.LastTaskResult -eq 0 -and $task.LastRunTime.Year -ge 2020 -and $task.State -ne 4 } 10000
+    Check 'Task Scheduler can execute the actual spaced-path quiet action without duplicating the app' ($demandExited -and -not $script:app.HasExited -and @(Get-Process Watchman -ErrorAction SilentlyContinue).Count -eq 1)
     Click ($m.Right - 40) ($m.Y + 202)
     Save-Settings
-    $runKey = Get-Item $runPath
-    try { $registeredStartup = $runKey.GetValue('Watchman', '') } finally { $runKey.Close() }
-    Check 'Turning startup off removes the Run entry' ($registeredStartup -eq '')
+    $removed = Wait-Until { $null -eq (Get-StartupTask) -and (Read-RunCommand) -eq '' } 10000
+    Check 'Saved startup Off removes both methods without stopping monitoring' ($removed -and -not $script:app.HasExited)
     # Theme IDs are part of the persisted compatibility contract (Dark/Light/Auto).
     $choiceWidth = ($m.Right - $m.Left - 40 - 16) / 3
     Click ($m.Left + 20 + 2 * ($choiceWidth + 8) + $choiceWidth / 2) ($m.Y + 518)
@@ -295,10 +433,72 @@ try {
     Section 2; $null = Capture '15-settings-warnings-light'
     Wheel -20; $null = Capture '16-settings-warnings-light-bottom'
     Section 3; $null = Capture '17-settings-floating-light'
-    Wheel -20; $null = Capture '18-settings-floating-light-bottom'
-    # Defaults only resets floating appearance, not unrelated settings.
+    $cpuBefore = Read-Setting 'FloatingMonitorCpu' 1
+    $memoryBefore = Read-Setting 'FloatingMonitorMemory' 1
+    Click ($m.Right - 40) ($m.Y + 223)
+    Click ($m.Right - 40) ($m.Y + 271)
+    Check 'CPU/memory settings edit a draft until Save Changes' ((Read-Setting 'FloatingMonitorCpu' 1) -eq $cpuBefore -and (Read-Setting 'FloatingMonitorMemory' 1) -eq $memoryBefore)
+    Click ($m.Left + 130) ($m.Y + $m.Height - 31); Save-Settings
+    Check 'Undo restores both floating reading choices' ((Read-Setting 'FloatingMonitorCpu') -eq $cpuBefore -and (Read-Setting 'FloatingMonitorMemory') -eq $memoryBefore)
+    Click ($m.Right - 40) ($m.Y + 223); Save-Settings
+    Check 'CPU and memory can be saved independently in Floating settings' ((Read-Setting 'FloatingMonitorCpu') -eq 0 -and (Read-Setting 'FloatingMonitorMemory') -eq 1)
+    Click ($m.Right - 40) ($m.Y + 271); Save-Settings
+    $networkBounds = [WatchmanSmokeNative]::Bounds($floating)
+    Check 'Disabling both settings restores the original compact network strip' ((Read-Setting 'FloatingMonitorCpu') -eq 0 -and (Read-Setting 'FloatingMonitorMemory') -eq 0 -and ($networkBounds.Bottom - $networkBounds.Top) -eq 28)
+    Click ($m.Left + 40) ($m.Y + $m.Height - 31)
+    Check 'Floating Defaults also remains an unsaved draft' ((Read-Setting 'FloatingMonitorCpu') -eq 0 -and (Read-Setting 'FloatingMonitorMemory') -eq 0)
+    Save-Settings
+    Check 'Floating Defaults restores CPU and memory without changing unrelated preferences' ((Read-Setting 'FloatingMonitorCpu') -eq 1 -and (Read-Setting 'FloatingMonitorMemory') -eq 1 -and (Read-Setting 'UnitModeBits') -eq (1 - $oldUnit))
+    Click ($m.Right - 40) ($m.Y + 223)
+    Close-Settings; Open-Settings; Section 3; Save-Settings
+    Check 'Closing Settings discards an unsaved CPU visibility change' ((Read-Setting 'FloatingMonitorCpu') -eq 1)
+    Wheel -2
+    $text = Floating-Text-Controls
+    Check 'An absent old text-weight preference becomes Light without changing the saved size' ((Read-Setting 'FloatingMonitorTextWeight') -eq 300 -and (Read-Setting 'FloatingMonitorFontSize') -eq 12)
+    $null = Capture '17a-settings-floating-text-light'
+    Click $text.Bold $text.WeightY; Click $text.Plus $text.SizeY
+    Check 'Weight and size edits remain unsaved drafts' ((Read-Setting 'FloatingMonitorTextWeight') -eq 300 -and (Read-Setting 'FloatingMonitorFontSize') -eq 12)
+    Click ($m.Left + 130) ($m.Y + $m.Height - 31); Save-Settings
+    Check 'Undo restores both saved typography choices' ((Read-Setting 'FloatingMonitorTextWeight') -eq 300 -and (Read-Setting 'FloatingMonitorFontSize') -eq 12)
+    Click $text.Regular $text.WeightY; Save-Settings
+    Check 'Regular can be saved independently of text size' ((Read-Setting 'FloatingMonitorTextWeight') -eq 400 -and (Read-Setting 'FloatingMonitorFontSize') -eq 12)
+    Click $text.Bold $text.WeightY
+    1..4 | ForEach-Object { Click $text.Plus $text.SizeY }
+    Save-Settings
+    $larger = [WatchmanSmokeNative]::Bounds($floating)
+    Check 'Bold and a larger 16px size are real saved choices, resizing the same monitor' ((Read-Setting 'FloatingMonitorTextWeight') -eq 700 -and (Read-Setting 'FloatingMonitorFontSize') -eq 16 -and ($larger.Right - $larger.Left) -eq 251)
+    $null = Capture '17d-settings-floating-text-bold'
+    Close-Settings; Open-Settings; Section 3; Wheel -2
+    Click $text.Light $text.WeightY
+    Close-Settings; Open-Settings; Section 3; Wheel -2; Save-Settings
+    Check 'Closing Settings discards an unsaved weight change' ((Read-Setting 'FloatingMonitorTextWeight') -eq 700 -and (Read-Setting 'FloatingMonitorFontSize') -eq 16)
+    Click ($m.Left + 40) ($m.Y + $m.Height - 31)
+    Check 'Typography Defaults is an unsaved draft until Save Changes' ((Read-Setting 'FloatingMonitorTextWeight') -eq 700 -and (Read-Setting 'FloatingMonitorFontSize') -eq 16)
+    Save-Settings
+    Check 'Floating Defaults restores Light white 12px without changing unrelated units' ((Read-Setting 'FloatingMonitorTextWeight') -eq 300 -and (Read-Setting 'FloatingMonitorFontSize') -eq 12 -and (Read-Setting 'UnitModeBits') -eq (1 - $oldUnit))
+    Wheel -6; $null = Capture '17b-settings-floating-colors-light'
+    $oldColor = Read-Setting 'FloatingTextColor'
+    Set-Floating-ValuesColor 255 0 0
+    Check 'The real native color picker edits only the draft' ((Read-Setting 'FloatingTextColor') -eq $oldColor)
+    Save-Settings
+    Check 'A chosen red value color saves without forcing Bold or changing the size' ((Read-Setting 'FloatingTextColor') -eq 255 -and (Read-Setting 'FloatingMonitorTextWeight') -eq 300 -and (Read-Setting 'FloatingMonitorFontSize') -eq 12) "color=$(Read-Setting 'FloatingTextColor'), weight=$(Read-Setting 'FloatingMonitorTextWeight'), size=$(Read-Setting 'FloatingMonitorFontSize')"
+    Close-Settings
+    $null = Capture '29e-floating-red-light' $floating
+    Choose-Popup (Open-Popup $floating) 'Transparent background'
+    $null = Capture '29f-floating-red-transparent' $floating
+    Choose-Popup (Open-Popup $floating) 'Transparent background'
+    Open-Settings; Section 3; Wheel -2
+    Click $text.Bold $text.WeightY
+    Click $text.Plus $text.SizeY; Click $text.Plus $text.SizeY; Save-Settings
+    Check 'Custom colors survive a later weight and size change' ((Read-Setting 'FloatingTextColor') -eq 255 -and (Read-Setting 'FloatingMonitorTextWeight') -eq 700 -and (Read-Setting 'FloatingMonitorFontSize') -eq 14) "color=$(Read-Setting 'FloatingTextColor'), weight=$(Read-Setting 'FloatingMonitorTextWeight'), size=$(Read-Setting 'FloatingMonitorFontSize')"
+    $null = Capture '17c-settings-floating-text-red-bold'
+    Close-Settings
+    $null = Capture '29g-floating-red-bold' $floating
+    Open-Settings; Section 3
+    # Defaults resets floating readings/appearance, not unrelated settings.
     Click ($m.Left + 40) ($m.Y + $m.Height - 31); Save-Settings
-    Check 'Floating defaults save the default 12px font' ((Read-Setting 'FloatingMonitorFontSize') -eq 12)
+    Check 'Floating defaults save the default Light 12px text' ((Read-Setting 'FloatingMonitorFontSize') -eq 12 -and (Read-Setting 'FloatingMonitorTextWeight') -eq 300)
+    Wheel -20; $null = Capture '18-settings-floating-light-bottom'
     Close-Settings
     $d = Dimensions
     Click ($d.Width - 112) 24
@@ -326,12 +526,34 @@ try {
 
     if ($floating -ne [IntPtr]::Zero -and [WatchmanSmokeNative]::IsWindowVisible($floating)) {
         $bounds = [WatchmanSmokeNative]::Bounds($floating)
-        Check 'Floating default geometry contains only the compact UP/DN strip' (($bounds.Right - $bounds.Left) -eq 188 -and ($bounds.Bottom - $bounds.Top) -eq 28)
+        Check 'Floating default geometry includes the CPU/memory row below UP/DN' (($bounds.Right - $bounds.Left) -eq 188 -and ($bounds.Bottom - $bounds.Top) -eq 56)
         $null = Capture '29-floating-monitor' $floating
         $popup = Open-Popup $floating
         Observe 'Actual floating context menu' ($popup.Labels -join ' | ')
-        Check 'Floating menu has drag/options controls, not CPU/memory modes' (($popup.Labels -contains 'Lock position') -and ($popup.Labels -contains 'Click-through') -and -not (($popup.Labels -join ' ') -match 'CPU|memory'))
+        Check 'Floating menu exposes both independent CPU/memory shortcuts and existing controls' (($popup.Labels -contains 'Lock position') -and ($popup.Labels -contains 'Click-through') -and ($popup.Labels -contains 'Show CPU usage') -and ($popup.Labels -contains 'Show memory usage'))
         [WatchmanSmokeNative]::EscapeMenu(); Start-Sleep -Milliseconds 200
+        Choose-Popup (Open-Popup $floating) 'Show CPU usage'
+        $bounds = [WatchmanSmokeNative]::Bounds($floating)
+        Check 'Floating shortcut can show memory without CPU' ((Read-Setting 'FloatingMonitorCpu') -eq 0 -and (Read-Setting 'FloatingMonitorMemory') -eq 1 -and ($bounds.Bottom - $bounds.Top) -eq 56)
+        $null = Capture '29b-floating-memory-only' $floating
+        Choose-Popup (Open-Popup $floating) 'Show memory usage'
+        $bounds = [WatchmanSmokeNative]::Bounds($floating)
+        Check 'Floating shortcuts remove the unused hardware row when both are hidden' (($bounds.Bottom - $bounds.Top) -eq 28)
+        $null = Capture '29c-floating-network-only' $floating
+        Choose-Popup (Open-Popup $floating) 'Show CPU usage'
+        $bounds = [WatchmanSmokeNative]::Bounds($floating)
+        Check 'Floating shortcut can show CPU without memory' ((Read-Setting 'FloatingMonitorCpu') -eq 1 -and (Read-Setting 'FloatingMonitorMemory') -eq 0 -and ($bounds.Bottom - $bounds.Top) -eq 56)
+        $null = Capture '29d-floating-cpu-only' $floating
+        Choose-Popup (Open-Popup $floating) 'Show memory usage'
+        $weightMenu = Open-Submenu (Open-Popup $floating) 'Text weight'
+        $radioStates = @(0..2 | ForEach-Object { [WatchmanSmokeNative]::GetMenuState($weightMenu.Menu, $_, 0x400) -band 8 })
+        Check 'Native Text weight menu exposes Light Regular Bold with exactly one selected choice' (($weightMenu.Labels -join '|') -eq 'Light (default)|Regular|Bold' -and $radioStates[0] -eq 8 -and $radioStates[1] -eq 0 -and $radioStates[2] -eq 0)
+        Choose-Popup $weightMenu 'Regular'
+        Check 'Native Regular weight shortcut saves immediately' ((Read-Setting 'FloatingMonitorTextWeight') -eq 400)
+        Choose-Popup (Open-Submenu (Open-Popup $floating) 'Text weight') 'Bold'
+        Check 'Native Bold weight shortcut saves immediately' ((Read-Setting 'FloatingMonitorTextWeight') -eq 700)
+        Choose-Popup (Open-Submenu (Open-Popup $floating) 'Text weight') 'Light (default)'
+        Check 'Native Light weight shortcut restores the thin default' ((Read-Setting 'FloatingMonitorTextWeight') -eq 300)
         $before = [WatchmanSmokeNative]::Bounds($floating)
         [WatchmanSmokeNative]::Drag($floating, -90, -80)
         $after = [WatchmanSmokeNative]::Bounds($floating)
@@ -363,7 +585,11 @@ try {
     $widget = [WatchmanSmokeNative]::Find('WatchmanWidgetClass', $script:app.Id)
     if ($widget -eq [IntPtr]::Zero -or -not [WatchmanSmokeNative]::IsWindowVisible($widget)) {
         Observe 'Taskbar placement retry' ([WatchmanSmokeNative]::WidenDisposableDesktop())
-        $null = Wait-Until { [WatchmanSmokeNative]::IsWindowVisible($widget) } 6000
+        $null = Wait-Until {
+            $widget = [WatchmanSmokeNative]::Find('WatchmanWidgetClass', $script:app.Id)
+            [WatchmanSmokeNative]::IsWindowVisible($widget)
+        } 6000
+        $widget = [WatchmanSmokeNative]::Find('WatchmanWidgetClass', $script:app.Id)
     }
     if ($widget -ne [IntPtr]::Zero -and [WatchmanSmokeNative]::IsWindowVisible($widget)) {
         $widgetParent = [WatchmanSmokeNative]::GetParent($widget)
@@ -382,14 +608,144 @@ try {
         $null = Capture '30-desktop-taskbar-unavailable' ([IntPtr]::Zero)
     }
 
+    # A real Explorer restart on the disposable desktop, not a posted fake
+    # broadcast. Never terminate Explorer outside the wrapper's safety gate.
+    $events = @(Startup-Events $script:app.Id)
+    Check 'Actual backend reports readiness and a first measurement' (
+        @($events | Where-Object { $_ -match ' backend ready ' }).Count -gt 0 -and
+        @($events | Where-Object { $_ -match ' backend first-measurement ' }).Count -gt 0)
+    $shellWindow = [WatchmanSmokeNative]::FindWindow('Shell_TrayWnd', $null)
+    if ($shellWindow -ne [IntPtr]::Zero) {
+        [uint32]$shellOwner = 0
+        $null = [WatchmanSmokeNative]::GetWindowThreadProcessId($shellWindow, [ref]$shellOwner)
+        $shellProcess = [Diagnostics.Process]::GetProcessById($shellOwner)
+        if ($shellProcess.ProcessName -ne 'explorer' -or $shellProcess.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId) {
+            throw 'Refusing to restart an unexpected shell or another Windows session.'
+        }
+        $backendStarts = @($events | Where-Object { $_ -match ' backend starting ' }).Count
+        $presentedBefore = @($events | Where-Object { $_ -match ' graphics (gdi|composition)-presented ' }).Count
+        Stop-Process -Id $shellOwner -Force
+        if (-not (Wait-Until { [WatchmanSmokeNative]::FindWindow('Shell_TrayWnd', $null) -ne [IntPtr]::Zero } 5000)) {
+            Start-Process explorer.exe | Out-Null
+        }
+        $shellRestored = Wait-Until { [WatchmanSmokeNative]::FindWindow('Shell_TrayWnd', $null) -ne [IntPtr]::Zero } 20000
+        Check 'Windows recreates the real taskbar after Explorer termination' $shellRestored
+        Check 'Explorer restart retains the same Watchman process' (-not $script:app.HasExited -and [WatchmanSmokeNative]::IsWindow($script:main))
+        $null = [WatchmanSmokeNative]::Send($script:main, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+        $widgetRecovered = Wait-Until {
+            $candidate = [WatchmanSmokeNative]::Find('WatchmanWidgetClass', $script:app.Id)
+            $candidate -ne [IntPtr]::Zero -and [WatchmanSmokeNative]::IsWindowVisible($candidate) -and
+                [WatchmanSmokeNative]::GetParent($candidate) -ne [IntPtr]::Zero
+        } 15000
+        $events = @(Startup-Events $script:app.Id)
+        Check 'Explorer recovery does not restart backend acquisition' (
+            @($events | Where-Object { $_ -match ' backend starting ' }).Count -eq $backendStarts)
+        if ($widgetRecovered) {
+            $frameRecovered = Wait-Until {
+                @((Startup-Events $script:app.Id) | Where-Object { $_ -match ' graphics (gdi|composition)-presented ' }).Count -gt $presentedBefore
+            } 5000
+            Check 'Explorer recovery submits a checked frame, not only WM_PAINT' $frameRecovered
+            $widget = [WatchmanSmokeNative]::Find('WatchmanWidgetClass', $script:app.Id)
+            $null = Capture '31b-widget-after-explorer-restart' $widget
+        } else {
+            $latestWidgetStatus = @($events | Where-Object { $_ -match ' widget ' } | Select-Object -Last 1)
+            $reason = @($latestWidgetStatus | Where-Object { $_ -match ' widget (waiting-for-taskbar|waiting-for-layout|unsupported-taskbar-bounds|no-safe-space) ' })
+            Check 'Hidden widget after shell restart has an explicit safe-placement reason' ($reason.Count -gt 0)
+            Observe 'Explorer widget coverage limit' ('No visible widget after real shell restart; visible recovery is NOT verified. Last placement reason: ' + ($reason -join ''))
+        }
+    } else {
+        Observe 'Explorer recovery coverage limit' 'No Explorer taskbar is available to restart; real shell recovery is NOT verified.'
+    }
+
+    if ($LiveSpeedTest) {
+        # One real consented M-Lab attempt on this disposable public runner, never
+        # the user's network/profile. External success is reported separately from
+        # the deterministic owned-loopback transfer/cancel tests in CTest.
+        Select-Tab 3
+        $null = [WatchmanSmokeNative]::SetForegroundWindow($script:main)
+        Open-SpeedConsent
+        $d = Dimensions
+        $dialogWidth = [Math]::Min(460, $d.Width - 40)
+        $dialogHeight = [Math]::Min(430, $d.Height - 40)
+        $dialogX = ($d.Width - $dialogWidth) / 2
+        $dialogY = ($d.Height - $dialogHeight) / 2
+        $speedBefore = @((Startup-Events $script:app.Id) | Where-Object { $_ -match ' speed-ui ' }).Count
+        Click ([int]($dialogX + ($dialogWidth + 112) / 2)) ([int]($dialogY + $dialogHeight - 41))
+        $speedClock = [Diagnostics.Stopwatch]::StartNew()
+        $maxSpeedUiMs = 0L
+        $capturedPhases = @{}
+        $speedFinished = $false
+        do {
+            $response = [Diagnostics.Stopwatch]::StartNew()
+            $null = [WatchmanSmokeNative]::Send($script:main, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+            $maxSpeedUiMs = [Math]::Max($maxSpeedUiMs, $response.ElapsedMilliseconds)
+            $speedEvents = @((Startup-Events $script:app.Id) | Where-Object { $_ -match ' speed-ui ' } | Select-Object -Skip $speedBefore)
+            $latestPhase = if ($speedEvents.Count) { [regex]::Match($speedEvents[-1], ' speed-ui ([a-z-]+) ').Groups[1].Value } else { '' }
+            if ($latestPhase -in @('locating','download','upload','finishing','failed','completed') -and -not $capturedPhases.ContainsKey($latestPhase)) {
+                $null = Capture ('31c-speed-' + $latestPhase)
+                $capturedPhases[$latestPhase] = $true
+            }
+            $speedFinished = $latestPhase -in @('failed','completed','cancelled')
+            if (-not $speedFinished) { Start-Sleep -Milliseconds 100 }
+        } while (-not $speedFinished -and $speedClock.Elapsed.TotalSeconds -lt 45)
+        Check 'Normal EXE displays a speed-test phase after explicit consent' ($speedEvents.Count -gt 0)
+        Check 'Normal EXE remains message-responsive during the real speed-test attempt' ($maxSpeedUiMs -lt 1000) "max_WM_NULL_ms=$maxSpeedUiMs"
+        if (-not $speedFinished) {
+            Open-SpeedConsent # The same button is Cancel while running.
+            $speedFinished = Wait-Until { @((Startup-Events $script:app.Id) | Where-Object { $_ -match ' speed-ui (cancelled|failed|completed) ' }).Count -gt 0 } 20000
+            Check 'Timed-out external attempt remains cancellable without closing the app' $speedFinished
+        }
+        if ($capturedPhases.ContainsKey('download') -and $capturedPhases.ContainsKey('upload') -and $capturedPhases.ContainsKey('completed')) {
+            Check 'Normal EXE presents both real M-Lab transfer phases and a completion frame' $true
+        } else {
+            Observe 'External speed-test coverage limit' ('Full real M-Lab download/upload completion NOT verified. Shown phases: ' + ($capturedPhases.Keys -join ', ') + '. Owned-loopback tests validate both actual WinHTTP transfer paths independently.')
+        }
+
+        # If the final card contains a partial/estimate notice, inspect the actual
+        # diagnostic dialog too. Never treat an estimate as full external success.
+        $d = Dimensions
+        Click ($d.Width - 80) ($d.Height - 141)
+        $null = Capture '31d-speed-result-details'
+        Key 27
+
+    } else {
+        Observe 'External speed-test coverage limit' 'Not requested. Deterministic real WinHTTP loopback tests run in CTest. Public M-Lab traffic requires workflow live_speed_test=true and publishes runner IP/time/results.'
+    }
+
     [WatchmanSmokeNative]::SetWindowPos($script:main, [IntPtr]::Zero, 100, 60, 460, 650, 0x40) | Out-Null
     $null = Capture '32-compact-dark'
     Open-Settings; Section 2; Wheel -20; $null = Capture '33-compact-warnings-dark'
     Close-Settings
     Select-Tab 3; Open-SpeedConsent; $null = Capture '33b-compact-speed-consent-dark'; Key 27
-    $null = [WatchmanSmokeNative]::Send($script:main, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 400
-    Check 'Close hides to tray without stopping monitoring' (-not $script:app.HasExited -and -not [WatchmanSmokeNative]::IsWindowVisible($script:main))
+    $widgetBeforeClose = [WatchmanSmokeNative]::Find('WatchmanWidgetClass', $script:app.Id)
+    $hadVisibleWidget = $widgetBeforeClose -ne [IntPtr]::Zero -and [WatchmanSmokeNative]::IsWindowVisible($widgetBeforeClose)
+    $floatingBeforeClose = [WatchmanSmokeNative]::Find('WatchmanFloatingMonitorClass', $script:app.Id)
+    $hadVisibleFloating = $floatingBeforeClose -ne [IntPtr]::Zero -and [WatchmanSmokeNative]::IsWindowVisible($floatingBeforeClose)
+    # Exercise the actual client-drawn cross, not just a synthetic WM_CLOSE.
+    $d = Dimensions
+    $hiddenFramesBefore = @((Startup-Events $script:app.Id) | Where-Object { $_ -match ' widget measurement-after-dashboard-hide ' }).Count
+    $widgetPreferenceBefore = Read-Setting 'Widget' 1
+    $floatingPreferenceBefore = Read-Setting 'FloatingMonitor' 0
+    Click ($d.Width - 24) 24
+    $hidden = Wait-Until { $script:app.HasExited -or -not [WatchmanSmokeNative]::IsWindowVisible($script:main) } 5000
+    Check 'Close hides to tray without stopping monitoring' ($hidden -and -not $script:app.HasExited -and -not [WatchmanSmokeNative]::IsWindowVisible($script:main))
+    if ($hadVisibleWidget) {
+        $keptWidget = Wait-Until {
+            $w = [WatchmanSmokeNative]::Find('WatchmanWidgetClass', $script:app.Id)
+            $w -ne [IntPtr]::Zero -and [WatchmanSmokeNative]::IsWindowVisible($w) -and [WatchmanSmokeNative]::GetParent($w) -ne [IntPtr]::Zero
+        } 5000
+        Check 'Closing the dashboard retains the enabled visible taskbar widget' $keptWidget
+        if ($keptWidget) {
+            $continued = Wait-Until { @((Startup-Events $script:app.Id) | Where-Object { $_ -match ' widget measurement-after-dashboard-hide ' }).Count -gt $hiddenFramesBefore } 6000
+            Check 'Backend acquisition and accepted widget frames continue after dashboard Close' $continued
+            $null = Capture '33c-taskbar-with-dashboard-closed' ([WatchmanSmokeNative]::Find('WatchmanWidgetClass', $script:app.Id))
+        }
+    } else { Observe 'Close-to-tray widget coverage limit' 'Widget was not visible before Close; this case does not prove visible-widget retention.' }
+    if ($hadVisibleFloating) {
+        Check 'Closing the dashboard retains the enabled floating monitor' ([WatchmanSmokeNative]::IsWindowVisible($floatingBeforeClose))
+        $null = Capture '33d-floating-with-dashboard-closed' $floatingBeforeClose
+    } else { Observe 'Close-to-tray floating coverage limit' 'Floating monitor was not visible before Close; retention is NOT verified.' }
+    Check 'Dashboard Close does not change saved widget preferences' ((Read-Setting 'Widget' 1) -eq $widgetPreferenceBefore -and (Read-Setting 'FloatingMonitor' 0) -eq $floatingPreferenceBefore)
     $duplicate = Start-App
     $exited = $duplicate.WaitForExit(10000)
     $restored = Wait-Until { [WatchmanSmokeNative]::IsWindowVisible($script:main) } 5000
@@ -407,6 +763,11 @@ try {
     $restored = Wait-Until { [WatchmanSmokeNative]::IsWindowVisible($script:main) -and -not [WatchmanSmokeNative]::IsIconic($script:main) } 5000
     Check 'Interactive relaunch restores the same minimized instance' ($exited -and $duplicate.ExitCode -eq 0 -and $restored -and -not $script:app.HasExited) "duplicate_exited=$exited, code=$($duplicate.ExitCode), restored=$restored"
     if (-not $exited) { Observe 'Minimized activation duplicate windows' ([WatchmanSmokeNative]::DescribeWindows($duplicate.Id)); $duplicate.Kill($true); $duplicate.WaitForExit() }
+    $floating = [WatchmanSmokeNative]::Find('WatchmanFloatingMonitorClass', $script:app.Id)
+    Choose-Popup (Open-Submenu (Open-Popup $floating) 'Text weight') 'Bold'
+    Choose-Popup (Open-Submenu (Open-Popup $floating) 'Text size') '14 px'
+    Open-Settings; Section 3; Wheel -8
+    Set-Floating-ValuesColor 255 0 0 -Stage 'restart'; Save-Settings; Close-Settings
     $oldProcess = $script:app
     Choose-Popup (Open-Popup $script:main $true) 'Restart Watchman'
     $oldExited = $oldProcess.WaitForExit(15000)
@@ -423,13 +784,89 @@ try {
     [uint32]$owner = 0; $null = [WatchmanSmokeNative]::GetWindowThreadProcessId($script:main, [ref]$owner)
     $script:app = [Diagnostics.Process]::GetProcessById($owner); $null = $script:app.Handle; $processes.Add($script:app)
     Check 'Replacement retains committed Settings and tour completion' ((Read-Setting 'UnitModeBits' 0) -eq (1 - $oldUnit) -and (Read-Setting 'WelcomeTourVersion' 0) -eq 1)
+    $floating = [WatchmanSmokeNative]::Find('WatchmanFloatingMonitorClass', $script:app.Id)
+    $weightMenu = Open-Submenu (Open-Popup $floating) 'Text weight'
+    $boldSelected = ([WatchmanSmokeNative]::GetMenuState($weightMenu.Menu, 2, 0x400) -band 8) -ne 0
+    [WatchmanSmokeNative]::EscapeMenu(); [WatchmanSmokeNative]::EscapeMenu(); Start-Sleep -Milliseconds 150
+    $resized = [WatchmanSmokeNative]::Bounds($floating)
+    Check 'A real process restart loads Bold 14px and the custom red color' ($boldSelected -and (Read-Setting 'FloatingMonitorTextWeight') -eq 700 -and (Read-Setting 'FloatingMonitorFontSize') -eq 14 -and (Read-Setting 'FloatingTextColor') -eq 255 -and ($resized.Right - $resized.Left) -eq 220) "bold_menu=$boldSelected, color=$(Read-Setting 'FloatingTextColor'), weight=$(Read-Setting 'FloatingMonitorTextWeight'), size=$(Read-Setting 'FloatingMonitorFontSize'), width=$($resized.Right - $resized.Left)"
+    $null = Capture '33e-floating-text-after-restart' $floating
+    Open-Settings; Section 3
+    $m = Modal
+    Click ($m.Left + 40) ($m.Y + $m.Height - 31); Save-Settings; Close-Settings
     Stop-App $script:app $script:main
     $script:main = [IntPtr]::Zero
 
+    # Real rapid launches exercise normal shutdown while asynchronous setup
+    # may still be in flight. The probe separately blocks setup deterministically.
+    for ($quick = 0; $quick -lt 3; ++$quick) {
+        $script:app = Start-App @('--startup')
+        Find-Main $script:app
+        Check "Rapid quiet launch $quick has a responsive hidden window host" (-not $script:app.HasExited -and -not [WatchmanSmokeNative]::IsWindowVisible($script:main))
+        Stop-App $script:app $script:main
+        $script:main = [IntPtr]::Zero
+    }
+
+    # Start the unmodified EXE during a real Explorer interruption on this
+    # disposable desktop. Native CTest separately forces blocked/failed tray
+    # calls; Explorer may auto-restart too quickly to cause a real add failure.
+    $quietShell = [WatchmanSmokeNative]::FindWindow('Shell_TrayWnd', $null)
+    if ($quietShell -ne [IntPtr]::Zero) {
+        [uint32]$quietShellOwner = 0
+        $null = [WatchmanSmokeNative]::GetWindowThreadProcessId($quietShell, [ref]$quietShellOwner)
+        $quietShellProcess = [Diagnostics.Process]::GetProcessById($quietShellOwner)
+        if ($quietShellProcess.ProcessName -ne 'explorer' -or $quietShellProcess.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId) {
+            throw 'Refusing to interrupt an unexpected shell or another Windows session.'
+        }
+        Stop-Process -Id $quietShellOwner -Force
+        $script:app = Start-App @('--startup')
+        Find-Main $script:app
+        Check 'Quiet EXE stays hidden and unfocused while Explorer is restarting' ([WatchmanSmokeNative]::StaysHidden($script:main, 1200))
+        if (-not (Wait-Until { [WatchmanSmokeNative]::FindWindow('Shell_TrayWnd', $null) -ne [IntPtr]::Zero } 3000)) {
+            Start-Process explorer.exe | Out-Null
+        }
+        $quietShellRestored = Wait-Until { [WatchmanSmokeNative]::FindWindow('Shell_TrayWnd', $null) -ne [IntPtr]::Zero } 20000
+        Check 'Real taskbar returns during quiet EXE recovery' $quietShellRestored
+        $quietTrayReady = Wait-Until { @((Startup-Events $script:app.Id) | Where-Object { $_ -match ' shell tray-ready ' }).Count -gt 0 } 10000
+        Check 'Quiet EXE recovers its real tray registration without opening the dashboard' ($quietTrayReady -and [WatchmanSmokeNative]::StaysHidden($script:main, 1200))
+        Record-StartupTiming $script:app.Id $true
+        $quietEvents = @(Startup-Events $script:app.Id)
+        $unavailable = @($quietEvents | Where-Object { $_ -match ' shell tray-unavailable ' }).Count
+        Observe 'Real tray-failure coverage during the shell interruption' "tray-unavailable markers=$unavailable. A fast Explorer restart may avoid this race; native CTest deterministically blocks/fails it. This is not a Windows sign-in test."
+        $quietWidgetReady = Wait-Until {
+            $w = [WatchmanSmokeNative]::Find('WatchmanWidgetClass', $script:app.Id)
+            $w -ne [IntPtr]::Zero -and [WatchmanSmokeNative]::IsWindowVisible($w) -and [WatchmanSmokeNative]::GetParent($w) -ne [IntPtr]::Zero
+        } 6000
+        if ($quietWidgetReady) {
+            $quietFrame = Wait-Until { @((Startup-Events $script:app.Id) | Where-Object { $_ -match ' graphics gdi-presented ' }).Count -gt 0 } 3000
+            Check 'Quiet shell recovery accepts an independent first GDI widget frame' $quietFrame
+            $null = Capture '34a-quiet-start-recovered-taskbar' ([WatchmanSmokeNative]::Find('WatchmanWidgetClass', $script:app.Id))
+        } else {
+            $quietReason = @((Startup-Events $script:app.Id) | Where-Object { $_ -match ' widget ' } | Select-Object -Last 1)
+            Check 'Unavailable quiet widget has an explicit safe-placement reason' (@($quietReason | Where-Object { $_ -match ' widget (waiting-for-taskbar|waiting-for-layout|unsupported-taskbar-bounds|no-safe-space) ' }).Count -gt 0)
+            Observe 'Quiet real-shell widget coverage limit' ('No visible safe gap; visible recovery is NOT verified. ' + ($quietReason -join ''))
+        }
+        Check 'Quiet shell recovery leaves all dashboard graphics unloaded' (@((Startup-Events $script:app.Id) | Where-Object { $_ -match ' main-graphics ' }).Count -eq 0)
+        Stop-App $script:app $script:main
+        $script:main = [IntPtr]::Zero
+    } else {
+        Observe 'Quiet real-shell interruption coverage limit' 'No Explorer taskbar was available; native owned-window tests cover blocked and failed tray calls instead.'
+    }
+
+    # A quiet-startup flag is not proof of an actual Windows sign-in.
     # First sign-in-style startup must remain quiet and defer, not consume, the tour.
     Remove-ItemProperty $settingsPath -Name 'WelcomeTourVersion'
+    Write-Setting 'Autostart' 1
+    Seed-LegacyRun
     $script:app = Start-App @('--startup')
     Find-Main $script:app
+    Record-StartupTiming $script:app.Id $true
+    $migrated = Wait-Until { @(Startup-Events $script:app.Id | Where-Object { $_ -match ' startup task-ready ' }).Count -eq 1 } 10000
+    Check 'Automatic upgrade migrates an enabled legacy Run item only after the UI loop is ready' ($migrated -and $null -ne (Get-StartupTask) -and (Read-RunCommand) -eq '')
+    $migrationEvents = @(Startup-Events $script:app.Id)
+    $loopLine = @($migrationEvents | Where-Object { $_ -match ' ui message-loop-ready ' } | Select-Object -First 1)
+    $startupLine = @($migrationEvents | Where-Object { $_ -match ' startup task-ready ' } | Select-Object -First 1)
+    Check 'Registration completion is not an initial widget/tray/message-loop gate' ($loopLine.Count -eq 1 -and $startupLine.Count -eq 1 -and [long](($startupLine[0] -split ' ')[0]) -ge [long](($loopLine[0] -split ' ')[0]))
     Check 'Startup launch stays in the tray and defers onboarding' (-not [WatchmanSmokeNative]::IsWindowVisible($script:main) -and (Read-Setting 'WelcomeTourVersion' 0) -eq 0)
     $duplicate = Start-App @('--startup')
     $duplicateExited = $duplicate.WaitForExit(10000)
@@ -441,8 +878,53 @@ try {
     Check 'Skipping the deferred tour saves completion' ((Read-Setting 'WelcomeTourVersion' 0) -eq 1)
     Stop-App $script:app $script:main
     $script:main = [IntPtr]::Zero
+    Check 'Explicit Exit leaves the enabled sign-in preference registered' ($null -ne (Get-StartupTask))
+
+    $script:app = Start-App @('--startup')
+    Find-Main $script:app
+    $unchanged = Wait-Until { @(Startup-Events $script:app.Id | Where-Object { $_ -match ' startup task-ready ' }).Count -eq 1 } 10000
+    Check 'A subsequent quiet launch does not rewrite a matching task or recreate Run' ($unchanged -and (Read-RunCommand) -eq '' -and @(Startup-Events $script:app.Id | Where-Object { $_ -match ' startup registration-changed ' }).Count -eq 0)
+    Stop-App $script:app $script:main
+    $script:main = [IntPtr]::Zero
+
+    (Get-StartupTask).Enabled = $false
+    $disabledTaskXml = (Get-StartupTask).Xml
+    $script:app = Start-App @('--startup') # Deliberate manual launch, not a sign-in trigger.
+    Find-Main $script:app
+    $externalDisabled = Wait-Until { @(Startup-Events $script:app.Id | Where-Object { $_ -match ' startup externally-disabled ' }).Count -eq 1 } 10000
+    Check 'An externally disabled task stays disabled across an ordinary quiet launch' ($externalDisabled -and -not (Get-StartupTask).Enabled -and (Get-StartupTask).Xml -eq $disabledTaskXml -and (Read-RunCommand) -eq '')
+    Stop-App $script:app $script:main
+    $script:main = [IntPtr]::Zero
+
+    Write-Setting 'Autostart' 0
+    $script:app = Start-App @('--startup')
+    Find-Main $script:app
+    $savedOff = Wait-Until { @(Startup-Events $script:app.Id | Where-Object { $_ -match ' startup disabled ' }).Count -eq 1 } 10000
+    Check 'A saved Off survives launch and removes a disabled sign-in task too' ($savedOff -and $null -eq (Get-StartupTask) -and (Read-RunCommand) -eq '')
+    Stop-App $script:app $script:main
+    $script:main = [IntPtr]::Zero
     $appDb = Join-Path $env:APPDATA 'Watchman.Native\watchman.db'
-    Check 'Real EXE creates persistent history at isolated APPDATA' (Test-Path $appDb)
+    Check 'Real EXE reuses the existing isolated native profile' (Test-Path $appDb)
+    Check 'New test-session history in the legacy DB is byte-identical after the native-profile fix' ((Get-FileHash -Algorithm SHA256 $legacyDb).Hash -eq $legacyHash)
+    Check 'The original-v1 archival DB was not restored or changed' ((Get-FileHash -Algorithm SHA256 $archiveDb).Hash -eq $archiveHash)
+    $allEvents = @(Get-Content -LiteralPath $startupLog)
+    $malformedEvents = @($allEvents | Where-Object { $_ -and $_ -notmatch '^\d+ pid=\d+ [a-z0-9-]+ [a-z0-9-]+ error=\d+$' })
+    Check 'Duplicate launches do not corrupt startup transition records' ($malformedEvents.Count -eq 0) "malformed_records=$($malformedEvents.Count)"
+    $updateStarts = @($allEvents | Where-Object { $_ -match ' updates check-started ' })
+    $updateStartSafe = $updateStarts.Count -gt 0
+    foreach ($start in $updateStarts) {
+        $parts = $start -split ' '
+        $updatePid = $parts[1]
+        $ready = @($allEvents | Where-Object { $_ -match ("^\d+ " + [regex]::Escape($updatePid) + " ui message-loop-ready ") } | Select-Object -First 1)
+        if ($ready.Count -ne 1 -or ([long]$parts[0] - [long](($ready[0] -split ' ')[0])) -lt 15000) { $updateStartSafe = $false }
+    }
+    Check 'Actual EXE defers automatic release checks at least 15 seconds after its own UI-loop marker' $updateStartSafe ("checks_started=" + $updateStarts.Count)
+    $updateResults = @($allEvents | Where-Object { $_ -match ' updates (checked|check-failed|available) ' })
+    Check 'Actual release-check worker returns a truthful result without blocking desktop smoke' ($updateResults.Count -gt 0) ($updateResults -join '; ')
+    Observe 'Update notification delivery limit' 'The actual EXE uses the real official stable channel. It is not fed a fake newer version; Windows notification visibility/activation requires a genuinely newer release on Windows 10/11. Native UI FIXTURE screenshots are separate owned test windows.'
+    Check 'Actual EXE reports selecting native history rather than stale legacy history' (@($allEvents | Where-Object { $_ -match ' history native-profile ' }).Count -gt 0)
+    & $RuntimeProbe --verify-profiles $env:APPDATA | Set-Content (Join-Path $OutputDirectory 'profile-verification.jsonl')
+    Check 'Real EXE preserves native rows without merging independent legacy/JSON/backup history' ($LASTEXITCODE -eq 0)
     if (Test-Path $appDb) {
         & $RuntimeProbe --inspect-db $appDb | Set-Content (Join-Path $OutputDirectory 'application-database.jsonl')
         Check 'Real EXE history database passes SQLite integrity check' ($LASTEXITCODE -eq 0)
@@ -457,6 +939,17 @@ try {
         [WatchmanSmokeNative]::EscapeMenu()
         foreach ($process in $processes) {
             try { if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit(5000) | Out-Null } } catch { Write-Warning $_ }
+        }
+        if ($startupTaskScopeSafe) {
+            $task = Get-StartupTask
+            if ($null -ne $task) {
+                if ($task.Definition.RegistrationInfo.Source -ne 'app.blinkeye.watchman.startup.v1' -or
+                    -not (Same-User $task.Definition.Principal.UserId ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value))) {
+                    throw 'Refusing cleanup of an unowned startup task.'
+                }
+                $script:startupFolder.DeleteTask($startupTaskName, 0)
+            }
+            Check 'Disposable smoke leaves no Watchman sign-in task' ($null -eq (Get-StartupTask))
         }
         if (Test-Path $settingsPath) { Remove-Item $settingsPath -Recurse -Force }
         if ($hadSettings -and (Test-Path $settingsBackup)) { & reg.exe import $settingsBackup | Out-Null }
@@ -475,6 +968,7 @@ try {
         $_ | Format-List * -Force | Out-String | Set-Content (Join-Path $OutputDirectory 'cleanup-error.txt')
     } finally {
         $env:APPDATA = $originalAppdata
+        $env:LOCALAPPDATA = $originalLocalAppdata
         [WatchmanSmokeNative]::RestoreDisplay()
     }
 }
@@ -487,6 +981,7 @@ try {
     $info.UseShellExecute = $false
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
+    $info.Environment['LOCALAPPDATA'] = Join-Path $OutputDirectory 'local-appdata'
     $info.ArgumentList.Add('--exercise'); $info.ArgumentList.Add($OutputDirectory)
     $probe = [Diagnostics.Process]::Start($info)
     $stdoutTask = $probe.StandardOutput.ReadToEndAsync()
@@ -511,6 +1006,8 @@ try {
         Where-Object Message -match 'Watchman.exe' | Select-Object -Property @('TimeCreated', 'Id', 'Message') |
         Format-List | Out-String | Set-Content (Join-Path $OutputDirectory 'application-crash-events.txt')
 } catch { Write-Warning $_ }
+
+if (Test-Path $startupLog) { Copy-Item $startupLog (Join-Path $OutputDirectory 'startup-recovery.txt') }
 
 $failures = @($records | Where-Object { $null -ne $_.pass -and -not $_.pass })
 $report = [pscustomobject]@{ executableSha256 = (Get-FileHash $Executable -Algorithm SHA256).Hash; commit = $env:GITHUB_SHA; failures = $failures.Count; checks = $records }

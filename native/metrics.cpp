@@ -5,7 +5,6 @@
 #include "metrics.h"
 #include <ws2tcpip.h>
 #include <iostream>
-#include <dxgi.h>
 #include <pdh.h>
 #include <powrprof.h>
 #include <wlanapi.h>
@@ -17,6 +16,7 @@
 #include <iomanip>
 #include <initializer_list>
 #include <map>
+#include <utility>
 #include <sstream>
 
 namespace {
@@ -305,86 +305,6 @@ static WifiConnectionDetails QueryWifiConnectionDetails(const GUID* target_inter
     return details;
 }
 
-constexpr wchar_t kGpuCounterWildcard[] = L"\\GPU Engine(*)\\Utilization Percentage";
-constexpr ULONGLONG kGpuCounterRefreshIntervalMs = 8000;
-constexpr PDH_STATUS kPdhMoreData = static_cast<PDH_STATUS>(0x800007D2u);
-
-static std::vector<std::wstring> ExpandGpuCounterPaths() {
-    DWORD required_chars = 0;
-    const PDH_STATUS first_status = PdhExpandWildCardPathW(
-        nullptr, kGpuCounterWildcard, nullptr, &required_chars, 0
-    );
-    if (first_status != kPdhMoreData || required_chars == 0) {
-        return {};
-    }
-
-    std::vector<wchar_t> buffer(required_chars);
-    DWORD buffer_chars = required_chars;
-    if (PdhExpandWildCardPathW(nullptr, kGpuCounterWildcard, buffer.data(), &buffer_chars, 0) != ERROR_SUCCESS) {
-        return {};
-    }
-
-    std::vector<std::wstring> paths;
-    for (const wchar_t* current = buffer.data(); current != nullptr && *current != L'\0';) {
-        std::wstring path(current);
-        if (path.find(L"_Total") == std::wstring::npos) {
-            paths.push_back(std::move(path));
-        }
-        current += wcslen(current) + 1;
-    }
-    return paths;
-}
-
-static std::wstring ExtractGpuInstanceName(const std::wstring& counter_path) {
-    const size_t start_marker = counter_path.find(L'(');
-    const size_t start = start_marker == std::wstring::npos ? 0 : start_marker + 1;
-    const size_t end = counter_path.find(L')', start);
-    return counter_path.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
-}
-
-static std::wstring ExtractGpuKey(const std::wstring& counter_path) {
-    const std::wstring instance = ExtractGpuInstanceName(counter_path);
-    const size_t marker = instance.find(L"_phys_");
-    if (marker != std::wstring::npos) {
-        size_t end = marker + 6;
-        while (end < instance.size() && std::iswdigit(instance[end])) {
-            ++end;
-        }
-        if (end > marker + 6) {
-            return L"phys_" + instance.substr(marker + 6, end - (marker + 6));
-        }
-    }
-    return instance;
-}
-
-static std::wstring PrettifyGpuEngineName(const std::wstring& raw_name) {
-    std::wstring pretty;
-    pretty.reserve(raw_name.size() + 4);
-    bool previous_lowercase = false;
-    for (wchar_t character : raw_name) {
-        if (character == L'_') {
-            character = L' ';
-        }
-        if (previous_lowercase && std::iswupper(character)) {
-            pretty.push_back(L' ');
-        }
-        pretty.push_back(character);
-        previous_lowercase = std::iswlower(character) != 0;
-    }
-    while (!pretty.empty() && pretty.back() == L' ') {
-        pretty.pop_back();
-    }
-    return pretty.empty() ? L"Active engine" : pretty;
-}
-
-static std::wstring ExtractGpuEngineName(const std::wstring& counter_path) {
-    const std::wstring instance = ExtractGpuInstanceName(counter_path);
-    const size_t marker = instance.find(L"_engtype_");
-    return marker == std::wstring::npos
-        ? L"Active engine"
-        : PrettifyGpuEngineName(instance.substr(marker + 9));
-}
-
 struct ProcessorPowerInformationRecord {
     ULONG Number;
     ULONG MaxMhz;
@@ -443,7 +363,8 @@ static float QueryCurrentCpuSpeedGhz(uint32_t processor_count) {
         : 0.0f;
 }
 
-MetricsManager::MetricsManager() {
+MetricsManager::MetricsManager(GpuMonitor::InitializationHook before_gpu_initialize)
+    : gpu_monitor_(std::move(before_gpu_initialize)) {
     uptime_seconds_ = 0;
 
     // Get CPU Core Count
@@ -455,37 +376,13 @@ MetricsManager::MetricsManager() {
     }
     InitializeSystemInfo();
 
-    // Get GPU Name/Label from DXGI
-    IDXGIFactory* pFactory = nullptr;
-    if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&pFactory))) {
-        IDXGIAdapter* pAdapter = nullptr;
-        if (SUCCEEDED(pFactory->EnumAdapters(0, &pAdapter))) {
-            DXGI_ADAPTER_DESC desc;
-            if (SUCCEEDED(pAdapter->GetDesc(&desc))) {
-                gpu_.label = desc.Description;
-                gpu_.available = true;
-            }
-            pAdapter->Release();
-        }
-        pFactory->Release();
-    }
-
-    if (!gpu_.available) {
-        gpu_.label = L"N/A";
-        gpu_.available = false;
-    }
-
     InitCpuPdh();
-    InitGpuPdh();
     Update();
 }
 
 MetricsManager::~MetricsManager() {
     if (pdh_cpu_initialized_ && pdh_cpu_query_) {
         PdhCloseQuery(static_cast<HQUERY>(pdh_cpu_query_));
-    }
-    if (pdh_gpu_initialized_ && pdh_query_) {
-        PdhCloseQuery(static_cast<HQUERY>(pdh_query_));
     }
 }
 
@@ -557,7 +454,6 @@ void MetricsManager::Update() {
     UpdateRam();
     UpdateDisk();
     UpdateNetwork();
-    UpdateGpu();
     UpdateUptime();
 }
 
@@ -907,147 +803,10 @@ void MetricsManager::RefreshAdapterDetails(uint32_t interface_index) {
     }
 }
 
-void MetricsManager::UpdateGpu() {
-    if (!pdh_gpu_initialized_) {
-        InitGpuPdh();
-    }
-
-    if (!pdh_gpu_initialized_ || !pdh_query_ || pdh_gpu_counters_.empty()) {
-        gpu_.percent_used = 0.0f;
-        gpu_.active_engine = L"Unavailable";
-        return;
-    }
-
-    RefreshGpuPdhCounters();
-    if (!pdh_gpu_initialized_ || !pdh_query_ || pdh_gpu_counters_.empty()) {
-        gpu_.percent_used = 0.0f;
-        gpu_.active_engine = L"Unavailable";
-        return;
-    }
-
-    const HQUERY query = static_cast<HQUERY>(pdh_query_);
-    if (PdhCollectQueryData(query) != ERROR_SUCCESS) {
-        gpu_.percent_used = 0.0f;
-        gpu_.active_engine = L"Unavailable";
-        return;
-    }
-
-    // PDH needs a first sample before formatted utilization values are valid.
-    if (!pdh_gpu_primed_) {
-        pdh_gpu_primed_ = true;
-        gpu_.percent_used = 0.0f;
-        gpu_.active_engine = L"Starting...";
-        return;
-    }
-
-    std::map<std::pair<std::wstring, std::wstring>, double> per_gpu_engine;
-    for (const GpuPdhCounter& entry : pdh_gpu_counters_) {
-        DWORD counter_type = 0;
-        PDH_FMT_COUNTERVALUE value{};
-        if (PdhGetFormattedCounterValue(
-                static_cast<HCOUNTER>(entry.handle), PDH_FMT_DOUBLE, &counter_type, &value
-            ) != ERROR_SUCCESS || value.CStatus != ERROR_SUCCESS ||
-            !std::isfinite(value.doubleValue) || value.doubleValue <= 0.0) {
-            continue;
-        }
-
-        per_gpu_engine[{ExtractGpuKey(entry.path), ExtractGpuEngineName(entry.path)}] += value.doubleValue;
-    }
-
-    std::map<std::wstring, double> per_gpu_overall;
-    std::wstring busiest_engine = L"Idle";
-    double busiest_value = 0.0;
-    for (const auto& [key, engine_total] : per_gpu_engine) {
-        const double clamped_total = std::min(engine_total, 100.0);
-        double& gpu_total = per_gpu_overall[key.first];
-        gpu_total = std::max(gpu_total, clamped_total);
-        if (clamped_total > busiest_value) {
-            busiest_value = clamped_total;
-            busiest_engine = key.second;
-        }
-    }
-
-    double overall = 0.0;
-    for (const auto& [gpu_key, gpu_total] : per_gpu_overall) {
-        overall = std::max(overall, gpu_total);
-    }
-
-    gpu_.percent_used = static_cast<float>(std::round(std::clamp(overall, 0.0, 100.0) * 10.0) / 10.0);
-    gpu_.active_engine = overall > 0.0 ? busiest_engine : L"Idle";
-}
-
 void MetricsManager::UpdateUptime() {
     // This is Windows boot uptime, matching Tauri's System::uptime(), rather
     // than the age of the Watchman process.
     uptime_seconds_ = GetTickCount64() / 1000;
-}
-
-void MetricsManager::InitGpuPdh() {
-    if (pdh_query_) {
-        PdhCloseQuery(static_cast<HQUERY>(pdh_query_));
-    }
-    pdh_query_ = nullptr;
-    pdh_gpu_counters_.clear();
-    pdh_gpu_initialized_ = false;
-    pdh_gpu_primed_ = false;
-
-    const std::vector<std::wstring> paths = ExpandGpuCounterPaths();
-    if (paths.empty()) {
-        return;
-    }
-
-    HQUERY query = nullptr;
-    if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS || !query) {
-        return;
-    }
-
-    for (const std::wstring& path : paths) {
-        HCOUNTER counter = nullptr;
-        if (PdhAddEnglishCounterW(query, path.c_str(), 0, &counter) == ERROR_SUCCESS && counter) {
-            pdh_gpu_counters_.push_back({ counter, path });
-        }
-    }
-
-    if (pdh_gpu_counters_.empty()) {
-        PdhCloseQuery(query);
-        return;
-    }
-
-    pdh_query_ = query;
-    pdh_gpu_initialized_ = true;
-    pdh_gpu_primed_ = false;
-    last_gpu_counter_refresh_ms_ = GetTickCount64();
-    gpu_.available = true;
-    gpu_.active_engine = L"Starting...";
-}
-
-void MetricsManager::RefreshGpuPdhCounters() {
-    if (!pdh_gpu_initialized_) {
-        return;
-    }
-
-    const ULONGLONG now = GetTickCount64();
-    if (now - last_gpu_counter_refresh_ms_ < kGpuCounterRefreshIntervalMs) {
-        return;
-    }
-    last_gpu_counter_refresh_ms_ = now;
-
-    std::vector<std::wstring> refreshed_paths = ExpandGpuCounterPaths();
-    if (refreshed_paths.empty()) {
-        return;
-    }
-    std::sort(refreshed_paths.begin(), refreshed_paths.end());
-
-    std::vector<std::wstring> current_paths;
-    current_paths.reserve(pdh_gpu_counters_.size());
-    for (const GpuPdhCounter& entry : pdh_gpu_counters_) {
-        current_paths.push_back(entry.path);
-    }
-    std::sort(current_paths.begin(), current_paths.end());
-
-    if (refreshed_paths != current_paths) {
-        InitGpuPdh();
-    }
 }
 
 void MetricsManager::ResetSession() {

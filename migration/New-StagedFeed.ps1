@@ -16,9 +16,14 @@ try {
 } finally {
     Remove-Item -LiteralPath $temp
 }
+$notes = if ($version -ceq '2.0.2') {
+    'Watchman 2.0.2 improves current-user startup registration and history-profile recovery handling.'
+} else {
+    "Watchman $version publisher and metadata update."
+}
 $feed = [ordered]@{
     version = $version
-    notes = "Watchman $version publisher and metadata update."
+    notes = $notes
     pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     platforms = @{'windows-x86_64' = @{
         signature = $sig

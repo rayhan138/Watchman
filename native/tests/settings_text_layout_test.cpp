@@ -1,4 +1,7 @@
 #include "settings_text_layout.h"
+#include "floating_monitor_text.h"
+#include "floating_monitor_settings_layout.h"
+#include "settings_header_layout.h"
 #include "theme_picker_layout.h"
 #include "warnings_settings_layout.h"
 #include "ui_style.h"
@@ -68,9 +71,50 @@ void SingleLine(IDWriteFactory* factory, IDWriteTextFormat* format, const wchar_
     DWRITE_TEXT_METRICS metrics{};
     Check(SUCCEEDED(layout->GetMetrics(&metrics)), "Cannot measure theme label");
     Check(metrics.lineCount == 1 && metrics.widthIncludingTrailingWhitespace <= width + 0.05f,
-        "Theme labels and Auto explanation must fit fully on one line at minimum width");
+        "Compact UI text must fit fully on one line at minimum width");
     Check(metrics.height <= height && std::abs(metrics.top + metrics.height / 2 - height / 2) < 0.1f,
-        "Theme text line box must fit and share the radio's vertical center");
+        "Compact UI text must fit and remain vertically centered");
+}
+
+float NaturalWidth(IDWriteFactory* factory, IDWriteTextFormat* format, const wchar_t* text) {
+    ComPtr<IDWriteTextLayout> layout;
+    Check(SUCCEEDED(factory->CreateTextLayout(text, static_cast<UINT32>(std::wcslen(text)),
+        format, 4096, 128, layout.GetAddressOf())), "Cannot measure Settings header text");
+    DWRITE_TEXT_METRICS metrics{};
+    Check(SUCCEEDED(layout->GetMetrics(&metrics)), "Cannot inspect Settings header text metrics");
+    return metrics.widthIncludingTrailingWhitespace;
+}
+
+void SettingsHeaderCases(IDWriteFactory* factory, IDWriteFontCollection* fonts,
+                         const wchar_t* family, const wchar_t* title_family) {
+    const auto title = Format(factory, fonts, title_family, 22, DWRITE_FONT_WEIGHT_EXTRA_BOLD);
+    const auto version = Format(factory, fonts, family, SettingsHeaderLayout::version_font_size, DWRITE_FONT_WEIGHT_BOLD);
+    for (auto* format : {title.Get(), version.Get()}) {
+        Check(SUCCEEDED(SettingsText::ConfigureThemeChoice(format)), "Cannot prepare Settings header type");
+    }
+    version->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    const float title_width = NaturalWidth(factory, title.Get(), L"SETTINGS");
+    for (const wchar_t* label : {L"Version 2.0.0", L"Version 2.0.1", L"Version 2.0.2", L"Version 12.34.56.7",
+                               L"Version 65535.65535.65535.65535", L"Version unavailable"}) {
+        const float version_width = NaturalWidth(factory, version.Get(), label);
+        for (float modal_width : {360.0f, 380.0f, 400.0f, 420.0f, 440.0f, 480.0f, 500.0f}) {
+            const auto replay = WatchmanWelcome::ReplayButton(0, 0, modal_width);
+            const auto header = SettingsHeaderLayout::Get(0, 0, replay.left, title_width, version_width);
+            SingleLine(factory, title.Get(), L"SETTINGS", header.title.right - header.title.left,
+                header.title.bottom - header.title.top);
+            const auto fitted = Format(factory, fonts, family,
+                SettingsHeaderLayout::version_font_size * header.version_font_scale, DWRITE_FONT_WEIGHT_BOLD);
+            Check(SUCCEEDED(SettingsText::ConfigureThemeChoice(fitted.Get())), "Cannot fit a long resource version");
+            fitted->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            SingleLine(factory, fitted.Get(), label, header.version_text.right - header.version_text.left,
+                header.version_text.bottom - header.version_text.top);
+            if (std::wcscmp(label, L"Version 2.0.2") == 0 && modal_width >= 440) {
+                Check(!header.stacked && header.version_font_scale == 1,
+                    "Normal release versions need a prominent full-size badge beside Quick tour");
+            }
+        }
+    }
+    std::wcout << L"Measured Settings title/version badge, narrow dialogs and long resource versions: " << family << L'\n';
 }
 
 void FontCases(IDWriteFactory* factory, IDWriteFontCollection* fonts, const wchar_t* family) {
@@ -202,7 +246,8 @@ void MonitorPreviewTextFits(IDWriteFactory* factory, IDWriteFontCollection* font
     using namespace WatchmanWelcome;
     const auto mono = Format(factory, fonts, UIStyle::FONT_MONO, 11, DWRITE_FONT_WEIGHT_BOLD);
     const auto caption = Format(factory, fonts, UIStyle::FONT_MAIN, UIStyle::TEXT_SMALL);
-    const auto floating_font = Format(factory, nullptr, L"Segoe UI", 12, DWRITE_FONT_WEIGHT_BOLD);
+    const auto floating_font = Format(factory, nullptr, FloatingMonitorText::family, 12,
+        static_cast<DWRITE_FONT_WEIGHT>(FloatingMonitorText::Value(FloatingMonitorText::default_weight)));
     for (auto* format : {mono.Get(), caption.Get(), floating_font.Get()}) {
         Check(SUCCEEDED(SettingsText::ConfigureThemeChoice(format)), "Cannot configure monitor sample text");
     }
@@ -228,6 +273,44 @@ void MonitorPreviewTextFits(IDWriteFactory* factory, IDWriteFontCollection* font
     fit(sample_upload, floating.upload_value, floating_font.Get());
     fit(L"DN", floating.download_label, floating_font.Get());
     fit(sample_download, floating.download_value, floating_font.Get());
+    fit(L"CPU", floating.cpu_label, floating_font.Get());
+    fit(sample_cpu, floating.cpu_value, floating_font.Get());
+    fit(L"MEM", floating.memory_label, floating_font.Get());
+    fit(sample_memory, floating.memory_value, floating_font.Get());
+    for (const auto weight : FloatingMonitorText::weights) for (int size = FloatingMonitorLayout::minimum_font_size; size <= FloatingMonitorLayout::maximum_font_size; ++size) {
+        const auto font = Format(factory, nullptr, FloatingMonitorText::family, static_cast<float>(size),
+            static_cast<DWRITE_FONT_WEIGHT>(FloatingMonitorText::Value(weight)));
+        for (bool cpu : {false, true}) for (bool memory : {false, true}) {
+            std::wstring text = L"UP   1.2 MB/s   DN   8.6 MB/s";
+            if (cpu || memory) text += L"\n";
+            if (cpu) text += L"CPU   24%";
+            if (cpu && memory) text += L"   ";
+            if (memory) text += L"MEM   58%";
+            ComPtr<IDWriteTextLayout> preview;
+            Check(SUCCEEDED(factory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()),
+                font.Get(), 178, 104, preview.GetAddressOf())), "Cannot measure narrow floating-settings preview");
+            preview->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            DWRITE_TEXT_METRICS metrics{};
+            Check(SUCCEEDED(preview->GetMetrics(&metrics)) && metrics.height <= 104 && metrics.width <= 178,
+                "All optional floating-preview samples fit at every supported text size, even in a narrow dialog");
+        }
+    }
+    const auto button = Format(factory, fonts, UIStyle::FONT_MAIN, UIStyle::TEXT_SMALL, DWRITE_FONT_WEIGHT_BOLD);
+    const auto body = Format(factory, fonts, UIStyle::FONT_MAIN, 14, DWRITE_FONT_WEIGHT_NORMAL);
+    for (auto* format : {button.Get(), body.Get()}) {
+        Check(SUCCEEDED(SettingsText::ConfigureThemeChoice(format)), "Cannot configure typography control text");
+    }
+    const auto page = GetFloatingMonitorSettingsLayout(154, 392, 10, 460, 104);
+    const auto fit_control = [&](const wchar_t* text, IDWriteTextFormat* format, const D2D1_RECT_F& rect) {
+        SingleLine(factory, format, text, rect.right - rect.left, rect.bottom - rect.top);
+    };
+    for (size_t index = 0; index < page.weight_controls.size(); ++index) {
+        fit_control(FloatingMonitorText::Label(FloatingMonitorText::weights[index]), button.Get(), page.weight_controls[index]);
+    }
+    fit_control(L"Segoe UI \u00b7 Light by default", caption.Get(), page.font_description);
+    fit_control(L"Weight", body.Get(), page.weight_label);
+    SingleLine(factory, body.Get(), L"Size", page.font_minus.left - page.font_description.left - 8, 32);
+    fit_control(L"No outline. Save Changes to apply.", caption.Get(), page.preview_caption);
     SingleLine(factory, caption.Get(), taskbar_caption, static_cast<float>(taskbar_size.width), 18);
     SingleLine(factory, caption.Get(), floating_caption, static_cast<float>(FloatingMonitorLayout::Width(12)), 18);
     std::cout << "Real welcome monitor samples, labels and numbers fit their actual widget geometry\n";
@@ -241,6 +324,7 @@ int main() {
             reinterpret_cast<IUnknown**>(factory.GetAddressOf()))), "Cannot create DirectWrite factory");
         WatchmanFonts::Collection bundled;
         Check(SUCCEEDED(bundled.Initialize(factory.Get())), "Cannot load the production embedded font collection");
+        SettingsHeaderCases(factory.Get(), bundled.Get(), UIStyle::FONT_MAIN, UIStyle::FONT_VALUES);
         FontCases(factory.Get(), bundled.Get(), UIStyle::FONT_MAIN);
         WelcomeCases(factory.Get(), bundled.Get(), UIStyle::FONT_MAIN);
         SpeedDialogCases(factory.Get(), bundled.Get(), UIStyle::FONT_MAIN);
@@ -252,6 +336,7 @@ int main() {
         BOOL exists = FALSE;
         Check(SUCCEEDED(system->FindFamilyName(UIStyle::FONT_MAIN_FALLBACK, &index, &exists)) && exists,
             "Segoe UI fallback must be available for real font measurement");
+        SettingsHeaderCases(factory.Get(), system.Get(), UIStyle::FONT_MAIN_FALLBACK, UIStyle::FONT_VALUES_FALLBACK);
         FontCases(factory.Get(), system.Get(), UIStyle::FONT_MAIN_FALLBACK);
         WelcomeCases(factory.Get(), system.Get(), UIStyle::FONT_MAIN_FALLBACK);
         SpeedDialogCases(factory.Get(), system.Get(), UIStyle::FONT_MAIN_FALLBACK);

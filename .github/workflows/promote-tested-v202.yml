@@ -1,0 +1,248 @@
+name: Promote tested v2.0.2 release
+on:
+  workflow_dispatch:
+    inputs:
+      staging_run:
+        description: 'Successful v2.0.2 signed staging run whose three independent Windows upgrade jobs passed'
+        required: true
+        type: string
+permissions:
+  actions: read
+  contents: write
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EXPECTED_BRANCH: arena/72827777-watchman
+      EXPECTED_WORKFLOW: Stage signed Windows candidate (no publication)
+      RELEASE_VERSION: 2.0.2
+      STAGING_RUN_ID: ${{ inputs.staging_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate the exact successful staging run and unchanged stable baselines
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$STAGING_RUN_ID" =~ ^[0-9]+$ ]] || { echo '::error::staging_run must be a numeric GitHub Actions run ID'; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STAGING_RUN_ID" > "$RUNNER_TEMP/staging-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STAGING_RUN_ID/jobs?per_page=100" > "$RUNNER_TEMP/staging-jobs.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STAGING_RUN_ID/artifacts?per_page=100" > "$RUNNER_TEMP/staging-artifacts.json"
+          python3 - "$RUNNER_TEMP/staging-run.json" "$RUNNER_TEMP/staging-jobs.json" "$RUNNER_TEMP/staging-artifacts.json" <<'PY'
+          import json, os, sys
+          run = json.load(open(sys.argv[1], encoding='utf-8'))
+          jobs = json.load(open(sys.argv[2], encoding='utf-8'))['jobs']
+          artifacts = json.load(open(sys.argv[3], encoding='utf-8'))['artifacts']
+          assert run['name'] == os.environ['EXPECTED_WORKFLOW'], run
+          assert run['path'] == '.github/workflows/release-windows.yml', run
+          assert run['event'] == 'workflow_dispatch' and run['conclusion'] == 'success', run
+          assert run['head_branch'] == os.environ['EXPECTED_BRANCH'], run
+          required = {
+              'stage',
+              'Independent v1.0.5 to v2.0.2 upgrade',
+              'Independent v2.0.0 to v2.0.2 upgrade',
+              'Independent v2.0.1 to v2.0.2 upgrade',
+          }
+          conclusions = {job['name']: job['conclusion'] for job in jobs}
+          assert required.issubset(conclusions), (required, conclusions)
+          assert all(conclusions[name] == 'success' for name in required), conclusions
+          staged = [a for a in artifacts if a['name'] == 'watchman-2.0.2-staged' and not a['expired']]
+          assert len(staged) == 1, staged
+          print(f"Validated run {run['id']} at {run['head_sha']}; all four required jobs passed and the signed staging artifact exists.")
+          PY
+          SOURCE_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_sha"])' "$RUNNER_TEMP/staging-run.json")
+          git merge-base --is-ancestor "$SOURCE_SHA" "$GITHUB_SHA" || { echo '::error::The tested source commit is not contained in merged main'; exit 1; }
+          unexpected=$(git diff --name-only "$SOURCE_SHA" "$GITHUB_SHA" | grep -Ev '^(README\.md|migration/README\.md)$' || true)
+          if [[ -n "$unexpected" ]]; then
+            echo '::error::Packaging, updater, build, release, or acceptance-test sources changed after the candidate was staged.'
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          test "$(git ls-remote origin refs/tags/v2.0.0 | awk '{print $1}')" = 'a26e926e84a1ac275fa15326d77bc2d6e0639042'
+          test "$(git ls-remote origin refs/tags/v2.0.1 | awk '{print $1}')" = '0d55734d07899debaa5e3b3b71d97f5ea4229dd7'
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest-before.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v2.0.0" > "$RUNNER_TEMP/v2.0.0-before.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v2.0.1" > "$RUNNER_TEMP/v2.0.1-before.json"
+          python3 - "$RUNNER_TEMP/latest-before.json" "$RUNNER_TEMP/v2.0.0-before.json" "$RUNNER_TEMP/v2.0.1-before.json" <<'PY'
+          import json, sys
+          latest, old, stable = (json.load(open(p, encoding='utf-8')) for p in sys.argv[1:])
+          assert latest['tag_name'] == 'v2.0.1' and not latest['draft'] and not latest['prerelease'], latest
+          def assets(release):
+              return {a['name']: (a.get('digest'), a['size']) for a in release['assets']}
+          expected_v200 = {
+              'latest.json': ('sha256:f87d604735cb00c494250f7a9fd5c3daafe5edf7aa66148d890c45aa0bb487b8', 766),
+              'Watchman_2.0.0_x64-setup.exe': ('sha256:f64ec44db04ce355c8d7647c5bb67ab25014d79c4c2735f60d035aa9cd38d4d6', 1894803),
+              'Watchman_2.0.0_x64-setup.exe.sig': ('sha256:b1474cd4eb2abcac8673bf3aa79e2e7fe0c9de3a626a958b942ae9842671ca1a', 420),
+          }
+          expected_v201 = {
+              'latest.json': ('sha256:f0fa7cf26774c5c4b62e8fdb44a6211bd6a89fbbee10160cc9f9b828a6a6bac4', 734),
+              'Watchman_2.0.1_x64-setup.exe': ('sha256:fcaa5d43f179443e904a0193e2a0f20faefd0d9a5c04bf315666ea81f39380cc', 1894988),
+              'Watchman_2.0.1_x64-setup.exe.sig': ('sha256:6e5768a4357cecbffeb062377f3cec8d6e90978615eadab5b584c4978ce20ff1', 420),
+          }
+          assert old['tag_name'] == 'v2.0.0' and old['target_commitish'] == 'a26e926e84a1ac275fa15326d77bc2d6e0639042', old
+          assert stable['tag_name'] == 'v2.0.1' and stable['target_commitish'] == '0d55734d07899debaa5e3b3b71d97f5ea4229dd7', stable
+          assert not old['draft'] and not old['prerelease'] and assets(old) == expected_v200, assets(old)
+          assert not stable['draft'] and not stable['prerelease'] and assets(stable) == expected_v201, assets(stable)
+          PY
+          expected_tags=$'69c16aa924e0618a7c2d828b89cd90132994dc2b refs/tags/v1.0.1\nd37f45e8d38f485cbbd3990dd8662aa91fe30b6a refs/tags/v1.0.2\n09951d4a6110a7cf78066b23a47ed5695cd0db60 refs/tags/v1.0.3\n8784419b2f2757173798239bbd4b5e2bc64e4a5a refs/tags/v1.0.4\n2e490a181ce7eee09a38a13c65c375489b47a01c refs/tags/v1.0.5'
+          actual_tags=$(git ls-remote origin 'refs/tags/v1.0.1' 'refs/tags/v1.0.2' 'refs/tags/v1.0.3' 'refs/tags/v1.0.4' 'refs/tags/v1.0.5' | awk '{print $1 " " $2}' | sort)
+          test "$(printf '%s\n' "$expected_tags" | sort)" = "$actual_tags"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases-before.json"
+          python3 - "$RUNNER_TEMP/releases-before.json" <<'PY'
+          import json, sys
+          releases = json.load(open(sys.argv[1], encoding='utf-8'))
+          assert not any(r['tag_name'] == 'v2.0.2' and not r['draft'] for r in releases), 'A published v2.0.2 release already exists'
+          drafts = [r for r in releases if r['tag_name'] == 'v2.0.2' and r['draft'] and not r['prerelease']]
+          assert len(drafts) <= 1, drafts
+          PY
+          tag_target=$(git ls-remote origin refs/tags/v2.0.2 | awk '{print $1}')
+          draft_exists=$(python3 -c 'import json,sys; print(str(any(r["tag_name"] == "v2.0.2" and r["draft"] and not r["prerelease"] for r in json.load(open(sys.argv[1], encoding="utf-8")))).lower())' "$RUNNER_TEMP/releases-before.json")
+          if [[ -n "$tag_target" && "$draft_exists" != true ]]; then
+            echo '::error::v2.0.2 tag exists without the unique recoverable draft; refusing to overwrite it.'
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: watchman-2.0.2-staged
+          path: staged
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.staging_run }}
+      - name: Verify the exact staged installer, detached signature, and feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="staged/Watchman_${RELEASE_VERSION}_x64-setup.exe"
+          signature="$installer.sig"
+          feed=staged/latest.json
+          test -s "$installer" && test -s "$signature" && test -s "$feed" && test -s staged/Watchman.exe.sha256
+          python3 - "$installer" staged/Watchman.exe.sha256 "$feed" "$signature" <<'PY'
+          import base64, hashlib, json, os, pathlib, re, sys
+          installer, app_hash_file, feed_file, signature_file = map(pathlib.Path, sys.argv[1:])
+          app_hash = app_hash_file.read_text(encoding='utf-8').strip().upper()
+          assert re.fullmatch(r'[0-9A-F]{64}', app_hash), app_hash
+          installer_hash = hashlib.sha256(installer.read_bytes()).hexdigest().upper()
+          signature = signature_file.read_text(encoding='utf-8').strip()
+          feed = json.loads(feed_file.read_text(encoding='utf-8'))
+          name = 'Watchman_2.0.2_x64-setup.exe'
+          entry = feed['platforms']['windows-x86_64']
+          assert feed['version'] == '2.0.2', feed
+          assert entry['signature'] == signature, 'Feed signature does not match the staged .sig asset'
+          assert entry['url'] == f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}/releases/download/v2.0.2/{name}', entry
+          try:
+              decoded_signature = base64.b64decode(signature, validate=True)
+          except Exception as error:
+              raise AssertionError('Detached signature is not valid base64') from error
+          assert decoded_signature, 'Detached signature is empty'
+          print(f'Exact staged installer SHA-256: {installer_hash}')
+          print(f'Installed Watchman.exe SHA-256 from Windows acceptance: {app_hash}')
+          PY
+          cargo build --locked --release --manifest-path migration/verify/Cargo.toml
+          tr -d '\r\n' < "$signature" | base64 --decode > "$RUNNER_TEMP/v2.0.2.minisig"
+          migration/verify/target/release/watchman-verify-release "$installer" "$RUNNER_TEMP/v2.0.2.minisig"
+      - name: Create or validate a draft with the tested bytes
+        id: release-draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          find_draft_id() {
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+            python3 - "$RUNNER_TEMP/releases.json" <<'PY'
+          import json, sys
+          releases = json.load(open(sys.argv[1], encoding='utf-8'))
+          drafts = [r for r in releases if r['tag_name'] == 'v2.0.2' and r['draft'] and not r['prerelease']]
+          assert len(drafts) <= 1, drafts
+          print(drafts[0]['id'] if drafts else '')
+          PY
+          }
+          release_id=$(find_draft_id)
+          if [[ -z "$release_id" ]]; then
+            printf '%s\n' 'Watchman 2.0.2 improves current-user startup registration and strict history-profile recovery. This candidate has passed the signed Windows staging acceptance gates.' > "$RUNNER_TEMP/release-notes.md"
+            gh release create v2.0.2 \
+              'staged/Watchman_2.0.2_x64-setup.exe' \
+              'staged/Watchman_2.0.2_x64-setup.exe.sig' \
+              'staged/latest.json' \
+              --draft --target "$GITHUB_SHA" --title 'Watchman 2.0.2' --notes-file "$RUNNER_TEMP/release-notes.md"
+            release_id=$(find_draft_id)
+          fi
+          [[ "$release_id" =~ ^[0-9]+$ ]] || { echo '::error::Could not find the unique v2.0.2 draft release'; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$RUNNER_TEMP/draft-release.json"
+          SOURCE_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_sha"])' "$RUNNER_TEMP/staging-run.json")
+          RELEASE_TARGET_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["target_commitish"])' "$RUNNER_TEMP/draft-release.json")
+          [[ "$RELEASE_TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo '::error::Draft target is not a commit SHA'; exit 1; }
+          git merge-base --is-ancestor "$SOURCE_SHA" "$RELEASE_TARGET_SHA" || { echo '::error::Draft target does not contain the tested candidate source'; exit 1; }
+          git merge-base --is-ancestor "$RELEASE_TARGET_SHA" "$GITHUB_SHA" || { echo '::error::Draft target is not contained in main'; exit 1; }
+          python3 - 'staged/Watchman_2.0.2_x64-setup.exe' 'staged/Watchman_2.0.2_x64-setup.exe.sig' staged/latest.json "$RUNNER_TEMP/draft-release.json" <<'PY'
+          import hashlib, json, pathlib, sys
+          installer, signature, feed, metadata = map(pathlib.Path, sys.argv[1:])
+          release = json.loads(metadata.read_text(encoding='utf-8'))
+          assert release['tag_name'] == 'v2.0.2' and release['draft'] and not release['prerelease'], release
+          expected = {p.name: p for p in (installer, signature, feed)}
+          assets = {a['name']: a for a in release['assets']}
+          assert set(assets) == set(expected), assets
+          for name, path in expected.items():
+              asset = assets[name]
+              digest = 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
+              assert asset.get('digest') == digest and asset['size'] == path.stat().st_size and asset['state'] == 'uploaded', (name, asset, digest)
+          PY
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "release_target_sha=$RELEASE_TARGET_SHA" >> "$GITHUB_OUTPUT"
+      - name: Publish only after this manual approval, then verify public bytes and stable baselines
+        shell: bash
+        env:
+          RELEASE_ID: ${{ steps.release-draft.outputs.release_id }}
+          RELEASE_TARGET_SHA: ${{ steps.release-draft.outputs.release_target_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$RELEASE_TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false -F make_latest=true >/dev/null
+          latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          test "$latest_tag" = 'v2.0.2'
+          git fetch --quiet origin refs/tags/v2.0.2:refs/tags/v2.0.2
+          test "$(git rev-parse 'refs/tags/v2.0.2^{commit}')" = "$RELEASE_TARGET_SHA"
+          test "$(git ls-remote origin refs/tags/v2.0.0 | awk '{print $1}')" = 'a26e926e84a1ac275fa15326d77bc2d6e0639042'
+          test "$(git ls-remote origin refs/tags/v2.0.1 | awk '{print $1}')" = '0d55734d07899debaa5e3b3b71d97f5ea4229dd7'
+          mkdir -p "$RUNNER_TEMP/public-assets"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/v2.0.2"
+          for file in Watchman_2.0.2_x64-setup.exe Watchman_2.0.2_x64-setup.exe.sig latest.json; do
+            curl --fail --location --silent --show-error "$base/$file" -o "$RUNNER_TEMP/public-assets/$file"
+            cmp "staged/$file" "$RUNNER_TEMP/public-assets/$file"
+          done
+          curl --fail --location --silent --show-error \
+            'https://github.com/'"$GITHUB_REPOSITORY"'/releases/latest/download/latest.json' \
+            -o "$RUNNER_TEMP/public-latest.json"
+          cmp staged/latest.json "$RUNNER_TEMP/public-latest.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v2.0.0" > "$RUNNER_TEMP/v2.0.0-after.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v2.0.1" > "$RUNNER_TEMP/v2.0.1-after.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v2.0.2" > "$RUNNER_TEMP/v2.0.2-after.json"
+          python3 - "$RUNNER_TEMP/v2.0.0-before.json" "$RUNNER_TEMP/v2.0.0-after.json" "$RUNNER_TEMP/v2.0.1-before.json" "$RUNNER_TEMP/v2.0.1-after.json" "$RUNNER_TEMP/v2.0.2-after.json" <<'PY'
+          import hashlib, json, pathlib, sys
+          v200_before, v200_after, v201_before, v201_after, v202 = (json.load(open(p, encoding='utf-8')) for p in sys.argv[1:])
+          stable = lambda r: (r['tag_name'], r['target_commitish'], r['draft'], r['prerelease'],
+                              sorted((a['name'], a['size'], a.get('digest')) for a in r['assets']))
+          assert stable(v200_before) == stable(v200_after), (stable(v200_before), stable(v200_after))
+          assert stable(v201_before) == stable(v201_after), (stable(v201_before), stable(v201_after))
+          assert v202['tag_name'] == 'v2.0.2' and not v202['draft'] and not v202['prerelease'], v202
+          expected = {
+              'Watchman_2.0.2_x64-setup.exe': pathlib.Path('staged/Watchman_2.0.2_x64-setup.exe'),
+              'Watchman_2.0.2_x64-setup.exe.sig': pathlib.Path('staged/Watchman_2.0.2_x64-setup.exe.sig'),
+              'latest.json': pathlib.Path('staged/latest.json'),
+          }
+          assets = {a['name']: a for a in v202['assets']}
+          assert set(assets) == set(expected), assets
+          for name, path in expected.items():
+              asset = assets[name]
+              digest = 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
+              assert asset.get('digest') == digest and asset['size'] == path.stat().st_size and asset['state'] == 'uploaded', (name, asset, digest)
+          PY
+          expected_tags=$'69c16aa924e0618a7c2d828b89cd90132994dc2b refs/tags/v1.0.1\nd37f45e8d38f485cbbd3990dd8662aa91fe30b6a refs/tags/v1.0.2\n09951d4a6110a7cf78066b23a47ed5695cd0db60 refs/tags/v1.0.3\n8784419b2f2757173798239bbd4b5e2bc64e4a5a refs/tags/v1.0.4\n2e490a181ce7eee09a38a13c65c375489b47a01c refs/tags/v1.0.5'
+          actual_tags=$(git ls-remote origin 'refs/tags/v1.0.1' 'refs/tags/v1.0.2' 'refs/tags/v1.0.3' 'refs/tags/v1.0.4' 'refs/tags/v1.0.5' | awk '{print $1 " " $2}' | sort)
+          test "$(printf '%s\n' "$expected_tags" | sort)" = "$actual_tags"
+          sha256sum "$RUNNER_TEMP/public-assets/Watchman_2.0.2_x64-setup.exe" \
+                   "$RUNNER_TEMP/public-assets/Watchman_2.0.2_x64-setup.exe.sig" \
+                   "$RUNNER_TEMP/public-assets/latest.json"

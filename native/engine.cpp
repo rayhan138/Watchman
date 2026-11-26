@@ -1,9 +1,13 @@
 #include "engine.h"
 #include "app_traffic_presentation.h"
+#include "startup_diagnostics.h"
+#include <objbase.h>
 #include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <limits>
+#include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -22,33 +26,117 @@ std::wstring HistorySaveError(const std::string& error) {
 
 } // namespace
 
-WatchmanEngine::WatchmanEngine() {
-    metrics_ = std::make_unique<MetricsManager>();
-    app_tracker_ = std::make_unique<AppTracker>();
-    storage_ = std::make_unique<TrafficStorage>();
-    ping_tester_ = std::make_unique<PingTester>();
-    speed_tester_ = std::make_unique<SpeedTester>();
-    diagnostics_runner_ = std::make_unique<DiagnosticsRunner>();
-}
+WatchmanEngine::WatchmanEngine(InitializationHook before_initialize)
+    : before_initialize_(std::move(before_initialize)) {}
 
 WatchmanEngine::~WatchmanEngine() {
     Stop();
 }
 
+bool WatchmanEngine::InitializeServices() {
+    const auto keep_starting = [this](InitializationStage stage) {
+        if (before_initialize_) before_initialize_(stage, is_running_);
+        return is_running_.load();
+    };
+    // Stop may be requested during any slow constructor. Never publish a
+    // half-initialized set of services, and do not start more work after Stop.
+    if (!keep_starting(InitializationStage::BeforeServices)) return false;
+    metrics_ = std::make_unique<MetricsManager>();
+    if (!keep_starting(InitializationStage::MetricsReady)) return false;
+    app_tracker_ = std::make_unique<AppTracker>();
+    if (!keep_starting(InitializationStage::AppTrackerReady)) return false;
+    storage_ = std::make_unique<TrafficStorage>();
+    WatchmanStartupDiagnostics::Record("history", storage_->GetProfileKind() == WatchmanHistory::Profile::Native
+        ? "native-profile" : "legacy-profile");
+    if (!keep_starting(InitializationStage::StorageReady)) return false;
+    ping_tester_ = std::make_unique<PingTester>();
+    speed_tester_ = std::make_unique<SpeedTester>();
+    diagnostics_runner_ = std::make_unique<DiagnosticsRunner>();
+    if (!keep_starting(InitializationStage::ToolsReady)) return false;
+    {
+        // Serialize pre-ready adapter choices with publication so an option
+        // changed during initialization cannot be silently lost.
+        std::lock_guard<std::mutex> lock(startup_mutex_);
+        if (!is_running_) return false;
+        metrics_->SetMonitoredAdapterId(requested_adapter_id_);
+        services_ready_.store(true, std::memory_order_release);
+    }
+    WatchmanStartupDiagnostics::Record("backend", "ready");
+    return true;
+}
+
+void WatchmanEngine::RecordStartupFailure(const char* message, uint32_t error) {
+    {
+        std::lock_guard<std::mutex> lock(startup_mutex_);
+        startup_error_ = L"Monitoring could not start or stopped unexpectedly. Restart Watchman and check startup-recovery.log.";
+    }
+    OutputDebugStringA(message);
+    WatchmanStartupDiagnostics::Record("backend", "failed", error);
+    is_running_ = false;
+}
+
+std::wstring WatchmanEngine::GetStartupError() const {
+    std::lock_guard<std::mutex> lock(startup_mutex_);
+    return startup_error_;
+}
+
 void WatchmanEngine::Start() {
     if (is_running_) return;
+    // Start/Stop are owned by the UI thread. Join before setting running so a
+    // finishing worker cannot clear the new worker's cancellation flag.
+    if (engine_thread_.joinable()) engine_thread_.join();
     is_running_ = true;
-    engine_thread_ = std::thread([this]() {
-        EngineLoop();
-    });
+    { std::lock_guard<std::mutex> lock(startup_mutex_); startup_error_.clear(); }
+    try {
+        engine_thread_ = std::thread([this] { WorkerMain(); });
+    } catch (const std::exception& error) {
+        RecordStartupFailure(error.what());
+    }
+}
+
+void WatchmanEngine::WorkerMain() {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    struct ComScope {
+        HRESULT result;
+        ~ComScope() { if (SUCCEEDED(result)) CoUninitialize(); }
+    } scope{com};
+    try {
+        if (FAILED(com)) {
+            RecordStartupFailure("Watchman engine COM initialization failed.", static_cast<uint32_t>(com));
+        } else {
+            WatchmanStartupDiagnostics::Record("backend", "starting");
+            const bool ready = IsReady() || InitializeServices();
+            if (ready && is_running_) EngineLoop();
+        }
+    } catch (const std::exception& error) {
+        RecordStartupFailure(error.what());
+    } catch (...) {
+        RecordStartupFailure("Watchman engine initialization/acquisition failed.");
+    }
+    // Flush on the owning worker, after acquisition stops. Stop on an engine
+    // that never reached Ready must not dereference unpublished services.
+    if (IsReady()) {
+        try { FlushPendingTraffic(); }
+        catch (...) { RecordStartupFailure("Watchman could not finish its pending history flush."); }
+    } else {
+        // Nothing was published: release partial services on their creating
+        // worker, before its COM apartment ends. A later Stop is a no-op.
+        diagnostics_runner_.reset();
+        speed_tester_.reset();
+        ping_tester_.reset();
+        storage_.reset();
+        app_tracker_.reset();
+        metrics_.reset();
+    }
+    is_running_ = false;
+    WatchmanStartupDiagnostics::Record("backend", "stopped");
 }
 
 void WatchmanEngine::Stop() {
     is_running_ = false;
-    if (engine_thread_.joinable()) {
-        engine_thread_.join();
-    }
-    FlushPendingTraffic();
+    if (IsReady()) speed_tester_->CancelTest();
+    wake_.notify_all();
+    if (engine_thread_.joinable()) engine_thread_.join();
 }
 
 void WatchmanEngine::EngineLoop() {
@@ -149,7 +237,8 @@ void WatchmanEngine::EngineLoop() {
         next_tick += std::chrono::seconds(1);
         const auto now = std::chrono::steady_clock::now();
         if (next_tick < now) next_tick = now + std::chrono::seconds(1);
-        std::this_thread::sleep_until(next_tick);
+        std::unique_lock<std::mutex> lock(wait_mutex_);
+        wake_.wait_until(lock, next_tick, [this] { return !is_running_.load(); });
     }
 }
 
@@ -190,99 +279,104 @@ void WatchmanEngine::RefreshAppTotals(const std::wstring& date) {
 }
 
 void WatchmanEngine::FetchSnapshots(bool refresh_persistent_data) {
-    std::vector<TrafficRecord> history;
-    std::vector<TrafficRecord> monthly_history;
-    std::vector<int> available_years;
-    if (refresh_persistent_data) {
-        history = storage_->LoadHistory();
-        monthly_history = storage_->LoadMonthlyHistory();
-        available_years = storage_->LoadAvailableHistoryYears();
+    DashboardSnapshot dashboard;
+    {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        dashboard = dashboard_snapshot_; // Last good today's totals/save status.
     }
-
+    NetworkSnapshot network;
+    AppActivitySnapshot apps;
+    TrafficHistorySnapshot next_history;
+    std::vector<TrafficRecord> history;
+    const bool history_loaded = refresh_persistent_data && storage_->LoadHistory(history);
+    if (refresh_persistent_data) {
+        dashboard.history_read_error = history_loaded ? L"" : HistorySaveError(storage_->GetLastError());
+    }
+    dashboard.history_profile_description = storage_->GetProfileDescription();
     const auto pending_app_totals = pending_traffic_.GetAppTotals(app_totals_date_);
-    std::lock_guard<std::mutex> lock(snapshot_mutex_);
 
     // Dashboard
-    ++dashboard_snapshot_.sample_sequence;
-    dashboard_snapshot_.history_save_pending = !pending_traffic_.Empty();
+    ++dashboard.sample_sequence;
+    dashboard.history_save_pending = !pending_traffic_.Empty();
     const auto cpu = metrics_->GetCpu();
-    dashboard_snapshot_.cpu_sample_available = cpu.sample_available;
-    dashboard_snapshot_.cpu_sampled_at_ms = cpu.sampled_at_ms;
-    dashboard_snapshot_.cpu_usage_percent = cpu.percent_used;
-    dashboard_snapshot_.temperatures = metrics_->GetTemperatures();
-    dashboard_snapshot_.cpu_core_count = metrics_->GetCpuCoreCount();
+    dashboard.cpu_sample_available = cpu.sample_available;
+    dashboard.cpu_sampled_at_ms = cpu.sampled_at_ms;
+    dashboard.cpu_usage_percent = cpu.percent_used;
+    dashboard.temperatures = metrics_->GetTemperatures();
+    dashboard.cpu_core_count = metrics_->GetCpuCoreCount();
 
     const auto ram = metrics_->GetRam();
-    dashboard_snapshot_.ram_sample_available = ram.sample_available;
-    dashboard_snapshot_.ram_sampled_at_ms = ram.sampled_at_ms;
-    dashboard_snapshot_.ram_usage_percent = ram.percent_used;
-    dashboard_snapshot_.ram_used_bytes = ram.used_bytes;
-    dashboard_snapshot_.ram_total_bytes = ram.total_bytes;
+    dashboard.ram_sample_available = ram.sample_available;
+    dashboard.ram_sampled_at_ms = ram.sampled_at_ms;
+    dashboard.ram_usage_percent = ram.percent_used;
+    dashboard.ram_used_bytes = ram.used_bytes;
+    dashboard.ram_total_bytes = ram.total_bytes;
 
-    dashboard_snapshot_.disk_usage_percent = metrics_->GetDisk().percent_used;
+    dashboard.disk_usage_percent = metrics_->GetDisk().percent_used;
 
-    dashboard_snapshot_.gpu_available = metrics_->GetGpu().available;
-    dashboard_snapshot_.gpu_usage_percent = metrics_->GetGpu().percent_used;
-    dashboard_snapshot_.gpu_name = metrics_->GetGpu().label;
-    dashboard_snapshot_.gpu_active_engine = metrics_->GetGpu().active_engine;
+    const auto gpu = metrics_->GetGpu();
+    dashboard.gpu_available = gpu.available;
+    dashboard.gpu_usage_percent = gpu.percent_used;
+    dashboard.gpu_name = gpu.label;
+    dashboard.gpu_active_engine = gpu.active_engine;
 
-    dashboard_snapshot_.download_speed_bps = metrics_->GetNetwork().download_speed_bps;
-    dashboard_snapshot_.upload_speed_bps = metrics_->GetNetwork().upload_speed_bps;
+    dashboard.download_speed_bps = metrics_->GetNetwork().download_speed_bps;
+    dashboard.upload_speed_bps = metrics_->GetNetwork().upload_speed_bps;
 
-    dashboard_snapshot_.session_download_bytes = session_dl_bytes_;
-    dashboard_snapshot_.session_upload_bytes = session_ul_bytes_;
+    dashboard.session_download_bytes = session_dl_bytes_;
+    dashboard.session_upload_bytes = session_ul_bytes_;
 
-    if (refresh_persistent_data) {
-        dashboard_snapshot_.today_traffic_date = app_totals_date_;
-        dashboard_snapshot_.today_download_bytes = 0;
-        dashboard_snapshot_.today_upload_bytes = 0;
+    if (history_loaded) {
+        dashboard.today_traffic_date = app_totals_date_;
+        dashboard.today_download_bytes = 0;
+        dashboard.today_upload_bytes = 0;
         if (!history.empty()) {
             for (const auto& rec : history) {
                 if (rec.date == app_totals_date_) {
-                    dashboard_snapshot_.today_download_bytes = rec.rx_bytes;
-                    dashboard_snapshot_.today_upload_bytes = rec.tx_bytes;
+                    dashboard.today_download_bytes = rec.rx_bytes;
+                    dashboard.today_upload_bytes = rec.tx_bytes;
                     break;
                 }
             }
         }
     }
 
-    dashboard_snapshot_.uptime_seconds = metrics_->GetUptimeSeconds();
+    dashboard.uptime_seconds = metrics_->GetUptimeSeconds();
     const SystemInfoMetrics system_info = metrics_->GetSystemInfo();
-    dashboard_snapshot_.os_name = system_info.os_name;
-    dashboard_snapshot_.architecture = system_info.architecture;
-    dashboard_snapshot_.hostname = system_info.hostname;
-    dashboard_snapshot_.cpu_name = system_info.cpu_name;
-    dashboard_snapshot_.cpu_speed_ghz = system_info.cpu_speed_ghz;
+    dashboard.os_name = system_info.os_name;
+    dashboard.architecture = system_info.architecture;
+    dashboard.hostname = system_info.hostname;
+    dashboard.cpu_name = system_info.cpu_name;
+    dashboard.cpu_speed_ghz = system_info.cpu_speed_ghz;
 
     // Network
-    network_snapshot_.is_connected = metrics_->GetNetwork().connected;
-    network_snapshot_.active_adapter_name = metrics_->GetNetwork().adapter_name;
-    network_snapshot_.active_adapter_type = metrics_->GetNetwork().adapter_type;
-    network_snapshot_.wifi_ssid = metrics_->GetNetwork().wifi_ssid;
-    network_snapshot_.local_ip = metrics_->GetNetwork().local_ip;
-    network_snapshot_.subnet_mask = metrics_->GetNetwork().subnet_mask;
-    network_snapshot_.ipv6_address = metrics_->GetNetwork().ipv6_address;
-    network_snapshot_.mac_address = metrics_->GetNetwork().mac_address;
-    network_snapshot_.dhcp_enabled = metrics_->GetNetwork().dhcp_enabled;
-    network_snapshot_.link_speed_bps = metrics_->GetNetwork().link_speed_bps;
-    network_snapshot_.receive_link_speed_bps = metrics_->GetNetwork().receive_link_speed_bps;
-    network_snapshot_.wifi_signal_percent = metrics_->GetNetwork().wifi_signal_percent;
-    network_snapshot_.latency_ms = ping_tester_->GetLatencyMs();
-    network_snapshot_.jitter_ms = ping_tester_->GetJitterMs();
-    network_snapshot_.packet_loss_percent = ping_tester_->GetPacketLoss();
-    network_snapshot_.ping_samples_sent = ping_tester_->GetSamplesSent();
-    network_snapshot_.ping_samples_received = ping_tester_->GetSamplesReceived();
-    network_snapshot_.min_latency_ms = ping_tester_->GetMinLatencyMs();
-    network_snapshot_.max_latency_ms = ping_tester_->GetMaxLatencyMs();
-    network_snapshot_.quality_score_percent = ping_tester_->GetQualityScorePercent();
+    network.is_connected = metrics_->GetNetwork().connected;
+    network.active_adapter_name = metrics_->GetNetwork().adapter_name;
+    network.active_adapter_type = metrics_->GetNetwork().adapter_type;
+    network.wifi_ssid = metrics_->GetNetwork().wifi_ssid;
+    network.local_ip = metrics_->GetNetwork().local_ip;
+    network.subnet_mask = metrics_->GetNetwork().subnet_mask;
+    network.ipv6_address = metrics_->GetNetwork().ipv6_address;
+    network.mac_address = metrics_->GetNetwork().mac_address;
+    network.dhcp_enabled = metrics_->GetNetwork().dhcp_enabled;
+    network.link_speed_bps = metrics_->GetNetwork().link_speed_bps;
+    network.receive_link_speed_bps = metrics_->GetNetwork().receive_link_speed_bps;
+    network.wifi_signal_percent = metrics_->GetNetwork().wifi_signal_percent;
+    network.latency_ms = ping_tester_->GetLatencyMs();
+    network.jitter_ms = ping_tester_->GetJitterMs();
+    network.packet_loss_percent = ping_tester_->GetPacketLoss();
+    network.ping_samples_sent = ping_tester_->GetSamplesSent();
+    network.ping_samples_received = ping_tester_->GetSamplesReceived();
+    network.min_latency_ms = ping_tester_->GetMinLatencyMs();
+    network.max_latency_ms = ping_tester_->GetMaxLatencyMs();
+    network.quality_score_percent = ping_tester_->GetQualityScorePercent();
 
     // Apps
-    app_activity_snapshot_.is_admin = app_tracker_->IsAdmin();
-    app_activity_snapshot_.bandwidth_available = app_tracker_->IsBandwidthAvailable();
-    app_activity_snapshot_.requires_admin = app_tracker_->RequiresAdmin();
-    app_activity_snapshot_.status_message = app_tracker_->GetStatusMessage();
-    app_activity_snapshot_.active_apps.clear();
+    apps.is_admin = app_tracker_->IsAdmin();
+    apps.bandwidth_available = app_tracker_->IsBandwidthAvailable();
+    apps.requires_admin = app_tracker_->RequiresAdmin();
+    apps.status_message = app_tracker_->GetStatusMessage();
+    apps.active_apps.clear();
     for (const auto& app : app_tracker_->GetActiveApps()) {
         AppActivityItem item;
         item.name = app.name;
@@ -301,41 +395,39 @@ void WatchmanEngine::FetchSnapshots(bool refresh_persistent_data) {
         item.is_running = app.is_running;
         item.last_active_seconds = app.last_active_seconds;
         item.status = app.status;
-        app_activity_snapshot_.active_apps.push_back(item);
+        apps.active_apps.push_back(item);
     }
     // Pre-sort active apps once per telemetry tick so UI frames do not re-sort on 60 FPS paints.
-    std::sort(app_activity_snapshot_.active_apps.begin(),
-              app_activity_snapshot_.active_apps.end(),
+    std::sort(apps.active_apps.begin(),
+              apps.active_apps.end(),
               AppTrafficPresentation::MostUsageFirst);
 
-    if (refresh_persistent_data) {
-        // Traffic History
-        traffic_history_snapshot_.history.clear();
-        traffic_history_snapshot_.monthly_history.clear();
-        uint64_t all_dl = 0;
-        uint64_t all_ul = 0;
-        for (const auto& rec : history) {
-            TrafficHistoryItem item;
-            item.date = rec.date;
-            item.rx_bytes = rec.rx_bytes;
-            item.tx_bytes = rec.tx_bytes;
-            traffic_history_snapshot_.history.push_back(item);
-            all_dl += rec.rx_bytes;
-            all_ul += rec.tx_bytes;
+    if (history_loaded) {
+        // Derive all aggregates from one checked SQLite statement/snapshot.
+        // Three independent reads could disagree or disguise a partial read.
+        std::map<std::wstring, std::pair<uint64_t, uint64_t>> months;
+        std::vector<int> years;
+        for (const auto& record : history) {
+            next_history.history.push_back({record.date, record.rx_bytes, record.tx_bytes});
+            next_history.all_time_download_bytes = AddTrafficBytes(next_history.all_time_download_bytes, record.rx_bytes);
+            next_history.all_time_upload_bytes = AddTrafficBytes(next_history.all_time_upload_bytes, record.tx_bytes);
+            auto& month = months[record.date.substr(0, 7)];
+            month.first = AddTrafficBytes(month.first, record.rx_bytes);
+            month.second = AddTrafficBytes(month.second, record.tx_bytes);
+            const int year = std::stoi(record.date.substr(0, 4));
+            if (years.empty() || years.back() != year) years.push_back(year);
         }
-
-        for (const auto& rec : monthly_history) {
-            TrafficHistoryItem item;
-            item.date = rec.date;
-            item.rx_bytes = rec.rx_bytes;
-            item.tx_bytes = rec.tx_bytes;
-            traffic_history_snapshot_.monthly_history.push_back(item);
-        }
-
-        traffic_history_snapshot_.available_years = available_years;
-        traffic_history_snapshot_.all_time_download_bytes = all_dl;
-        traffic_history_snapshot_.all_time_upload_bytes = all_ul;
+        for (const auto& [month, bytes] : months)
+            next_history.monthly_history.push_back({month, bytes.first, bytes.second});
+        next_history.available_years.assign(years.rbegin(), years.rend());
     }
+    // No SQLite, ETW, sensor reads, allocations/sorting of app rows or history
+    // aggregation while the UI is waiting to acquire the publication mutex.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    dashboard_snapshot_ = std::move(dashboard);
+    network_snapshot_ = std::move(network);
+    app_activity_snapshot_ = std::move(apps);
+    if (history_loaded) traffic_history_snapshot_ = std::move(next_history);
 }
 
 DashboardSnapshot WatchmanEngine::GetDashboardSnapshot() {
@@ -359,31 +451,39 @@ TrafficHistorySnapshot WatchmanEngine::GetTrafficHistorySnapshot() {
 }
 
 void WatchmanEngine::RunSpeedTest() {
-    speed_tester_->StartTest();
+    if (IsReady() && is_running_) speed_tester_->StartTest();
 }
 
 void WatchmanEngine::CancelSpeedTest() {
-    speed_tester_->CancelTest();
+    if (IsReady()) speed_tester_->CancelTest();
+}
+
+SpeedTestSnapshot WatchmanEngine::GetSpeedTestSnapshot() const {
+    if (IsReady()) return speed_tester_->GetSnapshot();
+    SpeedTestSnapshot starting;
+    starting.available = false;
+    starting.status = L"Monitoring is starting...";
+    return starting;
 }
 
 SpeedTestResult WatchmanEngine::GetSpeedTestResult() {
-    return speed_tester_->GetResult();
+    return IsReady() ? speed_tester_->GetResult() : SpeedTestResult{};
 }
 
 int WatchmanEngine::GetSpeedTestProgress() {
-    return speed_tester_->GetProgress();
+    return IsReady() ? speed_tester_->GetProgress() : 0;
 }
 
 double WatchmanEngine::GetSpeedTestLiveSpeed() {
-    return speed_tester_->GetLiveSpeed();
+    return IsReady() ? speed_tester_->GetLiveSpeed() : 0.0;
 }
 
 std::wstring WatchmanEngine::GetSpeedTestStatus() {
-    return speed_tester_->GetStatusString();
+    return IsReady() ? speed_tester_->GetStatusString() : L"Monitoring is starting...";
 }
 
 bool WatchmanEngine::IsSpeedTestRunning() {
-    return speed_tester_->IsRunning();
+    return IsReady() && speed_tester_->IsRunning();
 }
 
 void WatchmanEngine::RefreshNetworkDetails() {
@@ -395,34 +495,37 @@ void WatchmanEngine::SetNetworkHealthActive(bool active) {
 }
 
 void WatchmanEngine::SetNetworkAdapterId(const std::wstring& adapter_id) {
-    metrics_->SetMonitoredAdapterId(adapter_id);
+    std::lock_guard<std::mutex> lock(startup_mutex_);
+    requested_adapter_id_ = adapter_id;
+    if (IsReady()) metrics_->SetMonitoredAdapterId(adapter_id);
 }
 
 std::wstring WatchmanEngine::GetNetworkAdapterId() const {
-    return metrics_->GetMonitoredAdapterId();
+    std::lock_guard<std::mutex> lock(startup_mutex_);
+    return requested_adapter_id_;
 }
 
 std::vector<InterfaceInfo> WatchmanEngine::GetNetworkAdapters() const {
-    return metrics_->GetInterfaces();
+    return IsReady() ? metrics_->GetInterfaces() : std::vector<InterfaceInfo>{};
 }
 
 bool WatchmanEngine::TerminateApp(uint32_t pid) {
-    return app_tracker_->TerminateApp(pid);
+    return IsReady() && is_running_ && app_tracker_->TerminateApp(pid);
 }
 
 bool WatchmanEngine::RunDiagnostics() {
-    return diagnostics_runner_ && diagnostics_runner_->Start();
+    return IsReady() && is_running_ && diagnostics_runner_->Start();
 }
 
 DiagnosticsSnapshot WatchmanEngine::GetDiagnosticsSnapshot() const {
-    return diagnostics_runner_ ? diagnostics_runner_->GetSnapshot() : DiagnosticsSnapshot{};
+    return IsReady() ? diagnostics_runner_->GetSnapshot() : DiagnosticsSnapshot{};
 }
 
 TrafficExportResult WatchmanEngine::ExportTrafficCsv(const TrafficExportOptions& options) {
-    return storage_ ? storage_->ExportTrafficCsv(options) : TrafficExportResult{
+    return IsReady() ? storage_->ExportTrafficCsv(options) : TrafficExportResult{
         false,
         {},
-        L"Saved traffic history is unavailable."
+        L"Monitoring is still starting; saved history is not ready yet."
     };
 }
 

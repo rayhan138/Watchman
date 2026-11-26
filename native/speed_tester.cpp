@@ -18,7 +18,11 @@ constexpr wchar_t kUserAgent[] = L"Watchman Native/1.0";
 constexpr wchar_t kMlabLocateHost[] = L"locate.measurementlab.net";
 constexpr wchar_t kMlabLocatePath[] = L"/v2/nearest/ndt/ndt7";
 constexpr wchar_t kNdt7ProtocolHeader[] = L"Sec-WebSocket-Protocol: net.measurementlab.ndt.v7\r\n";
+#ifdef WATCHMAN_SPEED_TESTING
+constexpr double kTestWindowSeconds = 1.0; // Bounded owned-loopback tests only.
+#else
 constexpr double kTestWindowSeconds = 10.0;
+#endif
 constexpr DWORD kConnectTimeoutMs = 10'000;
 constexpr DWORD kReceiveTimeoutMs = 2'000;
 constexpr size_t kTransferChunkBytes = 64 * 1024;
@@ -140,15 +144,19 @@ bool GetHttpStatus(HINTERNET request, DWORD& status_code) {
     ) == TRUE;
 }
 
-bool ReadHttpResponse(HINTERNET request, std::string& response, std::wstring& error) {
+bool ReadHttpResponse(HINTERNET request, std::string& response, std::wstring& error, const std::atomic<bool>& cancelled) {
     response.clear();
-    while (true) {
+    while (!cancelled) {
         DWORD available = 0;
         if (!WinHttpQueryDataAvailable(request, &available)) {
             error = MakeWinHttpError(L"Reading M-Lab response failed", GetLastError());
             return false;
         }
         if (available == 0) return true;
+        if (available > 1024 * 1024 || response.size() + available > 1024 * 1024) {
+            error = L"M-Lab locator response exceeded its size limit";
+            return false;
+        }
 
         std::vector<char> buffer(static_cast<size_t>(available));
         DWORD downloaded = 0;
@@ -158,6 +166,8 @@ bool ReadHttpResponse(HINTERNET request, std::string& response, std::wstring& er
         }
         response.append(buffer.data(), downloaded);
     }
+    error = L"Test cancelled by user";
+    return false;
 }
 
 bool ParseWebSocketUrl(const std::wstring& url, WebSocketUrl& parsed, std::wstring& error) {
@@ -214,13 +224,14 @@ bool ParseWebSocketUrl(const std::wstring& url, WebSocketUrl& parsed, std::wstri
 
 class Ndt7WebSocket {
 public:
-    Ndt7WebSocket() = default;
+    explicit Ndt7WebSocket(const std::atomic<bool>& cancelled) : cancelled_(cancelled) {}
     ~Ndt7WebSocket() { Close(); }
 
     Ndt7WebSocket(const Ndt7WebSocket&) = delete;
     Ndt7WebSocket& operator=(const Ndt7WebSocket&) = delete;
 
     bool Connect(const std::wstring& url, std::wstring& error) {
+        if (cancelled_) return false;
         WebSocketUrl parsed;
         if (!ParseWebSocketUrl(url, parsed, error)) return false;
 
@@ -258,6 +269,17 @@ public:
             return false;
         }
 
+        // Keep a full 64 KiB masked data frame (including its header) inside
+        // one WinHTTP send buffer. The default 32 KiB buffering path corrupts
+        // framing when an automatic pong races a split bulk write on the
+        // tested Windows stack. The owned peer validates this exact exchange.
+        DWORD send_buffer_bytes = static_cast<DWORD>(2 * kTransferChunkBytes);
+        if (!WinHttpSetOption(request_, WINHTTP_OPTION_WEB_SOCKET_SEND_BUFFER_SIZE,
+                &send_buffer_bytes, sizeof(send_buffer_bytes))) {
+            error = MakeWinHttpError(L"Preparing M-Lab send buffering failed", GetLastError());
+            return false;
+        }
+
         if (!WinHttpSetOption(request_, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0)) {
             error = MakeWinHttpError(L"Preparing M-Lab WebSocket upgrade failed", GetLastError());
             return false;
@@ -271,10 +293,12 @@ public:
             error = MakeWinHttpError(L"Adding NDT7 protocol header failed", GetLastError());
             return false;
         }
+        if (cancelled_) return false;
         if (!WinHttpSendRequest(request_, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
             error = MakeWinHttpError(L"Starting M-Lab WebSocket failed", GetLastError());
             return false;
         }
+        if (cancelled_) return false;
         if (!WinHttpReceiveResponse(request_, nullptr)) {
             error = MakeWinHttpError(L"Completing M-Lab WebSocket handshake failed", GetLastError());
             return false;
@@ -308,7 +332,10 @@ public:
         }
         WinHttpCloseHandle(request_);
         request_ = nullptr;
-        return true;
+        // WebSocket handles reject WinHTTP's request SEND/RECEIVE_TIMEOUT
+        // options (12018). Keep request/session timeouts on their valid handle;
+        // do not reject a successful upgrade or promise a hard Receive deadline.
+        return !cancelled_;
     }
 
     DWORD Receive(void* buffer, DWORD buffer_size, DWORD* bytes_read, WINHTTP_WEB_SOCKET_BUFFER_TYPE* buffer_type) const {
@@ -329,7 +356,14 @@ public:
             reason.data(), static_cast<DWORD>(reason.size()), &reason_size);
         if (result != NO_ERROR) return MakeWinHttpError(L"Reading NDT7 close status failed", result);
         if (status != WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS) {
-            return L"NDT7 peer closed with status " + std::to_wstring(status);
+            std::wstring issue = L"NDT7 peer closed with status " + std::to_wstring(status);
+            // The RFC6455 reason is at most 123 bytes. Keep it only in the
+            // existing on-demand measurement details, never the local log.
+            auto peer_reason = Utf8ToWide(std::string(reason.data(),
+                (std::min)(static_cast<size_t>(reason_size), reason.size())));
+            for (auto& ch : peer_reason) if (ch < L' ' || ch == L'\x7f') ch = L' ';
+            if (!peer_reason.empty()) issue += L": " + peer_reason;
+            return issue;
         }
         return {};
     }
@@ -346,7 +380,7 @@ public:
 private:
     void Close() {
         if (socket_) {
-            ShutdownSend();
+            if (!cancelled_) ShutdownSend();
             WinHttpCloseHandle(socket_);
             socket_ = nullptr;
         }
@@ -364,6 +398,7 @@ private:
         }
     }
 
+    const std::atomic<bool>& cancelled_;
     HINTERNET session_ = nullptr;
     HINTERNET connection_ = nullptr;
     HINTERNET request_ = nullptr;
@@ -389,83 +424,105 @@ void AppendError(std::wstring& combined, const wchar_t* phase, const std::wstrin
 
 } // namespace
 
-SpeedTester::SpeedTester() {
-    result_.server_name = L"";
-    result_.server_city = L"";
-}
+SpeedTester::SpeedTester() = default;
 
 SpeedTester::~SpeedTester() {
-    is_running_ = false;
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
-    }
+    cancel_requested_ = true;
+    if (worker_thread_.joinable()) worker_thread_.join();
 }
 
-std::wstring SpeedTester::GetStatusString() const {
+SpeedTestSnapshot SpeedTester::GetSnapshot() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    return status_string_;
+    return state_;
 }
 
-SpeedTestResult SpeedTester::GetResult() const {
+void SpeedTester::SetPhase(SpeedTestPhase phase, const std::wstring& status, int progress, double live, const SpeedTestResult* result) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    return result_;
+    if (cancel_requested_) return; // A late I/O completion cannot overwrite Cancelling.
+    if (result) state_.result = *result;
+    state_.phase = phase;
+    state_.status = status;
+    state_.progress = std::clamp(progress, 0, 100);
+    state_.live_mbps = live;
 }
 
-void SpeedTester::SetStatus(const std::wstring& status) {
+void SpeedTester::PublishLive(int progress, double live) {
+    const uint64_t now = GetTickCount64();
+    if (now - last_live_publish_ms_ < 100) return;
+    last_live_publish_ms_ = now;
     std::lock_guard<std::mutex> lock(state_mutex_);
-    status_string_ = status;
+    if (cancel_requested_) return;
+    state_.progress = std::clamp(progress, 0, 100);
+    state_.live_mbps = live;
 }
 
-void SpeedTester::SetResult(const SpeedTestResult& res) {
+void SpeedTester::SetResult(const SpeedTestResult& result) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    result_ = res;
+    if (!cancel_requested_) state_.result = result;
 }
 
 void SpeedTester::CancelTest() {
-    if (is_running_.load()) {
-        is_running_.store(false);
-        SetStatus(L"Speed test cancelled by user");
-        progress_ = 0;
-        live_speed_ = 0.0;
-        SpeedTestResult res = GetResult();
-        res.error_message = L"Test cancelled by user";
-        SetResult(res);
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!is_running_ || cancel_requested_) return;
+    cancel_requested_ = true;
+    state_.phase = SpeedTestPhase::Cancelling;
+    state_.status = L"Cancelling; waiting for the current network operation...";
+    state_.live_mbps = 0.0;
+    // Keep ownership busy. Start must not join this unfinished worker from a click.
+}
+
+void SpeedTester::FinishWorker() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.live_mbps = 0.0;
+    if (cancel_requested_) {
+        state_.phase = SpeedTestPhase::Cancelled;
+        state_.status = L"Speed test cancelled by user";
+        state_.result.error_message = L"Test cancelled by user";
+        state_.progress = 0;
+    } else if (SpeedTestBusy(state_.phase)) {
+        state_.phase = state_.result.error_message.empty() ? SpeedTestPhase::Completed : SpeedTestPhase::Failed;
+        state_.progress = 100;
     }
+    // The worker performs no network work or state writes after this store.
+    is_running_ = false;
 }
 
 void SpeedTester::StartTest() {
     bool expected = false;
     if (!is_running_.compare_exchange_strong(expected, true)) return;
-
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
+    // A joinable predecessor has already finished *all* I/O/state publication.
+    if (worker_thread_.joinable()) worker_thread_.join();
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        cancel_requested_ = false;
+        state_ = {};
+        state_.phase = SpeedTestPhase::Locating;
+        state_.status = L"Preparing M-Lab test...";
     }
-
-    progress_ = 0;
-    live_speed_ = 0.0;
-    SetStatus(L"Preparing M-Lab test...");
-    SetResult(SpeedTestResult());
-
+    last_live_publish_ms_ = 0;
     try {
-        worker_thread_ = std::thread([this]() {
+        worker_thread_ = std::thread([this] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             try {
+#ifdef WATCHMAN_SPEED_TESTING
+                if (test_worker_) test_worker_(*this);
+                else
+#endif
                 RunSpeedTest();
             } catch (...) {
                 SpeedTestResult failed = GetResult();
                 failed.error_message = L"Unexpected error while running the M-Lab test";
                 SetResult(failed);
-                SetStatus(L"M-Lab test failed");
-                progress_ = 100;
-                live_speed_ = 0.0;
-                is_running_ = false;
+                SetPhase(SpeedTestPhase::Failed, L"M-Lab test failed", 100);
             }
+            FinishWorker();
         });
     } catch (...) {
         SpeedTestResult failed;
         failed.error_message = L"Unable to start the M-Lab worker thread";
         SetResult(failed);
-        SetStatus(L"M-Lab test could not start");
-        is_running_ = false;
+        SetPhase(SpeedTestPhase::Failed, L"M-Lab test could not start", 100);
+        FinishWorker();
     }
 }
 
@@ -476,6 +533,14 @@ bool SpeedTester::QueryMLabServer(
     std::wstring& server_city,
     std::wstring& error
 ) {
+#ifdef WATCHMAN_SPEED_TESTING
+    if (!test_download_.empty() && !test_upload_.empty()) {
+        dl_url = test_download_; ul_url = test_upload_;
+        server_name = L"Owned loopback server"; server_city = L"Offline regression";
+        return !cancel_requested_;
+    }
+#endif
+    if (cancel_requested_) return false;
     HINTERNET session = WinHttpOpen(
         kUserAgent,
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -512,8 +577,8 @@ bool SpeedTester::QueryMLabServer(
         return false;
     }
 
-    bool ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) == TRUE &&
-        WinHttpReceiveResponse(request, nullptr) == TRUE;
+    bool ok = !cancel_requested_ && WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) == TRUE &&
+        !cancel_requested_ && WinHttpReceiveResponse(request, nullptr) == TRUE;
     if (!ok) {
         error = MakeWinHttpError(L"M-Lab locator request failed", GetLastError());
         WinHttpCloseHandle(request);
@@ -532,7 +597,7 @@ bool SpeedTester::QueryMLabServer(
     }
 
     std::string response;
-    if (error.empty() && !ReadHttpResponse(request, response, error)) {
+    if (error.empty() && !ReadHttpResponse(request, response, error, cancel_requested_)) {
         // ReadHttpResponse provides the error message.
     }
 
@@ -569,7 +634,7 @@ bool SpeedTester::QueryMLabServer(
 }
 
 network_test::TransferResult SpeedTester::RunDownloadTest(const std::wstring& url, double& min_rtt_ms) {
-    Ndt7WebSocket socket;
+    Ndt7WebSocket socket(cancel_requested_);
     std::wstring issues;
     if (!socket.Connect(url, issues)) return network_test::FinishTransfer(false, 0, 0.0, 0.0, issues);
 
@@ -579,7 +644,7 @@ network_test::TransferResult SpeedTester::RunDownloadTest(const std::wstring& ur
     network_test::MeasurementText text_message;
     std::array<char, kTransferChunkBytes> buffer{};
 
-    while (is_running_) {
+    while (!cancel_requested_) {
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         if (elapsed >= kTestWindowSeconds) break;
 
@@ -613,8 +678,8 @@ network_test::TransferResult SpeedTester::RunDownloadTest(const std::wstring& ur
 
         const double current_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         if (current_elapsed > 0.05) {
-            live_speed_ = network_test::GoodputMbps(static_cast<double>(total_bytes), current_elapsed);
-            progress_ = 10 + static_cast<int>((std::min)(40.0, (current_elapsed / kTestWindowSeconds) * 40.0));
+            PublishLive(10 + static_cast<int>((std::min)(40.0, (current_elapsed / kTestWindowSeconds) * 40.0)),
+                network_test::GoodputMbps(static_cast<double>(total_bytes), current_elapsed));
         }
     }
 
@@ -624,7 +689,7 @@ network_test::TransferResult SpeedTester::RunDownloadTest(const std::wstring& ur
 }
 
 network_test::TransferResult SpeedTester::RunUploadTest(const std::wstring& url, double& min_rtt_ms) {
-    Ndt7WebSocket socket;
+    Ndt7WebSocket socket(cancel_requested_);
     std::wstring issues;
     if (!socket.Connect(url, issues)) return network_test::FinishTransfer(true, 0, 0.0, 0.0, issues);
 
@@ -643,7 +708,7 @@ network_test::TransferResult SpeedTester::RunUploadTest(const std::wstring& url,
             std::array<char, kTransferChunkBytes> receive_buffer{};
             network_test::MeasurementText text_message;
             bool peer_closed = false;
-            while (is_running_) {
+            while (!cancel_requested_) {
                 const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
                 if (elapsed >= kTestWindowSeconds + 3.0) break;
                 DWORD bytes_read = 0;
@@ -674,7 +739,7 @@ network_test::TransferResult SpeedTester::RunUploadTest(const std::wstring& url,
                         break;
                     }
                     if (text_result == network_test::MeasurementText::Result::Complete) {
-                        network_test::UpdateMeasurement(Utf8ToWide(text_message.Text()), server_mbps, min_rtt_ms);
+                        network_test::UpdateMeasurement(Utf8ToWide(text_message.Text()), server_mbps, min_rtt_ms, true);
                         text_message.Clear();
                     }
                 }
@@ -691,7 +756,7 @@ network_test::TransferResult SpeedTester::RunUploadTest(const std::wstring& url,
     // leaves Receive open so the reader can consume the final summary and close.
     double send_elapsed = 0.0;
     try {
-        while (is_running_ && !reader_done.load()) {
+        while (!cancel_requested_ && !reader_done.load()) {
             const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             if (elapsed >= kTestWindowSeconds) break;
             const DWORD send_result = socket.SendBinary(payload.data(), static_cast<DWORD>(payload.size()));
@@ -702,12 +767,13 @@ network_test::TransferResult SpeedTester::RunUploadTest(const std::wstring& url,
             total_bytes += payload.size();
             const double current_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             if (current_elapsed > 0.05) {
-                live_speed_ = network_test::GoodputMbps(static_cast<double>(total_bytes), current_elapsed);
-                progress_ = 55 + static_cast<int>((std::min)(40.0, (current_elapsed / kTestWindowSeconds) * 40.0));
+                PublishLive(55 + static_cast<int>((std::min)(40.0, (current_elapsed / kTestWindowSeconds) * 40.0)),
+                    network_test::GoodputMbps(static_cast<double>(total_bytes), current_elapsed));
             }
         }
         // Capture before shutdown/join: waiting for the reader is not sending time.
         send_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        SetPhase(SpeedTestPhase::Finishing, L"Waiting for the upload server summary...", 96);
         const DWORD shutdown_result = socket.ShutdownSend();
         if (shutdown_result != NO_ERROR) {
             network_test::AppendIssue(issues, MakeWinHttpError(L"Closing the upload send channel failed", shutdown_result));
@@ -717,16 +783,17 @@ network_test::TransferResult SpeedTester::RunUploadTest(const std::wstring& url,
         response_reader.join();
         throw;
     }
-    // This remains synchronous, not a hard deadline: ShutdownSend requests a peer
-    // close but cannot guarantee a blocked Receive returns. Do not advertise cancel.
+    // A WebSocket Receive has no safe forced-thread termination. The UI keeps
+    // showing Cancelling until this owned reader and worker actually retire;
+    // request timeouts are not a hard deadline for an upgraded socket.
     response_reader.join();
     network_test::AppendIssue(issues, receive_issues);
     return network_test::FinishTransfer(true, total_bytes, send_elapsed, server_mbps, issues);
 }
 
 void SpeedTester::RunSpeedTest() {
-    SetStatus(L"Locating M-Lab server...");
-    progress_ = 5;
+    if (cancel_requested_) return;
+    SetPhase(SpeedTestPhase::Locating, L"Locating M-Lab server...", 5);
 
     std::wstring download_url;
     std::wstring upload_url;
@@ -740,11 +807,7 @@ void SpeedTester::RunSpeedTest() {
         failed.completed_at_unix_seconds = static_cast<uint64_t>(
             std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())
         );
-        SetResult(failed);
-        SetStatus(L"M-Lab server location failed");
-        progress_ = 100;
-        live_speed_ = 0.0;
-        is_running_ = false;
+        SetPhase(SpeedTestPhase::Failed, L"M-Lab server location failed", 100, 0.0, &failed);
         return;
     }
 
@@ -753,11 +816,11 @@ void SpeedTester::RunSpeedTest() {
     result.server_city = server_city;
     SetResult(result);
 
-    SetStatus(L"Testing download speed...");
-    progress_ = 10;
+    if (cancel_requested_) return;
+    SetPhase(SpeedTestPhase::Download, L"Testing download speed...", 10);
     double download_rtt = 0.0;
     const auto download = RunDownloadTest(download_url, download_rtt);
-    if (!is_running_) return;
+    if (cancel_requested_) return;
 
     result = GetResult();
     result.download_speed_mbps = download.speed_mbps;
@@ -765,16 +828,15 @@ void SpeedTester::RunSpeedTest() {
     AppendError(result.error_message, L"Download", download.error);
     AppendError(result.warning_message, L"Download", download.warning);
     result.latency_ms = download_rtt;
-    SetResult(result);
+    SetPhase(SpeedTestPhase::PreparingUpload, L"Preparing upload test...", 50, 0.0, &result);
+    for (int wait = 0; wait < 25 && !cancel_requested_; ++wait)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (cancel_requested_) return;
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    if (!is_running_) return;
-
-    SetStatus(L"Testing upload speed...");
-    progress_ = 55;
+    SetPhase(SpeedTestPhase::Upload, L"Testing upload speed...", 55);
     double upload_rtt = 0.0;
     const auto upload = RunUploadTest(upload_url, upload_rtt);
-    if (!is_running_) return;
+    if (cancel_requested_) return;
 
     result = GetResult();
     result.upload_speed_mbps = upload.speed_mbps;
@@ -788,11 +850,7 @@ void SpeedTester::RunSpeedTest() {
     result.completed_at_unix_seconds = static_cast<uint64_t>(
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())
     );
-    SetResult(result);
-
-    SetStatus(!result.error_message.empty() ? L"M-Lab test completed with a failed phase" :
-        (!result.warning_message.empty() ? L"M-Lab test completed with warnings" : L"Test completed"));
-    progress_ = 100;
-    live_speed_ = 0.0;
-    is_running_ = false;
+    SetPhase(result.error_message.empty() ? SpeedTestPhase::Completed : SpeedTestPhase::Failed,
+        !result.error_message.empty() ? L"M-Lab test completed with a failed phase" :
+        (!result.warning_message.empty() ? L"M-Lab test completed with warnings" : L"Test completed"), 100, 0.0, &result);
 }

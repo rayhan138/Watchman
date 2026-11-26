@@ -62,7 +62,7 @@ void TaskbarWidgetCompositor::ReleaseRenderTarget() {
     SafeRelease(swap_chain_);
     width_ = 0;
     height_ = 0;
-    has_last_frame_ = false;
+    frame_validity_.Invalidate();
 }
 
 void TaskbarWidgetCompositor::ReleaseBrushes() {
@@ -108,6 +108,12 @@ void TaskbarWidgetCompositor::Reset() {
     hwnd_ = nullptr;
 }
 
+bool TaskbarWidgetCompositor::Fail(HRESULT error) {
+    Reset();
+    last_error_ = FAILED(error) ? error : E_FAIL;
+    return false;
+}
+
 bool TaskbarWidgetCompositor::CreateDeviceResources(HWND hwnd) {
     hwnd_ = hwnd;
 
@@ -126,14 +132,12 @@ bool TaskbarWidgetCompositor::CreateDeviceResources(HWND hwnd) {
         nullptr
     );
     if (FAILED(hr)) {
-        Reset();
-        return false;
+        return Fail(hr);
     }
 
     hr = d3d_device_->QueryInterface(IID_PPV_ARGS(&dxgi_device_));
     if (FAILED(hr)) {
-        Reset();
-        return false;
+        return Fail(hr);
     }
 
     IDXGIAdapter* adapter = nullptr;
@@ -143,8 +147,7 @@ bool TaskbarWidgetCompositor::CreateDeviceResources(HWND hwnd) {
     }
     SafeRelease(adapter);
     if (FAILED(hr)) {
-        Reset();
-        return false;
+        return Fail(hr);
     }
 
     hr = D2D1CreateFactory(
@@ -163,8 +166,7 @@ bool TaskbarWidgetCompositor::CreateDeviceResources(HWND hwnd) {
         );
     }
     if (FAILED(hr)) {
-        Reset();
-        return false;
+        return Fail(hr);
     }
 
     hr = DWriteCreateFactory(
@@ -173,14 +175,12 @@ bool TaskbarWidgetCompositor::CreateDeviceResources(HWND hwnd) {
         reinterpret_cast<IUnknown**>(&dwrite_factory_)
     );
     if (FAILED(hr)) {
-        Reset();
-        return false;
+        return Fail(hr);
     }
 
-    if (FAILED(bundled_fonts_.Initialize(dwrite_factory_)) || !EnsureTextFormat(L"", 11.0f)) {
-        Reset();
-        return false;
-    }
+    hr = bundled_fonts_.Initialize(dwrite_factory_);
+    if (FAILED(hr)) return Fail(hr);
+    if (!EnsureTextFormat(L"", 11.0f)) return Fail(last_error_);
 
     hr = DCompositionCreateDevice(
         dxgi_device_,
@@ -199,8 +199,7 @@ bool TaskbarWidgetCompositor::CreateDeviceResources(HWND hwnd) {
         hr = composition_device_->CreateVisual(&composition_visual_);
     }
     if (FAILED(hr)) {
-        Reset();
-        return false;
+        return Fail(hr);
     }
 
     d2d_context_->SetDpi(96.0f, 96.0f);
@@ -232,6 +231,7 @@ bool TaskbarWidgetCompositor::EnsureRenderTarget(UINT width, UINT height) {
         &swap_chain_
     );
     if (FAILED(hr)) {
+        last_error_ = hr;
         return false;
     }
 
@@ -241,6 +241,7 @@ bool TaskbarWidgetCompositor::EnsureRenderTarget(UINT width, UINT height) {
     }
     if (FAILED(hr)) {
         ReleaseRenderTarget();
+        last_error_ = hr;
         return false;
     }
 
@@ -265,13 +266,16 @@ bool TaskbarWidgetCompositor::EnsureRenderTarget(UINT width, UINT height) {
     SafeRelease(surface);
     if (FAILED(hr)) {
         ReleaseRenderTarget();
+        last_error_ = hr;
         return false;
     }
 
     d2d_context_->SetTarget(target_bitmap_);
     width_ = width;
     height_ = height;
-    return SUCCEEDED(composition_device_->Commit());
+    const HRESULT committed = composition_device_->Commit();
+    if (FAILED(committed)) last_error_ = committed;
+    return SUCCEEDED(committed);
 }
 
 bool TaskbarWidgetCompositor::EnsureTextFormat(const std::wstring& font_family, float font_size) {
@@ -283,7 +287,7 @@ bool TaskbarWidgetCompositor::EnsureTextFormat(const std::wstring& font_family, 
     SafeRelease(text_format_);
     const HRESULT hr = bundled_fonts_.CreateTextFormat(requested.c_str(), DWRITE_FONT_WEIGHT_BOLD,
         font_size, &text_format_);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) { last_error_ = hr; return false; }
     text_format_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     text_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     text_format_family_ = requested;
@@ -333,6 +337,7 @@ bool TaskbarWidgetCompositor::EnsureBrushes(const TaskbarWidgetFrame& frame) {
 
     if (FAILED(hr)) {
         ReleaseBrushes();
+        last_error_ = hr;
         return false;
     }
 
@@ -381,12 +386,11 @@ void TaskbarWidgetCompositor::DrawText(
 }
 
 bool TaskbarWidgetCompositor::Render(HWND hwnd, const TaskbarWidgetFrame& frame) {
-    if (!hwnd || !IsWindow(hwnd)) {
-        return false;
-    }
+    if (!hwnd || !IsWindow(hwnd)) return Fail(HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE));
+    last_error_ = S_OK;
 
     RECT client{};
-    GetClientRect(hwnd, &client);
+    if (!GetClientRect(hwnd, &client)) return Fail(HRESULT_FROM_WIN32(GetLastError()));
     const UINT width = static_cast<UINT>(std::max<LONG>(1, client.right - client.left));
     const UINT height = static_cast<UINT>(std::max<LONG>(1, client.bottom - client.top));
 
@@ -396,19 +400,14 @@ bool TaskbarWidgetCompositor::Render(HWND hwnd, const TaskbarWidgetFrame& frame)
     if (!d3d_device_ && !CreateDeviceResources(hwnd)) {
         return false;
     }
-    if (!EnsureRenderTarget(width, height)) {
-        Reset();
-        return false;
-    }
+    if (!EnsureRenderTarget(width, height)) return Fail(last_error_);
 
-    if (has_last_frame_ && FramesMatch(last_frame_, frame)) {
+    if (frame_validity_.CanReuse(FramesMatch(last_frame_, frame))) {
         return true;
     }
     const auto layout = TaskbarWidgetLayout::Get(static_cast<int>(width), static_cast<int>(height), frame.mode, frame.vertical, frame.dpi, frame.taskbar_edge);
-    if (!EnsureTextFormat(frame.font_family, layout.font_size) || !EnsureBrushes(frame)) {
-        Reset();
-        return false;
-    }
+    if (!EnsureTextFormat(frame.font_family, layout.font_size) || !EnsureBrushes(frame))
+        return Fail(last_error_);
 
     d2d_context_->BeginDraw();
     const D2D1_COLOR_F transparent = D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f);
@@ -470,8 +469,7 @@ bool TaskbarWidgetCompositor::Render(HWND hwnd, const TaskbarWidgetFrame& frame)
     HRESULT hr = d2d_context_->EndDraw();
 
     if (FAILED(hr)) {
-        Reset();
-        return false;
+        return Fail(hr);
     }
 
     hr = swap_chain_->Present(1, 0);
@@ -479,11 +477,11 @@ bool TaskbarWidgetCompositor::Render(HWND hwnd, const TaskbarWidgetFrame& frame)
         hr = composition_device_->Commit();
     }
     if (FAILED(hr)) {
-        Reset();
-        return false;
+        return Fail(hr);
     }
 
     last_frame_ = frame;
-    has_last_frame_ = true;
+    frame_validity_.Presented();
+    ++submission_count_;
     return true;
 }

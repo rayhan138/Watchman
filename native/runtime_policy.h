@@ -31,6 +31,19 @@ inline MainUiActivity GetMainUiActivity(bool visible, bool minimized, bool foreg
     return {keep_graphics, keep_graphics && foreground};
 }
 
+// Idle Network/Tools pages do not need sixty identical full-window paints/s.
+// Animate transitions at the native cadence; publish a running speed test at 10Hz.
+class MainFrameCadence {
+public:
+    bool Due(uint64_t now, bool animating, bool live_speed_test) {
+        if (animating) { last_live_ = now; return true; }
+        if (live_speed_test && now - last_live_ >= 100) { last_live_ = now; return true; }
+        return false;
+    }
+private:
+    uint64_t last_live_ = 0;
+};
+
 struct LaunchOptions {
     bool startup = false;
     uint32_t replace_pid = 0;
@@ -40,6 +53,8 @@ struct LaunchOptions {
 inline LaunchOptions ParseArguments(const std::vector<std::wstring>& arguments) {
     LaunchOptions result;
     for (size_t index = 1; index < arguments.size(); ++index) {
+        // Tauri v1.0.5 registered the legacy Run entry with --minimized.
+        // Preserve the same quiet-start intent while migrating that exact flag.
         if (arguments[index] == L"--startup" || arguments[index] == L"--minimized") result.startup = true;
         else if (arguments[index] == L"--replace-pid" && index + 1 < arguments.size()) {
             const auto& text = arguments[++index];

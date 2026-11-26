@@ -4,6 +4,8 @@
 #include "sqlite3.h"
 
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -265,6 +267,147 @@ void TestFailedOpenCanRetry() {
     Require(observer.Integer("SELECT download_bytes FROM daily_traffic;") == 1, "Failed handle prevented retry");
 }
 
+std::string FileBytes(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+}
+
+void TestExistingNativeProfileContinuity() {
+    TempHistory temp;
+    const auto legacy_path = temp.directory / L"Watchman" / L"watchman.db";
+    const auto native_path = temp.directory / L"Watchman.Native" / L"watchman.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    std::filesystem::create_directories(native_path.parent_path() / L"original-v1");
+    {
+        TrafficStorage legacy(legacy_path.wstring(), 0);
+        Require(legacy.SaveTrafficForDate(L"2026-11-18", 100, 20, {}), legacy.GetLastError());
+        Require(legacy.SaveTrafficForDate(L"2026-11-24", 7, 3, {{L"legacy-only.exe", 4, 1, 42}}), legacy.GetLastError());
+    }
+    const auto legacy_before = FileBytes(legacy_path);
+    const auto backup_path = native_path.parent_path() / L"original-v1" / L"watchman.db";
+    const auto json_path = native_path.parent_path() / L"history.json";
+    std::ofstream(backup_path, std::ios::binary) << "Do not restore this archived database";
+    std::ofstream(json_path, std::ios::binary) << "{\"records\":{\"2026-11-24\":{\"download\":999999999}}}";
+    std::ofstream(native_path.parent_path() / L"migration-v2.complete") << "2.0.0\n";
+    const auto backup_before = FileBytes(backup_path), json_before = FileBytes(json_path);
+    Connection native(native_path.wstring());
+    native.Exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;"
+        "CREATE TABLE daily_traffic(date TEXT PRIMARY KEY,upload_bytes INTEGER NOT NULL DEFAULT 0,"
+        "download_bytes INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);"
+        "INSERT INTO daily_traffic VALUES('2026-11-18',20,100,'preserve-18');"
+        "INSERT INTO daily_traffic VALUES('2026-11-21',30,200,'preserve-21');"
+        "INSERT INTO daily_traffic VALUES('2026-11-22',40,300,'preserve-22');"
+        "INSERT INTO daily_traffic VALUES('2026-11-23',50,400,'preserve-23');"
+        "INSERT INTO daily_traffic VALUES('2026-11-24',60,500,'preserve-24');");
+    Require(std::filesystem::exists(native_path.wstring() + L"-wal"), "Fixture did not retain committed WAL data");
+    const auto selection = WatchmanHistory::Select(temp.directory);
+    Require(selection.error.empty() && selection.profile == WatchmanHistory::Profile::Native,
+            "Native profile was not selected");
+    {
+        TrafficStorage storage(selection, 0);
+        Require(storage.GetLastError().empty(), storage.GetLastError());
+        Require(storage.GetDatabaseFilePath() == native_path.wstring(), "Wrong database was opened");
+        std::vector<TrafficRecord> rows;
+        Require(storage.LoadHistory(rows) && rows.size() == 5 && rows.back().rx_bytes == 500,
+                "Native days/committed WAL were lost or legacy/JSON data was merged");
+        Require(storage.SaveTrafficForDate(L"2026-11-24", 9, 2, {{L"native-only.exe", 6, 1, 99}}), storage.GetLastError());
+        Require(native.Integer("SELECT download_bytes FROM daily_traffic WHERE date='2026-11-24'") == 509,
+                "New samples were not written to the selected native profile");
+        Require(native.Integer("SELECT COUNT(*) FROM app_traffic WHERE app_name='legacy-only.exe'") == 0,
+                "The independent legacy session was silently merged");
+    }
+    {
+        TrafficStorage reopened(WatchmanHistory::Select(temp.directory), 0);
+        const auto rows = reopened.LoadHistory();
+        Require(rows.size() == 5 && rows.back().rx_bytes == 509, "Reopen changed or duplicated native history");
+        Require(native.Text("SELECT updated_at FROM daily_traffic WHERE date='2026-11-21'") == "preserve-21",
+                "Untouched native historical metadata changed");
+    }
+    Require(FileBytes(legacy_path) == legacy_before && FileBytes(backup_path) == backup_before &&
+            FileBytes(json_path) == json_before, "Independent history or archival backup was overwritten");
+}
+
+void TestNativeFailureDoesNotFallBack() {
+    TempHistory temp;
+    const auto legacy_path = temp.directory / L"Watchman" / L"watchman.db";
+    const auto native_path = temp.directory / L"Watchman.Native" / L"watchman.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    std::filesystem::create_directories(native_path.parent_path());
+    { TrafficStorage legacy(legacy_path.wstring(), 0);
+      Require(legacy.SaveTrafficForDate(L"2026-11-24", 7, 3, {}), legacy.GetLastError()); }
+    const auto legacy_before = FileBytes(legacy_path);
+    for (const auto* contents : {"", "not a SQLite database"}) {
+        std::ofstream(native_path, std::ios::binary | std::ios::trunc) << contents;
+        const auto damaged_before = FileBytes(native_path);
+        TrafficStorage storage(WatchmanHistory::Select(temp.directory), 0);
+        Require(!storage.GetLastError().empty() && !storage.SaveTrafficForDate(L"2026-11-24", 1, 1, {}),
+                "Damaged native profile was replaced or redirected to legacy");
+        Require(FileBytes(legacy_path) == legacy_before && FileBytes(native_path) == damaged_before,
+                "Failure changed independent or damaged history");
+    }
+    std::filesystem::remove(native_path);
+    TrafficStorage missing(WatchmanHistory::Select(temp.directory), 0);
+    Require(!missing.SaveTrafficForDate(L"2026-11-24", 1, 1, {}) && !std::filesystem::exists(native_path),
+            "A missing native DB was recreated empty");
+    Require(FileBytes(legacy_path) == legacy_before, "Missing native DB redirected deltas to legacy");
+    for (const auto* suffix : {L"-wal", L"-shm", L"-journal"}) {
+        const auto sidecar = std::filesystem::path(native_path.wstring() + suffix);
+        std::ofstream(sidecar, std::ios::binary) << "orphaned native recovery data";
+        const auto sidecar_before = FileBytes(sidecar);
+        TrafficStorage orphaned(WatchmanHistory::Select(temp.directory), 0);
+        Require(!orphaned.SaveTrafficForDate(L"2026-11-24", 1, 1, {}) &&
+                !std::filesystem::exists(native_path) && FileBytes(sidecar) == sidecar_before,
+                "An orphaned native SQLite sidecar was overwritten or redirected to legacy");
+        Require(FileBytes(legacy_path) == legacy_before, "Orphaned native sidecar redirected deltas to legacy");
+        std::filesystem::remove(sidecar);
+    }
+}
+
+void TestCheckedHistoryRetainsLastGood() {
+    TempHistory temp;
+    TrafficStorage storage(temp.database_path, 0);
+    Require(storage.SaveTrafficForDate(L"2026-11-24", 100, 20, {}), storage.GetLastError());
+    std::vector<TrafficRecord> rows;
+    Require(storage.LoadHistory(rows) && rows.size() == 1, "Checked initial read failed");
+    Connection writer(temp.database_path);
+    writer.Exec("ALTER TABLE daily_traffic RENAME TO unavailable;");
+    Require(!storage.LoadHistory(rows) && !storage.GetLastError().empty() &&
+            rows.size() == 1 && rows[0].rx_bytes == 100, "Failed query erased last good history");
+    writer.Exec("ALTER TABLE unavailable RENAME TO daily_traffic;"
+                "INSERT INTO daily_traffic VALUES('2026-11-25',-1,0,'bad');");
+    Require(!storage.LoadHistory(rows) && rows.size() == 1 && rows[0].rx_bytes == 100,
+            "Invalid later row published a partial/unsigned history");
+    writer.Exec("DELETE FROM daily_traffic WHERE date='2026-11-25';");
+    Require(storage.LoadHistory(rows) && storage.GetLastError().empty() && rows.size() == 1,
+            "Checked history did not recover after repair");
+}
+
+void TestExportPresentationPreservesStoredBytes() {
+    TempHistory temp;
+    TrafficStorage storage(temp.database_path, 0);
+    constexpr uint64_t mb = 1024ULL * 1024, gb = mb * 1024;
+    Require(storage.SaveTrafficForDate(L"2024-01-01", 15 * mb, 512 * 1024, {}), storage.GetLastError());
+    Require(storage.SaveTrafficForDate(L"2024-01-08", 2 * gb, gb, {}), storage.GetLastError());
+    Require(storage.SaveTrafficForDate(L"2024-02-29", mb, 0, {}), storage.GetLastError());
+    Connection observer(temp.database_path);
+    const auto download = observer.Integer("SELECT SUM(download_bytes) FROM daily_traffic;");
+    const auto upload = observer.Integer("SELECT SUM(upload_bytes) FROM daily_traffic;");
+    const auto timestamp = observer.Text("SELECT updated_at FROM daily_traffic WHERE date='2024-01-01';");
+    std::vector<TrafficRecord> records;
+    Require(storage.LoadHistory(records), storage.GetLastError());
+    for (auto period : {TrafficExportPeriod::Daily, TrafficExportPeriod::Weekly, TrafficExportPeriod::Monthly, TrafficExportPeriod::Yearly}) {
+        const auto csv = WatchmanExport::BuildCsv(records, {period, L"2024-01", 2024});
+        Require(csv.error.empty() && csv.utf8.substr(0, 3) == "\xEF\xBB\xBF" &&
+            csv.utf8.find("Summary\r\n") != std::string::npos && csv.utf8.find("Bytes") == std::string::npos,
+            "Real storage records do not produce the new presentation contract");
+    }
+    Require(observer.Integer("SELECT SUM(download_bytes) FROM daily_traffic;") == download &&
+            observer.Integer("SELECT SUM(upload_bytes) FROM daily_traffic;") == upload &&
+            observer.Text("SELECT updated_at FROM daily_traffic WHERE date='2024-01-01';") == timestamp &&
+            observer.Integer("SELECT COUNT(*) FROM daily_traffic;") == 3,
+            "CSV presentation must never convert or rewrite persisted history");
+}
+
 } // namespace
 
 int main() {
@@ -276,7 +419,11 @@ int main() {
         TestAtomicFailureAndRetry();
         TestFailedOpenCanRetry();
         TestAppTodayTotalsAndCheckedRead();
-        std::cout << "HistoryStorage: 7 synthetic tests passed\n";
+        TestExistingNativeProfileContinuity();
+        TestNativeFailureDoesNotFallBack();
+        TestCheckedHistoryRetainsLastGood();
+        TestExportPresentationPreservesStoredBytes();
+        std::cout << "HistoryStorage: 11 synthetic tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "HistoryStorage failure: " << error.what() << '\n';

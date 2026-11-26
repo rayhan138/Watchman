@@ -25,12 +25,14 @@ public static class WatchmanSmokeNative {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr window);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern IntPtr GetDesktopWindow();
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string className, string title);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool PostMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wparam, IntPtr lparam, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wparam, StringBuilder lparam, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr window, int index);
     [DllImport("user32.dll")] private static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
     [DllImport("user32.dll")] private static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
@@ -38,6 +40,10 @@ public static class WatchmanSmokeNative {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetMenuString(IntPtr menu, uint index, StringBuilder text, int maximum, uint flags);
     [DllImport("user32.dll")] public static extern bool GetMenuItemRect(IntPtr owner, IntPtr menu, uint index, out Rect rect);
     [DllImport("user32.dll")] public static extern uint GetMenuItemID(IntPtr menu, int index);
+    [DllImport("user32.dll")] public static extern IntPtr GetSubMenu(IntPtr menu, int index);
+    [DllImport("user32.dll")] public static extern uint GetMenuState(IntPtr menu, uint index, uint flags);
+    [DllImport("user32.dll")] private static extern IntPtr GetDlgItem(IntPtr dialog, int id);
+    [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr window);
     [DllImport("user32.dll")] public static extern bool InvalidateRect(IntPtr window, IntPtr rect, bool erase);
     [DllImport("dwmapi.dll")] public static extern int DwmFlush();
 
@@ -55,6 +61,16 @@ public static class WatchmanSmokeNative {
         if (found == IntPtr.Zero) EnumChildWindows(GetDesktopWindow(), callback, IntPtr.Zero);
         GC.KeepAlive(callback);
         return found;
+    }
+    // Sampling supplements deterministic owned-window fault tests; it is not
+    // a physical-pixel or actual sign-in measurement.
+    public static bool StaysHidden(IntPtr window, int milliseconds) {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        do {
+            if (!IsWindow(window) || IsWindowVisible(window) || GetForegroundWindow() == window) return false;
+            Thread.Sleep(10);
+        } while (clock.ElapsedMilliseconds < milliseconds);
+        return true;
     }
     public static string Caption(IntPtr window) {
         StringBuilder text = new StringBuilder(1024);
@@ -74,6 +90,30 @@ public static class WatchmanSmokeNative {
             return true;
         };
         EnumWindows(callback, IntPtr.Zero);
+        GC.KeepAlive(callback);
+        return result.ToString();
+    }
+    private static string ControlText(IntPtr window, uint timeout = 5000) {
+        // Send WM_GETTEXT explicitly: caption helpers can return an empty
+        // cached caption for another process's native Edit controls.
+        StringBuilder text = new StringBuilder(1024);
+        IntPtr copied;
+        if (SendMessageTimeout(window,0xD,new IntPtr(text.Capacity),text,2,timeout,out copied) == IntPtr.Zero)
+            throw new TimeoutException("Native control did not answer WM_GETTEXT");
+        return text.ToString();
+    }
+    public static string DescribeChildren(IntPtr parent) {
+        StringBuilder result = new StringBuilder();
+        EnumCallback callback = (window, parameter) => {
+            StringBuilder name = new StringBuilder(256);
+            GetClassName(window, name, name.Capacity);
+            Rect rect = Bounds(window);
+            result.AppendFormat("hwnd={0}, id={1}, class={2}, text={3}, visible={4}, enabled={5}, rect={6},{7},{8},{9};\n",
+                window, GetDlgCtrlID(window), name, ControlText(window), IsWindowVisible(window), IsWindowEnabled(window),
+                rect.Left, rect.Top, rect.Right, rect.Bottom);
+            return true;
+        };
+        EnumChildWindows(parent, callback, IntPtr.Zero);
         GC.KeepAlive(callback);
         return result.ToString();
     }
@@ -99,6 +139,72 @@ public static class WatchmanSmokeNative {
         Send(window, 0x200, IntPtr.Zero, Pack(x,y));
         Send(window, secondDoubleClick ? 0x203u : 0x201u, new IntPtr(1), Pack(x,y));
         Send(window, 0x202, IntPtr.Zero, Pack(x,y));
+    }
+    // A posted click permits an ordinary modal ChooseColor dialog to open;
+    // synchronous SendMessage would wait for that same dialog to be dismissed.
+    public static void BeginClick(IntPtr window, int x, int y) {
+        if (!PostMessage(window, 0x200, IntPtr.Zero, Pack(x,y)) ||
+            !PostMessage(window, 0x201, new IntPtr(1), Pack(x,y)) ||
+            !PostMessage(window, 0x202, IntPtr.Zero, Pack(x,y)))
+            throw new InvalidOperationException("Could not open the native color picker");
+    }
+    private static IntPtr RgbField(IntPtr dialog, int id) {
+        IntPtr edit = GetDlgItem(dialog,id);
+        StringBuilder name = new StringBuilder(32);
+        if (edit != IntPtr.Zero) GetClassName(edit,name,name.Capacity);
+        if (edit == IntPtr.Zero || name.ToString() != "Edit" || !IsWindowEnabled(edit))
+            throw new InvalidOperationException("Native RGB edit unavailable: " + id);
+        return edit;
+    }
+    public static bool IsColorDialogReady(IntPtr dialog) {
+        // EnumWindows can see #32770 before the dialog has created/initialized
+        // its edits. Wait for visible, enabled controls and their real values,
+        // rather than replacing that race with an arbitrary startup sleep.
+        if (dialog == IntPtr.Zero || !IsWindowVisible(dialog) || !IsWindowEnabled(dialog)) return false;
+        try {
+            foreach (int id in new int[] {706,707,708}) {
+                IntPtr edit = RgbField(dialog,id);
+                byte value;
+                if (!IsWindowVisible(edit) || !Byte.TryParse(ControlText(edit,100),out value)) return false;
+            }
+            return true;
+        } catch (InvalidOperationException) { return false; }
+        catch (TimeoutException) { return false; }
+    }
+    private static void InputKey(byte key) {
+        keybd_event(key,0,0,UIntPtr.Zero); keybd_event(key,0,2,UIntPtr.Zero);
+    }
+    public static string ReadRgb(IntPtr dialog) {
+        return String.Join(",",new string[] {
+            ControlText(RgbField(dialog,706)), ControlText(RgbField(dialog,707)), ControlText(RgbField(dialog,708))
+        });
+    }
+    public static string PrepareRgb(IntPtr dialog, byte red, byte green, byte blue) {
+        // Exercise normal focus/keyboard notifications, not a registry write
+        // or a synthetic OK result. Legacy Win32 Edit does not promise Ctrl+A;
+        // Home + Shift+End selects its entire line even at the 3-digit limit.
+        int[] ids = {706, 707, 708};
+        byte[] values = {red, green, blue};
+        SetForegroundWindow(dialog);
+        for (int i=0; i<ids.Length; ++i) {
+            Rect rect = Bounds(RgbField(dialog,ids[i]));
+            ActualClick((rect.Left+rect.Right)/2,(rect.Top+rect.Bottom)/2,false);
+            InputKey(36); // Home
+            keybd_event(16,0,0,UIntPtr.Zero);
+            InputKey(35); // Shift+End
+            keybd_event(16,0,2,UIntPtr.Zero);
+            foreach (char digit in values[i].ToString()) InputKey((byte)digit);
+            Thread.Sleep(180);
+        }
+        InputKey(9); // Flush the final edit's focus-loss validation.
+        Thread.Sleep(200);
+        return ReadRgb(dialog);
+    }
+    public static void AcceptColor(IntPtr dialog) {
+        IntPtr button = GetDlgItem(dialog,1);
+        if (button == IntPtr.Zero) throw new InvalidOperationException("Native color OK button unavailable");
+        Rect rect = Bounds(button);
+        ActualClick((rect.Left+rect.Right)/2,(rect.Top+rect.Bottom)/2,false);
     }
     public static void Key(IntPtr window, int key) {
         Send(window, 0x100, new IntPtr(key), new IntPtr(1));

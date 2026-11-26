@@ -13,10 +13,18 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <condition_variable>
+#include <functional>
 
 class WatchmanEngine {
 public:
-    WatchmanEngine();
+    // The constructor is deliberately cheap. Services are constructed on the
+    // engine worker, not the window thread. The optional dependency hook is
+    // used by in-process tests to stall/fail initialization; it is never fed
+    // by command-line flags, environment variables or saved preferences.
+    enum class InitializationStage { BeforeServices, MetricsReady, AppTrackerReady, StorageReady, ToolsReady };
+    using InitializationHook = std::function<void(InitializationStage, const std::atomic<bool>&)>;
+    explicit WatchmanEngine(InitializationHook before_initialize = {});
     ~WatchmanEngine();
 
     // Starts the background 1-second interval loop
@@ -24,6 +32,8 @@ public:
     
     // Stops the background loop gracefully
     void Stop();
+    bool IsReady() const { return services_ready_.load(std::memory_order_acquire); }
+    std::wstring GetStartupError() const;
 
     // Snapshot getters for UI
     DashboardSnapshot GetDashboardSnapshot();
@@ -34,6 +44,7 @@ public:
     // Commands
     void RunSpeedTest();
     void CancelSpeedTest();
+    SpeedTestSnapshot GetSpeedTestSnapshot() const;
     SpeedTestResult GetSpeedTestResult();
     int GetSpeedTestProgress();
     double GetSpeedTestLiveSpeed();
@@ -55,12 +66,22 @@ public:
     void ResetSession();
 
 private:
+    bool InitializeServices();
+    void WorkerMain();
+    void RecordStartupFailure(const char* message, uint32_t error = ERROR_GEN_FAILURE);
     void EngineLoop();
     void FetchSnapshots(bool refresh_persistent_data);
     void FlushPendingTraffic();
     void RefreshAppTotals(const std::wstring& date);
 
     std::atomic<bool> is_running_{false};
+    std::atomic<bool> services_ready_{false};
+    InitializationHook before_initialize_;
+    mutable std::mutex startup_mutex_;
+    std::wstring startup_error_;
+    std::wstring requested_adapter_id_;
+    std::mutex wait_mutex_;
+    std::condition_variable wake_;
     std::atomic<bool> network_health_active_{false};
     std::atomic<bool> network_details_refresh_requested_{false};
     std::atomic<bool> reset_session_requested_{false};

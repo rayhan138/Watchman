@@ -10,6 +10,7 @@
 #include <string>
 #include "bundled_fonts.h"
 #include "taskbar_widget_mode.h"
+#include "widget_runtime.h"
 
 struct TaskbarWidgetFrame {
     TaskbarWidgetMode mode = TaskbarWidgetMode::All;
@@ -41,8 +42,12 @@ public:
 
     bool Render(HWND hwnd, const TaskbarWidgetFrame& frame);
     void Reset();
+    void InvalidateFrame() { frame_validity_.Invalidate(); }
+    HRESULT LastError() const { return last_error_; }
+    uint64_t SubmissionCount() const { return submission_count_; }
 
 private:
+    bool Fail(HRESULT error);
     bool CreateDeviceResources(HWND hwnd);
     bool EnsureRenderTarget(UINT width, UINT height);
     bool EnsureTextFormat(const std::wstring& font_family, float font_size);
@@ -95,5 +100,7 @@ private:
     float text_format_size_ = 0.0f;
 
     TaskbarWidgetFrame last_frame_;
-    bool has_last_frame_ = false;
+    WatchmanWidgetRuntime::FrameValidity frame_validity_;
+    HRESULT last_error_ = S_OK;
+    uint64_t submission_count_ = 0;
 };

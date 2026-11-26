@@ -9,7 +9,7 @@ $Directory = (Resolve-Path $Directory).Path
 $transport = Join-Path $env:RUNNER_TEMP ('watchman-evidence-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $transport
 try {
-    foreach ($pattern in @('*.json', '*.jsonl', '*error*.txt', '*-events.txt', '*stderr*.txt', 'report.md')) {
+    foreach ($pattern in @('*.json', '*.jsonl', '*.csv', '*error*.txt', '*-events.txt', '*stderr*.txt', 'startup-recovery.txt', 'startup-task-definition.txt', '*tests.txt', 'report.md')) {
         Get-ChildItem $Directory -Filter $pattern | Copy-Item -Destination $transport
     }
     $encoder = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object MimeType -eq 'image/jpeg'

@@ -1,6 +1,7 @@
 #pragma once
 #include "telemetry_math.h"
 #include "temperature_monitor.h"
+#include "gpu_monitor.h"
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
@@ -57,13 +58,6 @@ struct NetworkMetrics {
     bool dhcp_enabled = false;
 };
 
-struct GpuMetrics {
-    float percent_used = 0.0f;
-    std::wstring label = L"N/A";
-    std::wstring active_engine = L"Unavailable";
-    bool available = false;
-};
-
 struct SystemInfoMetrics {
     std::wstring os_name = L"Windows";
     std::wstring architecture = L"N/A";
@@ -87,7 +81,7 @@ struct InterfaceInfo {
 
 class MetricsManager {
 public:
-    MetricsManager();
+    explicit MetricsManager(GpuMonitor::InitializationHook before_gpu_initialize = {});
     ~MetricsManager();
 
     // Call once per second to update stats
@@ -102,7 +96,7 @@ public:
     RamMetrics GetRam() const { return ram_; }
     DiskMetrics GetDisk() const { return disk_; }
     NetworkMetrics GetNetwork() const { return network_; }
-    GpuMetrics GetGpu() const { return gpu_; }
+    GpuMetrics GetGpu() const { return gpu_monitor_.GetSnapshot(); }
     SystemInfoMetrics GetSystemInfo() const { return system_info_; }
     uint32_t GetCpuCoreCount() const { return cpu_core_count_; }
     uint64_t GetUptimeSeconds() const { return uptime_seconds_; }
@@ -121,7 +115,6 @@ private:
     RamMetrics ram_;
     DiskMetrics disk_;
     NetworkMetrics network_;
-    GpuMetrics gpu_;
     SystemInfoMetrics system_info_;
 
     uint32_t cpu_core_count_ = 0;
@@ -129,19 +122,7 @@ private:
     
     TemperatureMonitor temperature_monitor_;
 
-    // Each GPU engine is a separate PDH instance. Keep its expanded path so
-    // utilization can be grouped the same way as the Tauri implementation.
-    struct GpuPdhCounter {
-        void* handle = nullptr;
-        std::wstring path;
-    };
-
-    // PDH state for GPU monitoring
-    void* pdh_query_ = nullptr;
-    std::vector<GpuPdhCounter> pdh_gpu_counters_;
-    bool pdh_gpu_initialized_ = false;
-    bool pdh_gpu_primed_ = false;
-    ULONGLONG last_gpu_counter_refresh_ms_ = 0;
+    GpuMonitor gpu_monitor_;
 
     // Whole-machine busy time, without boost/frequency scaling. Native times
     // remain warm for a seamless fallback on single-processor-group systems.
@@ -170,15 +151,12 @@ private:
     void UpdateRam();
     void UpdateDisk();
     void UpdateNetwork();
-    void UpdateGpu();
     void UpdateUptime();
     void InitializeSystemInfo();
     void UpdateSystemInfo();
     void RefreshAdapterDetails(uint32_t interface_index);
     
     void InitCpuPdh();
-    void InitGpuPdh();
-    void RefreshGpuPdhCounters();
     uint32_t FindBestInterfaceIndex();
     uint32_t FindInterfaceIndexById(const std::wstring& adapter_id) const;
 };

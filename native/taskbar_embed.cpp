@@ -14,6 +14,26 @@ namespace {
 
 constexpr int kWidgetMargin = 2;
 constexpr int kTrayGap = 2;
+using WatchmanWidgetRuntime::Status;
+WatchmanWidgetRuntime::Result g_last_result{Status::WaitingForShell, 0};
+bool Fail(Status status, DWORD error = 0) {
+    g_last_result = {status, error};
+    return false;
+}
+#ifdef WATCHMAN_TASKBAR_TESTING
+HWND g_test_taskbar = nullptr;
+HWND g_test_foreground = nullptr;
+DWORD g_test_parent_error = 0;
+DWORD g_test_position_error = 0;
+unsigned g_test_position_skip = 0;
+#endif
+HWND FindPrimaryTaskbar() {
+#ifdef WATCHMAN_TASKBAR_TESTING
+    return g_test_taskbar;
+#else
+    return FindWindowW(L"Shell_TrayWnd", nullptr);
+#endif
+}
 
 struct TaskbarHandles {
     HWND taskbar = nullptr;
@@ -30,6 +50,7 @@ struct TaskbarHandles {
 struct SavedTaskbarLayout {
     HWND bar = nullptr;
     HWND min = nullptr;
+    DWORD shell_process = 0;
     RECT original_min_client{0, 0, 0, 0};
     RECT original_parent_client{};
     RECT reserved_min_client{};
@@ -67,6 +88,9 @@ POINT g_last_left_click_point{0, 0};
 DWORD g_last_left_click_time = 0;
 bool g_use_layered_widget_style = true;
 bool g_use_manual_layered_paint = false;
+// The low-level mouse hook runs on its own thread. Publish only the active
+// input HWND; it must never race reads of the UI-owned saved-layout structure.
+std::atomic<HWND> g_input_widget{nullptr};
 std::atomic<HWND> g_widget_menu_owner{nullptr};
 std::atomic<bool> g_widget_menu_open{false};
 std::atomic<HWND> g_widget_command_target{nullptr};
@@ -99,12 +123,16 @@ void RequestWidgetHistory() {
 }
 
 bool IsPointInsideWidget(POINT point) {
-    if (!g_layout.widget_embedded || g_layout.widget == nullptr || !IsWindow(g_layout.widget)) {
-        return false;
-    }
+    const HWND widget = g_input_widget.load(std::memory_order_acquire);
+    if (!widget || !IsWindow(widget) || !IsWindowVisible(widget)) return false;
+    DWORD process = 0;
+    GetWindowThreadProcessId(widget, &process);
+    wchar_t name[64]{};
+    if (process != GetCurrentProcessId() || !GetClassNameW(widget, name, 64) ||
+        lstrcmpW(name, L"WatchmanWidgetClass") != 0) return false;
 
     RECT rect{};
-    if (!GetWindowRect(g_layout.widget, &rect)) {
+    if (!GetWindowRect(widget, &rect)) {
         return false;
     }
 
@@ -204,6 +232,9 @@ DWORD WINAPI WidgetMouseHookThread(LPVOID) {
 }
 
 void EnsureWidgetMouseHook() {
+#ifdef WATCHMAN_TASKBAR_TESTING
+    return; // No global input hook while testing owned fake taskbar windows.
+#endif
     if (InterlockedCompareExchange(&g_mouse_hook_started, 1, 0) != 0) {
         return;
     }
@@ -256,6 +287,15 @@ bool HasUsableTaskbarHandle(HWND hwnd) {
     return hwnd != nullptr && IsWindow(hwnd) != FALSE;
 }
 
+bool IsClassName(HWND hwnd, const wchar_t* first, const wchar_t* second = nullptr);
+
+bool IsOwnedWidgetHandle(HWND hwnd) {
+    DWORD process = 0;
+    const DWORD thread = GetWindowThreadProcessId(hwnd, &process);
+    return IsWindow(hwnd) && process == GetCurrentProcessId() && thread == GetCurrentThreadId() &&
+        IsClassName(hwnd, L"WatchmanWidgetClass");
+}
+
 bool HasUsableCachedTaskbarHandles(HWND taskbar) {
     const TaskbarHandles& cached = g_cached_taskbar_handles;
     if (cached.taskbar != taskbar ||
@@ -266,13 +306,14 @@ bool HasUsableCachedTaskbarHandles(HWND taskbar) {
 
     if (cached.legacy_layout) {
         return HasUsableTaskbarHandle(cached.bar) && HasUsableTaskbarHandle(cached.min) &&
+               IsClassName(cached.min, L"MSTaskSwWClass", L"MSTaskListWClass") &&
                GetParent(cached.min) == cached.parent &&
                (cached.parent == taskbar || IsChild(taskbar, cached.parent));
     }
 
-    return HasUsableTaskbarHandle(cached.tray) && IsChild(taskbar, cached.tray) &&
-           HasUsableTaskbarHandle(cached.min) && IsChild(taskbar, cached.min) &&
-           (cached.start == nullptr || (HasUsableTaskbarHandle(cached.start) && IsChild(taskbar, cached.start)));
+    return HasUsableTaskbarHandle(cached.tray) && IsClassName(cached.tray, L"TrayNotifyWnd") && IsChild(taskbar, cached.tray) &&
+           HasUsableTaskbarHandle(cached.min) && IsClassName(cached.min, L"MSTaskSwWClass", L"MSTaskListWClass") && IsChild(taskbar, cached.min) &&
+           (cached.start == nullptr || (HasUsableTaskbarHandle(cached.start) && IsClassName(cached.start, L"Start") && IsChild(taskbar, cached.start)));
 }
 
 int DetectTaskbarEdge(const RECT& rect) {
@@ -288,7 +329,7 @@ int DetectTaskbarEdge(const RECT& rect) {
     return std::abs(rect.left - monitor.left) <= std::abs(monitor.right - rect.right) ? 2 : 3;
 }
 
-bool IsClassName(HWND hwnd, const wchar_t* first, const wchar_t* second = nullptr) {
+bool IsClassName(HWND hwnd, const wchar_t* first, const wchar_t* second) {
     wchar_t buffer[256] = {};
     const int length = GetClassNameW(
         hwnd,
@@ -335,9 +376,7 @@ bool GetRectInParent(HWND child, HWND parent, RECT* rect) {
 }
 
 bool CaptureWidgetState(HWND widget) {
-    if (widget == nullptr) {
-        return false;
-    }
+    if (!IsOwnedWidgetHandle(widget)) return Fail(Status::AttachFailed, ERROR_INVALID_WINDOW_HANDLE);
 
     if (g_layout.widget_state_captured && g_layout.widget == widget) {
         return true;
@@ -354,7 +393,7 @@ bool CaptureWidgetState(HWND widget) {
 }
 
 bool RestoreWidgetSubclass() {
-    if (!g_layout.widget_subclassed || g_layout.widget == nullptr || !IsWindow(g_layout.widget)) {
+    if (!g_layout.widget_subclassed || !IsOwnedWidgetHandle(g_layout.widget)) {
         g_layout.widget_subclassed = false;
         return true;
     }
@@ -366,7 +405,7 @@ bool RestoreWidgetSubclass() {
                 GWLP_WNDPROC,
                 reinterpret_cast<LONG_PTR>(g_layout.widget_wndproc_before)
             ) == 0 && GetLastError() != 0) {
-            return false;
+            return Fail(Status::CleanupPending, GetLastError());
         }
     }
 
@@ -393,6 +432,7 @@ bool EnsureWidgetSubclassed(HWND hwnd) {
     }
 
     g_layout.widget_wndproc_before = current;
+    SetLastError(0);
     const LONG_PTR result = SetWindowLongPtrW(
         hwnd,
         GWLP_WNDPROC,
@@ -400,7 +440,7 @@ bool EnsureWidgetSubclassed(HWND hwnd) {
     );
 
     if (result == 0 && GetLastError() != 0) {
-        return false;
+        return Fail(Status::AttachFailed, GetLastError());
     }
 
     g_layout.widget = hwnd;
@@ -408,27 +448,24 @@ bool EnsureWidgetSubclassed(HWND hwnd) {
     return true;
 }
 
-void ApplyBaseWidgetStyles(HWND hwnd) {
-    if (hwnd == nullptr) {
-        return;
-    }
+bool ApplyBaseWidgetStyles(HWND hwnd) {
+    if (!IsWindow(hwnd)) return Fail(Status::AttachFailed, ERROR_INVALID_WINDOW_HANDLE);
 
     const LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    LONG_PTR target_ex_style =
-        (ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
-    if (g_use_layered_widget_style) {
-        target_ex_style |= WS_EX_LAYERED;
-    } else {
-        target_ex_style &= ~WS_EX_LAYERED;
-    }
+    LONG_PTR target_ex_style = (ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
+    if (g_use_layered_widget_style) target_ex_style |= WS_EX_LAYERED;
+    else target_ex_style &= ~WS_EX_LAYERED;
 
     if (ex_style != target_ex_style) {
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, target_ex_style);
+        SetLastError(0);
+        const LONG_PTR previous = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, target_ex_style);
+        const DWORD error = GetLastError();
+        if (!previous && error) return Fail(Status::AttachFailed, error);
     }
-
-    if (g_use_layered_widget_style && !g_use_manual_layered_paint) {
-        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-    }
+    if (g_use_layered_widget_style && !g_use_manual_layered_paint &&
+        !SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA))
+        return Fail(Status::AttachFailed, GetLastError());
+    return true;
 }
 
 bool IsPointInsideNativePopupMenu(POINT point) {
@@ -460,7 +497,7 @@ void CancelWidgetMenuForOutsideClick(POINT point) {
 }
 
 bool RestoreWidgetToTopLevel() {
-    if (!g_layout.widget_state_captured || g_layout.widget == nullptr || !IsWindow(g_layout.widget)) {
+    if (!g_layout.widget_state_captured || !IsOwnedWidgetHandle(g_layout.widget)) {
         g_layout.widget_embedded = false;
         g_layout.widget_subclassed = false;
         return true;
@@ -474,10 +511,11 @@ bool RestoreWidgetToTopLevel() {
     }
     if (GetParent(g_layout.widget) != parent) {
         SetLastError(0);
-        SetParent(g_layout.widget, parent);
-        if (GetLastError() != 0) {
-            return false;
-        }
+        const HWND previous = SetParent(g_layout.widget, parent);
+        const DWORD error = GetLastError();
+        if (!previous && error) return Fail(Status::CleanupPending, error);
+        // With WS_CHILD still set, GetParent may report the desktop instead
+        // of NULL after detaching. Validate only after restoring WS_POPUP.
     }
 
     if (!RestoreWidgetSubclass()) {
@@ -486,9 +524,11 @@ bool RestoreWidgetToTopLevel() {
     SetLastError(0);
     if (SetWindowLongPtrW(g_layout.widget, GWL_STYLE, g_layout.widget_style_before) == 0 &&
         GetLastError() != 0) {
-        return false;
+        return Fail(Status::CleanupPending, GetLastError());
     }
-    ApplyBaseWidgetStyles(g_layout.widget);
+    if (GetParent(g_layout.widget) != parent)
+        return Fail(Status::CleanupPending, ERROR_INVALID_WINDOW_HANDLE);
+    if (!ApplyBaseWidgetStyles(g_layout.widget)) return false;
     if (!SetWindowPos(
             g_layout.widget,
             HWND_TOPMOST,
@@ -497,7 +537,7 @@ bool RestoreWidgetToTopLevel() {
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)) {
-        return false;
+        return Fail(Status::CleanupPending, GetLastError());
     }
 
     g_layout.widget_embedded = false;
@@ -510,11 +550,16 @@ bool InitTaskbarWindows(TaskbarHandles* handles) {
         return false;
     }
 
-    const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    const HWND taskbar = FindPrimaryTaskbar();
     RECT taskbar_screen{};
-    if (taskbar == nullptr || !ReadWindowRect(taskbar, &taskbar_screen)) {
+    if (!HasUsableTaskbarHandle(taskbar)) {
         g_cached_taskbar_handles = {};
-        return false;
+        return Fail(Status::WaitingForShell);
+    }
+    if (!ReadWindowRect(taskbar, &taskbar_screen) ||
+        RectWidth(taskbar_screen) <= 0 || RectHeight(taskbar_screen) <= 0) {
+        g_cached_taskbar_handles = {};
+        return Fail(Status::WaitingForLayout);
     }
 
     const bool horizontal = RectWidth(taskbar_screen) >= RectHeight(taskbar_screen);
@@ -562,7 +607,7 @@ bool InitTaskbarWindows(TaskbarHandles* handles) {
         if (initialized) {
             g_cached_taskbar_handles = *handles;
         }
-        return initialized;
+        return initialized || Fail(Status::WaitingForLayout);
     }
 
     handles->parent = handles->taskbar;
@@ -593,16 +638,28 @@ bool InitTaskbarWindows(TaskbarHandles* handles) {
     if (initialized) {
         g_cached_taskbar_handles = *handles;
     }
-    return initialized;
+    return initialized || Fail(Status::WaitingForLayout);
 }
 
 bool PositionWindowIfChanged(HWND hwnd, HWND parent, const RECT& target) {
+#ifdef WATCHMAN_TASKBAR_TESTING
+    if (g_test_position_error) {
+        if (g_test_position_skip) --g_test_position_skip;
+        else {
+            const DWORD error = g_test_position_error;
+            g_test_position_error = 0;
+            return Fail(Status::AttachFailed, error);
+        }
+    }
+#endif
     RECT current{};
     if (GetRectInParent(hwnd, parent, &current) && EqualRect(&current, &target)) {
         return true;
     }
-    return SetWindowPos(hwnd, HWND_TOP, target.left, target.top,
-                        RectWidth(target), RectHeight(target), SWP_NOACTIVATE) != FALSE;
+    if (!SetWindowPos(hwnd, HWND_TOP, target.left, target.top,
+                      RectWidth(target), RectHeight(target), SWP_NOACTIVATE))
+        return Fail(Status::AttachFailed, GetLastError());
+    return true;
 }
 
 constexpr bool RestoreReservationGeometry(const RECT& original, const RECT& reserved,
@@ -650,9 +707,12 @@ static_assert([]() constexpr {
 }(), "Retained reservations must survive translation/resize without double shrinking");
 
 bool RestoreReservedLayout() {
-    if (!g_layout.active || !IsWindow(g_layout.min) ||
+    DWORD process = 0;
+    GetWindowThreadProcessId(g_layout.min, &process);
+    if (!g_layout.active || !IsWindow(g_layout.min) || process != g_layout.shell_process ||
+        !IsClassName(g_layout.min, L"MSTaskSwWClass", L"MSTaskListWClass") ||
         GetParent(g_layout.min) != g_layout.bar) {
-        return true;
+        return true; // Destroyed/replaced shell windows are not ours to resize.
     }
     RECT current{}, parent{};
     if (!GetRectInParent(g_layout.min, g_layout.bar, &current) ||
@@ -707,6 +767,7 @@ bool CaptureOriginalLayout(const TaskbarHandles& handles) {
     }
     g_layout.bar = handles.parent;
     g_layout.min = handles.min;
+    GetWindowThreadProcessId(handles.min, &g_layout.shell_process);
     g_layout.original_min_client = current;
     g_layout.original_parent_client = parent;
     g_layout.taskbar_screen = handles.taskbar_screen;
@@ -716,6 +777,7 @@ bool CaptureOriginalLayout(const TaskbarHandles& handles) {
 }
 
 bool RestoreTaskbarLayoutInternal() {
+    g_input_widget.store(nullptr, std::memory_order_release);
     const bool restored_layout = RestoreReservedLayout();
     const bool restored_widget = RestoreWidgetToTopLevel();
     if (restored_layout) {
@@ -728,6 +790,15 @@ bool RestoreTaskbarLayoutInternal() {
 bool IsFullscreenWindow(HWND foreground) {
     if (foreground == nullptr || !IsWindowVisible(foreground) || IsIconic(foreground)) {
         return false;
+    }
+    // Explorer's desktop/wallpaper covers the monitor too, especially when it
+    // becomes foreground during shell restart. It is not a fullscreen app.
+    if (foreground == GetDesktopWindow() || foreground == GetShellWindow()) return false;
+    if (IsClassName(foreground, L"Progman", L"WorkerW")) {
+        DWORD foreground_process = 0, shell_process = 0;
+        GetWindowThreadProcessId(foreground, &foreground_process);
+        GetWindowThreadProcessId(FindPrimaryTaskbar(), &shell_process);
+        if (shell_process && foreground_process == shell_process) return false;
     }
 
     RECT window_rect = {};
@@ -754,8 +825,8 @@ bool IsFullscreenWindow(HWND foreground) {
 }
 
 bool EnsureWidgetEmbedded(HWND hwnd, const TaskbarHandles& handles) {
-    if (hwnd == nullptr || handles.parent == nullptr) {
-        return false;
+    if (!IsOwnedWidgetHandle(hwnd) || !IsWindow(handles.parent)) {
+        return Fail(Status::AttachFailed, ERROR_INVALID_WINDOW_HANDLE);
     }
 
     if (!CaptureWidgetState(hwnd)) {
@@ -767,7 +838,7 @@ bool EnsureWidgetEmbedded(HWND hwnd, const TaskbarHandles& handles) {
     }
 
     EnsureWidgetMouseHook();
-    ApplyBaseWidgetStyles(hwnd);
+    if (!ApplyBaseWidgetStyles(hwnd)) return false;
 
     LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     const LONG_PTR child_style = (style & ~WS_POPUP) | WS_CHILD;
@@ -777,19 +848,32 @@ bool EnsureWidgetEmbedded(HWND hwnd, const TaskbarHandles& handles) {
         ShowWindow(hwnd, SW_HIDE);
     }
     if (style_changed) {
-        SetWindowLongPtrW(hwnd, GWL_STYLE, child_style & ~WS_VISIBLE);
+        SetLastError(0);
+        if (!SetWindowLongPtrW(hwnd, GWL_STYLE, child_style & ~WS_VISIBLE) && GetLastError())
+            return Fail(Status::AttachFailed, GetLastError());
     }
 
     if (parent_changed) {
-        SetLastError(0);
-        SetParent(hwnd, handles.parent);
-        if (GetLastError() != 0) {
-            return false;
+#ifdef WATCHMAN_TASKBAR_TESTING
+        if (g_test_parent_error) {
+            const DWORD error = g_test_parent_error;
+            g_test_parent_error = 0;
+            return Fail(Status::AttachFailed, error);
         }
+#endif
+        SetLastError(0);
+        const HWND previous = SetParent(hwnd, handles.parent);
+        const DWORD error = GetLastError();
+        if ((!previous && error) || GetParent(hwnd) != handles.parent)
+            return Fail(Status::AttachFailed, error ? error : ERROR_INVALID_WINDOW_HANDLE);
     }
+    // Record parenting immediately. If frame/positioning fails, cleanup still
+    // has to detach the child instead of leaving an untracked reservation.
+    g_layout.widget = hwnd;
+    g_layout.widget_embedded = true;
 
     if (style_changed || parent_changed) {
-        SetWindowPos(
+        if (!SetWindowPos(
             hwnd,
             HWND_TOP,
             0,
@@ -797,7 +881,7 @@ bool EnsureWidgetEmbedded(HWND hwnd, const TaskbarHandles& handles) {
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED
-        );
+        )) return Fail(Status::AttachFailed, GetLastError());
         g_win11_placement = {};
     }
 
@@ -815,7 +899,7 @@ bool ApplyWin11Placement(
 ) {
     RECT taskbar_client{};
     if (!GetClientRect(handles.parent, &taskbar_client)) {
-        return false;
+        return Fail(Status::WaitingForLayout, GetLastError());
     }
     RECT tray_client = taskbar_client;
     RECT start_client = taskbar_client;
@@ -838,34 +922,24 @@ bool ApplyWin11Placement(
     // not occupied app bounds. Those shells may keep the widget hidden even
     // when visually empty space exists; never infer an overlapping fallback.
     // A missing Win11 task-list HWND is likewise not evidence of space.
-    if (!has_tray || !has_min || (handles.start != nullptr && !has_start) ||
-        RectWidth(tray_client) <= 0 || RectHeight(tray_client) <= 0 ||
-        RectWidth(min_client) <= 0 || RectHeight(min_client) <= 0 ||
-        widget_width <= 0 || widget_height <= 0 ||
-        widget_width > taskbar_width || widget_height > taskbar_height) {
-        return false;
-    }
+    const bool required_bounds_valid = has_tray && has_min &&
+        (handles.start == nullptr || has_start) &&
+        RectWidth(tray_client) > 0 && RectHeight(tray_client) > 0 &&
+        RectWidth(min_client) > 0 && RectHeight(min_client) > 0;
+    int leading = handles.horizontal ? std::max(0, static_cast<int>(min_client.right))
+                                     : std::max(0, static_cast<int>(min_client.bottom));
+    if (has_start) leading = std::max(leading, static_cast<int>(handles.horizontal ? start_client.right : start_client.bottom));
+    const int trailing = handles.horizontal ? std::min(taskbar_width, static_cast<int>(tray_client.left))
+                                           : std::min(taskbar_height, static_cast<int>(tray_client.top));
+    const auto readiness = WatchmanWidgetRuntime::CheckGap(required_bounds_valid,
+        taskbar_width, taskbar_height, widget_width, widget_height, leading, trailing,
+        handles.horizontal, kWidgetMargin + kTrayGap);
+    if (readiness != Status::WaitingForFrame) return Fail(readiness);
 
     if (handles.horizontal) {
-        int leading = std::max(0, static_cast<int>(min_client.right));
-        if (has_start) {
-            leading = std::max(leading, static_cast<int>(start_client.right));
-        }
-        const int trailing = std::min(taskbar_width, static_cast<int>(tray_client.left));
-        if (trailing - leading < widget_width + kWidgetMargin + kTrayGap) {
-            return false;
-        }
         child_x = trailing - widget_width - kTrayGap;
         child_y = (taskbar_height - widget_height) / 2;
     } else {
-        int leading = std::max(0, static_cast<int>(min_client.bottom));
-        if (has_start) {
-            leading = std::max(leading, static_cast<int>(start_client.bottom));
-        }
-        const int trailing = std::min(taskbar_height, static_cast<int>(tray_client.top));
-        if (trailing - leading < widget_height + kWidgetMargin + kTrayGap) {
-            return false;
-        }
         child_x = (taskbar_width - widget_width) / 2;
         child_y = trailing - widget_height - kTrayGap;
     }
@@ -887,16 +961,7 @@ bool ApplyWin11Placement(
         g_win11_placement.height != widget_height;
 
     if (placement_changed) {
-        if (!SetWindowPos(
-                hwnd,
-                HWND_TOP,
-                child_x,
-                child_y,
-                widget_width,
-                widget_height,
-                SWP_NOACTIVATE)) {
-            return false;
-        }
+        if (!PositionWindowIfChanged(hwnd, handles.parent, target)) return false;
 
         g_win11_placement = {
             handles.parent,
@@ -927,21 +992,21 @@ bool ApplyLegacyPlacement(
     TaskbarPlacement* placement
 ) {
     if (!CaptureOriginalLayout(handles)) {
-        return false;
+        return Fail(Status::CleanupPending);
     }
 
     RECT bounds{};
     if (!IntersectRect(&bounds, &g_layout.original_min_client, &g_layout.original_parent_client) ||
         preferred_width <= 0 || preferred_height <= 0 ||
         preferred_width > RectWidth(bounds) || preferred_height > RectHeight(bounds)) {
-        return false;
+        return Fail(Status::NoSpace);
     }
     RECT reserved = g_layout.original_min_client;
     RECT widget{};
     if (handles.horizontal) {
         const int remaining = RectWidth(bounds) - preferred_width - kWidgetMargin - kTrayGap;
         if (remaining < 1) {
-            return false;
+            return Fail(Status::NoSpace);
         }
         reserved.right = bounds.left + remaining;
         widget.left = reserved.right + kWidgetMargin;
@@ -949,7 +1014,7 @@ bool ApplyLegacyPlacement(
     } else {
         const int remaining = RectHeight(bounds) - preferred_height - kWidgetMargin - kTrayGap;
         if (remaining < 1) {
-            return false;
+            return Fail(Status::NoSpace);
         }
         reserved.bottom = bounds.top + remaining;
         widget.left = bounds.left + (RectWidth(bounds) - preferred_width) / 2;
@@ -988,11 +1053,11 @@ int tm_get_taskbar_metrics(TaskbarMetrics* metrics) {
         return 0;
     }
     *metrics = TaskbarMetrics{};
-    const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    const HWND taskbar = FindPrimaryTaskbar();
     RECT rect{};
-    if (!ReadWindowRect(taskbar, &rect) || RectWidth(rect) <= 0 || RectHeight(rect) <= 0) {
-        return 0;
-    }
+    if (!IsWindow(taskbar)) return Fail(Status::WaitingForShell);
+    if (!ReadWindowRect(taskbar, &rect) || RectWidth(rect) <= 0 || RectHeight(rect) <= 0)
+        return Fail(Status::WaitingForLayout);
     metrics->edge = DetectTaskbarEdge(rect);
     metrics->thickness = metrics->edge < 2 ? RectHeight(rect) : RectWidth(rect);
     const UINT dpi = GetDpiForWindow(taskbar);
@@ -1012,58 +1077,60 @@ int tm_set_widget_manual_layered_paint(int enabled) {
 
 int tm_apply_widget_styles(void* widget_hwnd) {
     HWND hwnd = static_cast<HWND>(widget_hwnd);
-    if (hwnd == nullptr) {
-        return 0;
-    }
-
-    ApplyBaseWidgetStyles(hwnd);
-    return SetWindowPos(
-        hwnd,
-        HWND_TOPMOST,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED
-    ) != FALSE;
+    const LONG_PTR before = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (!ApplyBaseWidgetStyles(hwnd)) return 0;
+    // Do not force a non-client frame change on every GDI telemetry frame.
+    if (before == GetWindowLongPtrW(hwnd, GWL_EXSTYLE)) return 1;
+    if (!SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED))
+        return Fail(Status::AttachFailed, GetLastError());
+    return 1;
 }
 
 int tm_embed_widget(void* widget_hwnd, int preferred_width, int preferred_height, TaskbarPlacement* placement) {
+    g_last_result = {Status::AttachFailed, 0};
     HWND hwnd = static_cast<HWND>(widget_hwnd);
-    if (hwnd == nullptr || placement == nullptr || preferred_width <= 0 || preferred_height <= 0) {
-        return 0;
-    }
+    if (!IsWindow(hwnd) || placement == nullptr || preferred_width <= 0 || preferred_height <= 0)
+        return Fail(Status::AttachFailed, ERROR_INVALID_PARAMETER);
 
     TaskbarHandles handles{};
-    if (!InitTaskbarWindows(&handles)) {
-        return 0;
-    }
-
-    if (g_layout.active && (g_layout.bar != handles.parent || g_layout.min != handles.min)) {
-        if (!RestoreReservedLayout()) {
-            return 0;
-        }
+    if (!InitTaskbarWindows(&handles)) return 0;
+    if (g_layout.active && (g_layout.bar != handles.parent || g_layout.min != handles.min || !handles.legacy_layout)) {
+        if (!RestoreReservedLayout()) return Fail(Status::CleanupPending);
         g_layout.active = false;
         g_layout.captured = false;
     }
-
-    if (handles.legacy_layout) {
-        return ApplyLegacyPlacement(handles, hwnd, preferred_width, preferred_height, placement) ? 1 : 0;
-    }
-
-    if (g_layout.active) {
-        if (!RestoreReservedLayout()) {
-            return 0;
-        }
-        g_layout.active = false;
-        g_layout.captured = false;
-    }
-
-    return ApplyWin11Placement(handles, hwnd, preferred_width, preferred_height, placement) ? 1 : 0;
+    const bool placed = handles.legacy_layout
+        ? ApplyLegacyPlacement(handles, hwnd, preferred_width, preferred_height, placement)
+        : ApplyWin11Placement(handles, hwnd, preferred_width, preferred_height, placement);
+    if (placed) {
+        g_last_result = {Status::WaitingForFrame, 0};
+        g_input_widget.store(hwnd, std::memory_order_release);
+    } else g_input_widget.store(nullptr, std::memory_order_release);
+    return placed ? 1 : 0;
 }
 
+WatchmanWidgetRuntime::Result tm_get_widget_result() { return g_last_result; }
+
 int tm_restore_taskbar_layout() {
-    return RestoreTaskbarLayoutInternal() ? 1 : 0;
+    const auto previous = g_last_result;
+    g_last_result = {Status::CleanupPending, 0};
+    if (!RestoreTaskbarLayoutInternal()) {
+        g_last_result.status = Status::CleanupPending;
+        return 0;
+    }
+    g_last_result = previous;
+    return 1;
+}
+
+int tm_reset_taskbar_binding() {
+    if (!tm_restore_taskbar_layout()) return 0;
+    g_layout = {};
+    g_win11_placement = {};
+    g_cached_taskbar_handles = {};
+    InterlockedExchange(&g_pending_widget_context_menu, 0);
+    InterlockedExchange(&g_pending_widget_double_click, 0);
+    return 1;
 }
 
 int tm_set_widget_context_menu_open(void* owner_hwnd, int open) {
@@ -1104,6 +1171,11 @@ int tm_take_widget_double_click_request() {
 }
 
 int tm_should_widget_be_visible(void* widget_hwnd, void* main_hwnd, int* visible) {
+#ifdef WATCHMAN_TASKBAR_TESTING
+    // Ignore unrelated real desktop apps unless a foreground is explicitly
+    // supplied by this in-process test. Both branches use the real classifier.
+    if (visible && !g_test_foreground) { *visible = 1; return 1; }
+#endif
     if (visible == nullptr) {
         return 0;
     }
@@ -1115,12 +1187,16 @@ int tm_should_widget_be_visible(void* widget_hwnd, void* main_hwnd, int* visible
 
     HWND widget = static_cast<HWND>(widget_hwnd);
     HWND main = static_cast<HWND>(main_hwnd);
-    HWND foreground = GetForegroundWindow();
+#ifdef WATCHMAN_TASKBAR_TESTING
+    const HWND foreground = g_test_foreground;
+#else
+    const HWND foreground = GetForegroundWindow();
+#endif
 
     if (foreground == nullptr ||
         foreground == widget ||
         (main != nullptr && foreground == main) ||
-        foreground == FindWindowW(L"Shell_TrayWnd", nullptr)) {
+        foreground == FindPrimaryTaskbar()) {
         *visible = 1;
         return 1;
     }
@@ -1130,3 +1206,17 @@ int tm_should_widget_be_visible(void* widget_hwnd, void* main_hwnd, int* visible
 }
 
 }  // extern "C"
+
+#ifdef WATCHMAN_TASKBAR_TESTING
+void tm_use_taskbar_for_test(HWND taskbar) {
+    g_test_taskbar = taskbar;
+    g_cached_taskbar_handles = {};
+}
+HWND tm_input_widget_for_test() { return g_input_widget.load(std::memory_order_acquire); }
+void tm_use_foreground_for_test(HWND foreground) { g_test_foreground = foreground; }
+void tm_fail_next_parent_for_test(DWORD error) { g_test_parent_error = error; }
+void tm_fail_next_position_for_test(DWORD error, unsigned calls_before_failure) {
+    g_test_position_error = error;
+    g_test_position_skip = calls_before_failure;
+}
+#endif
