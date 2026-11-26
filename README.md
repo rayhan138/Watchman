@@ -9,7 +9,7 @@
 
 # Watchman
 
-**Release status:** v2.0.1 remains the public stable Latest release. v2.0.2 is being prepared on the native C++/Win32 code path with per-user sign-in-task migration and strict history-profile recovery checks; it is not published. [Windows acceptance evidence, staging, and the gated promotion process](migration/README.md).
+**Release status:** v2.0.1 remains the public stable Latest release. v2.0.2 has passed signed Windows staging and independent upgrades from v1.0.5, v2.0.0, and v2.0.1, but is not published; promotion awaits explicit approval. [Windows acceptance evidence, staging, and the gated promotion process](migration/README.md).
 
 Watchman is a lightweight Windows network monitor that helps you see what your PC is doing with your internet in real time.
 

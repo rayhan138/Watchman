@@ -53,6 +53,17 @@ The final candidate was built and signed from commit `1154283b2a81f57089e66f7928
 
 `promote-tested-v201.yml` is the historical v2.0.1 gate. The new `promote-tested-v202.yml` is the only path that can publish v2.0.2: it requires the exact successful staging run and all three independent upgrade jobs, downloads that same artifact by run ID, re-verifies the signed installer and feed, refuses overwrites, and pins the unchanged v2.0.1/v2.0.0/v1.x releases and tags. Promotion publishes the tested bytes as stable Latest; it is manual and will not be dispatched without explicit approval. Signing secrets are not exposed to the promotion job.
 
+## v2.0.2 signed staging evidence (not promoted)
+
+Staging run [45890550770](https://github.com/rayhan138/Watchman/actions/runs/45890550770), built from candidate commit `7d30e624e56ce040c297c8b14afc4685b5385533`, completed successfully. The stage job passed the native Windows build/tests, signing, signature verification, offline-feed creation, and artifact upload. All three independent upgrade jobs downloaded and tested the same `watchman-2.0.2-staged` artifact from this run:
+
+* [v1.0.5 → v2.0.2](https://github.com/rayhan138/Watchman/actions/runs/45890550770/job/140154802523): passed exact staged-byte verification, seeded legacy Tauri `--minimized` Run-command migration, profile/settings/history checks, uninstall cleanup, and rollback.
+* [v2.0.0 → v2.0.2](https://github.com/rayhan138/Watchman/actions/runs/45890550770/job/140154802610): passed exact staged-byte verification, custom-path in-place update, identity/publisher checks, profile continuity, and startup/uninstall checks.
+* [v2.0.1 → v2.0.2](https://github.com/rayhan138/Watchman/actions/runs/45890550770/job/140154802693): passed against the pinned public stable v2.0.1 baseline, including exact staged-byte verification and profile/startup checks.
+* [Signed stage job](https://github.com/rayhan138/Watchman/actions/runs/45890550770/job/140151867951): passed. The Actions artifact `watchman-2.0.2-staged` (ID `15151577432`) is 1,943,472 bytes; its ZIP SHA-256 digest is `7933e70b28d6825fad8f222dac3b22f07a5c059e15acbe587855e7284570edbc` (artifact archive digest, not the installer hash).
+
+The public `v2.0.1` release remains Latest with its existing assets unchanged. The v2.0.2 promotion workflow was not dispatched; stable publication remains pending explicit approval.
+
 ## Recovery and limitations
 
 1. Before rollout, snapshot the VM or independently back up the user's data while Watchman is stopped. Record install path, Run state, native settings if any and daily totals; cache and verify the v1.0.5 installer/signature.
